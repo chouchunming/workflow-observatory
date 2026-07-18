@@ -1,0 +1,20 @@
+{
+  "name": "workflow-observatory",
+  "interface": {
+    "displayName": "Workflow Observatory"
+  },
+  "plugins": [
+    {
+      "name": "workflow-observer",
+      "source": {
+        "source": "local",
+        "path": "./plugins/workflow-observer"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

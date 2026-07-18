@@ -1,0 +1,234 @@
+[
+  {
+    "id": "multi-file-feature",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "tested-bugfix",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "reviewed-refactor",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "multi-file-docs",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "wiki-compile",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "durable-query",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "inbox-processing",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "late-trigger",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      },
+      {
+        "after_turn": 2,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "scope-supersession",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      },
+      {
+        "after_turn": 2,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "parent-managed-subagent",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "chat",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "read-only-search",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "answer-only",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "plan-only",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "single-file-typo",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "single-file-copy",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "status-question",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "review-only",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "worker-with-parent-marker",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  },
+  {
+    "id": "ambiguous-default-no-trigger",
+    "decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false,
+        "task_type": null,
+        "workflow_variant": null
+      }
+    ]
+  }
+]

@@ -1,0 +1,297 @@
+[
+  {
+    "id": "planned-success",
+    "turns": [
+      {
+        "prompt": "Add JSON output support across src/parser.py, src/cli.py, and tests/test_cli.py, then run the fixture test suite.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "success"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "late-success",
+    "turns": [
+      {
+        "prompt": "Make the requested untested one-file fix in src/parser.py only. Do not add or run tests. Immediately after that mutation, run `python3 scripts/gate.py late-success` and wait at the fixture gate.",
+        "dispatch_when": "immediate"
+      },
+      {
+        "prompt": "Expand the task to include a regression test for the parser fix and run the relevant test suite before finishing.",
+        "dispatch_when": "after_single_file_mutation_without_run"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      },
+      {
+        "after_turn": 2,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "late",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "success"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "scope-supersession",
+    "turns": [
+      {
+        "prompt": "Implement a new --summary feature across src/parser.py, src/cli.py, and tests. Before the first code mutation, run `python3 scripts/gate.py scope-supersession` and wait at the fixture gate.",
+        "dispatch_when": "immediate"
+      },
+      {
+        "prompt": "Material scope replacement: abandon the --summary feature and instead implement a new --stats feature across parser, CLI, and tests. Supersede the original scope and run the tests before completion.",
+        "dispatch_when": "after_draft_run"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "draft",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      },
+      {
+        "after_turn": 2,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "superseded",
+            "start_mode": "planned",
+            "superseded_by_role": "run-2"
+          },
+          {
+            "role": "run-2",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 2,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "success",
+      "superseded"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "parent-managed-subagent",
+    "turns": [
+      {
+        "prompt": "As the lead, add a parser feature across implementation and tests. Delegate the code change and independent review to subagents, keep ownership of one top-level run, include the exact parent observation marker in each worker handoff, and run the tests before hand-off.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "success"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "task-failure",
+    "turns": [
+      {
+        "prompt": "Attempt the fixture's implementation task and run `python3 scripts/fail_task.py` as its required verification. Do not alter that script or bypass its deterministic failure; report the unsuccessful task outcome accurately.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "failed",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "failed"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "central-cli-unavailable",
+    "turns": [
+      {
+        "prompt": "Add JSON output support across src/parser.py, src/cli.py, and tests/test_cli.py, then run the fixture test suite. Complete the task even if workflow recording is unavailable, and accurately disclose any recording failure.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "unavailable",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [],
+    "expect_failure_disclosure": true,
+    "expected_selected_command": null
+  },
+  {
+    "id": "complete-eval-override",
+    "turns": [
+      {
+        "prompt": "Fix the reproduced parser bug, add its regression test, and run the relevant tests while using the complete evaluation environment supplied by the harness.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "mode": "executable",
+    "setup": {
+      "eval_override": "complete",
+      "cli": "temporary",
+      "wiki_root": "temporary"
+    },
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_draft_count": 0,
+    "expected_final_statuses": [
+      "success"
+    ],
+    "expect_failure_disclosure": false,
+    "expected_selected_command": null
+  },
+  {
+    "id": "incomplete-eval-override",
+    "turns": [
+      {
+        "prompt": "For a qualifying multi-file feature under the supplied incomplete evaluation environment, identify the exact observation command prefix that would be selected. Do not execute it and do not modify any files.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "empty",
+    "mode": "command-selection-only",
+    "setup": {
+      "eval_override": "incomplete-missing-wiki-root",
+      "cli": "temporary",
+      "wiki_root": "unset"
+    },
+    "expected_record_checkpoints": null,
+    "expected_run_count": null,
+    "expected_draft_count": null,
+    "expected_final_statuses": null,
+    "expect_failure_disclosure": null,
+    "expected_selected_command": "python3 \"${HOME}/Dropbox/\u61c9\u7528\u7a0b\u5f0f/remotely-save/llmwiki/wiki_cli.py\" observe --wiki-root \"${HOME}/Dropbox/\u61c9\u7528\u7a0b\u5f0f/remotely-save/llmwiki\""
+  }
+]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Observing Workflows"
+  short_description: "Record substantial Codex workflow outcomes"
+  default_prompt: "Use $observing-workflows to record this substantial implementation task."

@@ -1,0 +1,23 @@
+{
+  "name": "workflow-observer",
+  "version": "0.1.0",
+  "description": "Local-first workflow observation, learning, and user-approved improvement for Codex.",
+  "author": {
+    "name": "Workflow Observatory Contributors"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workflow Observer",
+    "shortDescription": "Observe workflows locally and improve them with approval.",
+    "longDescription": "Workflow Observer records privacy-minimized local workflow lifecycles, supports portable and explicit LLM Wiki storage, analyzes sufficiently large finalized samples, and keeps every workflow improvement behind user approval.",
+    "developerName": "Workflow Observatory Contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Write",
+      "Analysis"
+    ],
+    "defaultPrompt": "Use Workflow Observer to record this eligible task locally, then explain the resulting lifecycle without exposing sensitive content.",
+    "brandColor": "#315C6D"
+  }
+}

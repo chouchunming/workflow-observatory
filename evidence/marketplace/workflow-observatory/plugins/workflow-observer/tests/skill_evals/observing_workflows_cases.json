@@ -1,0 +1,650 @@
+[
+  {
+    "id": "multi-file-feature",
+    "turns": [
+      {
+        "prompt": "Add JSON output support across src/parser.py, src/cli.py, and tests/test_cli.py. Run the fixture test suite and use a reviewer before the final hand-off.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "feature",
+    "workflow_variant": "implementation-with-review",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "tested-bugfix",
+    "turns": [
+      {
+        "prompt": "Reproduce the parser bug where surrounding whitespace produces an empty token, fix it, add a regression test, and run the relevant tests.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "bugfix",
+    "workflow_variant": "implementation-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "reviewed-refactor",
+    "turns": [
+      {
+        "prompt": "Refactor token normalization shared by src/parser.py and src/cli.py without changing behavior. Run the tests and require a reviewer gate before completion.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "refactor",
+    "workflow_variant": "implementation-with-review",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "multi-file-docs",
+    "turns": [
+      {
+        "prompt": "Update README.md, docs/guide.md, and docs/reference.md so the linked command examples consistently describe JSON output. Check all three links and examples.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "documentation",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "documentation",
+    "workflow_variant": "implementation-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "wiki-compile",
+    "turns": [
+      {
+        "prompt": "Compile raw/source.md into the smallest relevant concept page, link it from the Wiki index, record the source citation, and run the Wiki lint command.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "wiki",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "compile",
+    "workflow_variant": "compile-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "durable-query",
+    "turns": [
+      {
+        "prompt": "Research how parser and CLI responsibilities are described in this fixture Wiki, write a durable comparison to wiki/summary/, link it from the relevant entry page, and lint the Wiki.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "wiki",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "query",
+    "workflow_variant": "research-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "inbox-processing",
+    "turns": [
+      {
+        "prompt": "Process the fixture's pending inbox captures, promote their durable content to the relevant Wiki pages, mark the captures processed, regenerate the inbox dashboard, and run lint.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "wiki",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "inbox-processing",
+    "workflow_variant": "compile-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "late-trigger",
+    "turns": [
+      {
+        "prompt": "Make the requested untested one-file fix in src/parser.py only. Do not add or run tests. Immediately after that mutation, run `python3 scripts/gate.py late-trigger` and wait at the fixture gate.",
+        "dispatch_when": "immediate"
+      },
+      {
+        "prompt": "Expand the task to include a regression test for the parser fix and run the relevant test suite before finishing.",
+        "dispatch_when": "after_single_file_mutation_without_run"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      },
+      {
+        "after_turn": 2,
+        "triggered": true
+      }
+    ],
+    "task_type": "bugfix",
+    "workflow_variant": "implementation-basic",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      },
+      {
+        "after_turn": 2,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "late",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "scope-supersession",
+    "turns": [
+      {
+        "prompt": "Implement a new --summary feature across src/parser.py, src/cli.py, and tests. Before the first code mutation, run `python3 scripts/gate.py scope-supersession` and wait at the fixture gate.",
+        "dispatch_when": "immediate"
+      },
+      {
+        "prompt": "Material scope replacement: abandon the --summary feature and instead implement a new --stats feature across parser, CLI, and tests. Supersede the original scope, run the tests, and use a reviewer before completion.",
+        "dispatch_when": "after_draft_run"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      },
+      {
+        "after_turn": 2,
+        "triggered": true
+      }
+    ],
+    "task_type": "feature",
+    "workflow_variant": "implementation-with-review",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "draft",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      },
+      {
+        "after_turn": 2,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "superseded",
+            "start_mode": "planned",
+            "superseded_by_role": "run-2"
+          },
+          {
+            "role": "run-2",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 2,
+    "expected_final_statuses": [
+      "success",
+      "superseded"
+    ]
+  },
+  {
+    "id": "parent-managed-subagent",
+    "turns": [
+      {
+        "prompt": "As the lead, add a parser feature across implementation and tests. Delegate the code change and independent review to subagents, keep ownership of one top-level run, include the exact parent observation marker in each worker handoff, and run the tests before hand-off.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": true
+      }
+    ],
+    "task_type": "feature",
+    "workflow_variant": "implementation-with-review",
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": [
+          {
+            "role": "run-1",
+            "status": "success",
+            "start_mode": "planned",
+            "superseded_by_role": null
+          }
+        ]
+      }
+    ],
+    "expected_run_count": 1,
+    "expected_final_statuses": [
+      "success"
+    ]
+  },
+  {
+    "id": "chat",
+    "turns": [
+      {
+        "prompt": "Let's discuss whether a parser should be strict or forgiving. Do not change any files.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "empty",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "read-only-search",
+    "turns": [
+      {
+        "prompt": "Search the fixture for every call to parse_tokens and report the file names and behavior. Make no edits.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "answer-only",
+    "turns": [
+      {
+        "prompt": "Explain in chat what an argparse subcommand is and give a short example. Do not modify files.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "empty",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "plan-only",
+    "turns": [
+      {
+        "prompt": "Write no files. Provide an implementation plan in chat for adding JSON output to this CLI.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "single-file-typo",
+    "turns": [
+      {
+        "prompt": "Correct the one misspelled word in README.md. Do not change any other file and do not run tests or lint.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "documentation",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "single-file-copy",
+    "turns": [
+      {
+        "prompt": "Change one sentence in docs/guide.md to say that output is printed to standard output. Make no other edits and perform no validation.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "documentation",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "status-question",
+    "turns": [
+      {
+        "prompt": "What is the current status of this task? Report only; do not edit or run anything.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "empty",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "review-only",
+    "turns": [
+      {
+        "prompt": "Review the current diff for correctness, regressions, and missing tests. Return findings only and do not edit files.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "worker-with-parent-marker",
+    "turns": [
+      {
+        "prompt": "Observation managed by parent run obs-20260714-120000-abcdef; do not start a child observation. As the worker, update src/parser.py and its tests, run the relevant tests, and report evidence back to the parent.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  },
+  {
+    "id": "ambiguous-default-no-trigger",
+    "turns": [
+      {
+        "prompt": "Please improve the parsing experience if you see a useful opportunity, but I have no specific change or validation requirement in mind.",
+        "dispatch_when": "immediate"
+      }
+    ],
+    "fixture": "python-cli",
+    "expected_decisions": [
+      {
+        "after_turn": 1,
+        "triggered": false
+      }
+    ],
+    "task_type": null,
+    "workflow_variant": null,
+    "expected_record_checkpoints": [
+      {
+        "after_turn": 1,
+        "records": []
+      }
+    ],
+    "expected_run_count": 0,
+    "expected_final_statuses": []
+  }
+]

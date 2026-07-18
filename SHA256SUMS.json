@@ -1,0 +1,795 @@
+{
+  "archive_root": "workflow-observatory",
+  "marketplace_files": {
+    ".agents/plugins/marketplace.json": {
+      "member": "workflow-observatory/.agents/plugins/marketplace.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc",
+      "source_sha256": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc"
+    },
+    ".gitignore": {
+      "member": "workflow-observatory/.gitignore",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de",
+      "source_sha256": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de"
+    },
+    "LICENSE": {
+      "member": "workflow-observatory/LICENSE",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052",
+      "source_sha256": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052"
+    },
+    "NOTICE.md": {
+      "member": "workflow-observatory/NOTICE.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99",
+      "source_sha256": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99"
+    },
+    "README.md": {
+      "member": "workflow-observatory/README.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1",
+      "source_sha256": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1"
+    },
+    "ROADMAP.md": {
+      "member": "workflow-observatory/ROADMAP.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9",
+      "source_sha256": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9"
+    },
+    "TODO.md": {
+      "member": "workflow-observatory/TODO.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0",
+      "source_sha256": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0"
+    },
+    "docs/parallel-evaluation-plan.md": {
+      "member": "workflow-observatory/docs/parallel-evaluation-plan.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732",
+      "source_sha256": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732"
+    },
+    "docs/release-acceptance.md": {
+      "member": "workflow-observatory/docs/release-acceptance.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0",
+      "source_sha256": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0"
+    },
+    "plugins/workflow-observer/.codex-plugin/plugin.json": {
+      "member": "workflow-observatory/plugins/workflow-observer/.codex-plugin/plugin.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63",
+      "source_sha256": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63"
+    },
+    "plugins/workflow-observer/README.md": {
+      "member": "workflow-observatory/plugins/workflow-observer/README.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b",
+      "source_sha256": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b"
+    },
+    "plugins/workflow-observer/scripts/core_source.json": {
+      "member": "workflow-observatory/plugins/workflow-observer/scripts/core_source.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1",
+      "source_sha256": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1"
+    },
+    "plugins/workflow-observer/scripts/store_config.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/scripts/store_config.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967",
+      "source_sha256": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967"
+    },
+    "plugins/workflow-observer/scripts/wiki_observations.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+      "source_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f"
+    },
+    "plugins/workflow-observer/scripts/workflow_observer_cli.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/scripts/workflow_observer_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee",
+      "source_sha256": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee"
+    },
+    "plugins/workflow-observer/skills/workflow-improving/SKILL.md": {
+      "member": "workflow-observatory/plugins/workflow-observer/skills/workflow-improving/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08",
+      "source_sha256": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08"
+    },
+    "plugins/workflow-observer/skills/workflow-learning/SKILL.md": {
+      "member": "workflow-observatory/plugins/workflow-observer/skills/workflow-learning/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf",
+      "source_sha256": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf"
+    },
+    "plugins/workflow-observer/skills/workflow-observer/SKILL.md": {
+      "member": "workflow-observatory/plugins/workflow-observer/skills/workflow-observer/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712",
+      "source_sha256": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712"
+    },
+    "plugins/workflow-observer/skills/workflow-telemetry/SKILL.md": {
+      "member": "workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685",
+      "source_sha256": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685"
+    },
+    "plugins/workflow-observer/tests/run_marketplace_eval.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/run_marketplace_eval.py",
+      "normalizations": [
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "372835e3f90d7f47955a533653c864c86e16a179acc063f0f6b8ebbdf0387c4f",
+      "source_sha256": "b91b7f519a4e5a2a2edef97d9a2856e6fed43193a0fd1e41a7c530f0714ecbae"
+    },
+    "plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+      "source_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2"
+    },
+    "plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json",
+      "normalizations": [
+        "user-home"
+      ],
+      "normalized": true,
+      "packaged_sha256": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+      "source_sha256": "17626afd2a24f232489bd51f55e23a237d5b1445f217e9769ba206ce5a09f12a"
+    },
+    "plugins/workflow-observer/tests/test_adapter_conformance.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_adapter_conformance.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d",
+      "source_sha256": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d"
+    },
+    "plugins/workflow-observer/tests/test_core_parity.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_core_parity.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e",
+      "source_sha256": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e"
+    },
+    "plugins/workflow-observer/tests/test_eval_runner_hygiene.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_eval_runner_hygiene.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a",
+      "source_sha256": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a"
+    },
+    "plugins/workflow-observer/tests/test_learning_improving.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_learning_improving.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130",
+      "source_sha256": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130"
+    },
+    "plugins/workflow-observer/tests/test_manifests.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_manifests.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd",
+      "source_sha256": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd"
+    },
+    "plugins/workflow-observer/tests/test_package_archive.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397",
+      "source_sha256": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397"
+    },
+    "plugins/workflow-observer/tests/test_portable_cli.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_portable_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480",
+      "source_sha256": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480"
+    },
+    "plugins/workflow-observer/tests/test_skill_contracts.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_skill_contracts.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326",
+      "source_sha256": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326"
+    },
+    "plugins/workflow-observer/tests/test_store_config.py": {
+      "member": "workflow-observatory/plugins/workflow-observer/tests/test_store_config.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a",
+      "source_sha256": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a"
+    }
+  },
+  "members": {
+    "workflow-observatory/.agents/plugins/marketplace.json": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc",
+    "workflow-observatory/.gitignore": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de",
+    "workflow-observatory/LICENSE": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052",
+    "workflow-observatory/NOTICE.md": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99",
+    "workflow-observatory/README.md": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1",
+    "workflow-observatory/ROADMAP.md": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9",
+    "workflow-observatory/TODO.md": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0",
+    "workflow-observatory/docs/parallel-evaluation-plan.md": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732",
+    "workflow-observatory/docs/release-acceptance.md": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0",
+    "workflow-observatory/evidence/.superpowers/sdd/workflow-observatory-task-6-report.md": "114f9c6bf3b01f9de61cbb0848ae519d69073087efb467a0dbec5efa8e433173",
+    "workflow-observatory/evidence/AGENTS.md": "a3862232a5bb4b5478a7e4a47bc9355709d2dfaab225bea4fb1dd16e4f55c9f9",
+    "workflow-observatory/evidence/docs/superpowers/plans/2026-07-12-observation-records.md": "0fb3e706e680d25806db6f2aca987d3622b38cd5b2cbda3d705f2e95596cbf72",
+    "workflow-observatory/evidence/docs/superpowers/plans/2026-07-13-observation-records-v2.md": "63ed25cc3d1df7583625ba192dae5fd4cb9f1e568425a906c07acb04c86f959b",
+    "workflow-observatory/evidence/docs/superpowers/plans/2026-07-15-workflow-observatory-marketplace.md": "3b803cc022080a7c2f1b4b0d26f86e145bb6d8dccbaa19eaeba3f073b41158f0",
+    "workflow-observatory/evidence/docs/superpowers/plans/2026-07-15-workflow-telemetry-best-practices-research.md": "aff772d21b40d67814df7bcf1e966ee3e959a13e3cbb6632794068b5fff071f2",
+    "workflow-observatory/evidence/docs/superpowers/specs/2026-07-12-observation-records-design.md": "c9961e6b4a758f69a20dc66be8a61c331887467d6736d2bd0757313f128a3dd3",
+    "workflow-observatory/evidence/docs/superpowers/specs/2026-07-15-workflow-observatory-marketplace-design.md": "6d86a6cf0612cc21b67e8ebaa2f1bee5f4bafe3281b4fa96f08b3f1af3c4b75a",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/.agents/plugins/marketplace.json": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/.gitignore": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/LICENSE": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/NOTICE.md": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/README.md": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/ROADMAP.md": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/TODO.md": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/docs/parallel-evaluation-plan.md": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/docs/release-acceptance.md": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/.codex-plugin/plugin.json": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/README.md": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/core_source.json": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/store_config.py": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/workflow_observer_cli.py": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-improving/SKILL.md": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-learning/SKILL.md": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-observer/SKILL.md": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry/SKILL.md": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/run_marketplace_eval.py": "372835e3f90d7f47955a533653c864c86e16a179acc063f0f6b8ebbdf0387c4f",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_adapter_conformance.py": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_core_parity.py": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_eval_runner_hygiene.py": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_learning_improving.py": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_manifests.py": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_portable_cli.py": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_skill_contracts.py": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326",
+    "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_store_config.py": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a",
+    "workflow-observatory/evidence/scripts/__init__.py": "6e31c2f3d9a8fd9c903cabcfb5afba60ce553b42f58c99d7a58ef276cd813efe",
+    "workflow-observatory/evidence/scripts/package_workflow_observatory.py": "84b13d5473a96a1b7a5ad6ad3bba9b323369859040854653abd8dc921930630c",
+    "workflow-observatory/evidence/scripts/run_observing_workflows_task9_eval.py": "527ea436211d10d648ab28c5a2a1642fb54e7964e1209932d4d91bdcfc46a266",
+    "workflow-observatory/evidence/skills/observing-workflows/README.md": "c774a30e2eb2c9ba1f489217d59c9b105bca322680bdb707b14fa3290d122e99",
+    "workflow-observatory/evidence/skills/observing-workflows/SKILL.md": "1911dad1b8d29beb45fffce8e37992db388c0b81f5b83c2452f14f2de7bca237",
+    "workflow-observatory/evidence/skills/observing-workflows/agents/openai.yaml": "ed4018a7add9a52904ac32bdbdaf7b54753111952fe1d5aafac2a9ecc63cf8fc",
+    "workflow-observatory/evidence/tests/observing_workflows_eval_harness.py": "d310760953b8233a637557f554ca4a2e7898085469e3bb50345c1804ab6fbd24",
+    "workflow-observatory/evidence/tests/run_observing_workflows_eval.py": "e145ac634c685225f504288aabd763e40e206acef94d646cad219693d2b9d412",
+    "workflow-observatory/evidence/tests/skill_evals/observing_workflows_baseline.json": "45f46b28206c03f4a73eef9c374c89e3e09b6449307fabdff6fcd66525fab26c",
+    "workflow-observatory/evidence/tests/skill_evals/observing_workflows_cases.json": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+    "workflow-observatory/evidence/tests/skill_evals/observing_workflows_lifecycle_cases.json": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+    "workflow-observatory/evidence/tests/test_inbox_flow.py": "52f840cdcb64b9a84bc34ff585f16a7d50ff35fc31501fcc91a6a929e1638f4a",
+    "workflow-observatory/evidence/tests/test_knowledge_loop.py": "564a10be9cfd379bd7d084908efa7dd3cd112cd04f7044fa75186901e74d1dc6",
+    "workflow-observatory/evidence/tests/test_observation_cli.py": "3140e1ab9d3aea423718e2a1ffd6ce61b4c097f54c19238e2d96f9c2359cb297",
+    "workflow-observatory/evidence/tests/test_observation_integration.py": "d9c698a7f5c6529d03579f944069ceabc212702de10c7648dd9c4a8a942b8662",
+    "workflow-observatory/evidence/tests/test_observation_lifecycle.py": "a426ade11b6366eb58f4cf4cb373f0d5b5f8f2c8b66b77ba18940b030174a687",
+    "workflow-observatory/evidence/tests/test_observation_records.py": "14cee3c250c2af0b6b699a25abdbb71af8af90fc2a6478682364255e58b87c5c",
+    "workflow-observatory/evidence/tests/test_observation_report.py": "6d03e49a01d30ec41a4139f1a8720347061ba51e2da8ae14822cc7f316ddb423",
+    "workflow-observatory/evidence/tests/test_observing_workflows_eval_harness.py": "9b123cb2f1246c1daa8cc6cdbca9d647691440029f6f3ff9dc02aeb704747391",
+    "workflow-observatory/evidence/tests/test_observing_workflows_task9_eval.py": "8d0c3eebf9f40d898e475e3bc43f99b8fef36215ad827392a9addbfcb928b6e0",
+    "workflow-observatory/evidence/tests/test_task_records.py": "852c235f406fa1be61660f814267e800952d9dc4553509a51b5b1ed37631bb92",
+    "workflow-observatory/evidence/wiki/concept/Workflow_Observation_and_Process_Knowledge.md": "e11690df4bfde10d3c52650fc315114abd8b892ba099516ddbfcafd944c5967f",
+    "workflow-observatory/evidence/wiki_cli.py": "d131b916832c6807478b283de429324aaff82704dae8cb84f88590fa2f35bf51",
+    "workflow-observatory/evidence/wiki_observations.py": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+    "workflow-observatory/plugins/workflow-observer/.codex-plugin/plugin.json": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63",
+    "workflow-observatory/plugins/workflow-observer/README.md": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b",
+    "workflow-observatory/plugins/workflow-observer/scripts/core_source.json": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1",
+    "workflow-observatory/plugins/workflow-observer/scripts/store_config.py": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967",
+    "workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+    "workflow-observatory/plugins/workflow-observer/scripts/workflow_observer_cli.py": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee",
+    "workflow-observatory/plugins/workflow-observer/skills/workflow-improving/SKILL.md": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08",
+    "workflow-observatory/plugins/workflow-observer/skills/workflow-learning/SKILL.md": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf",
+    "workflow-observatory/plugins/workflow-observer/skills/workflow-observer/SKILL.md": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712",
+    "workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry/SKILL.md": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685",
+    "workflow-observatory/plugins/workflow-observer/tests/run_marketplace_eval.py": "372835e3f90d7f47955a533653c864c86e16a179acc063f0f6b8ebbdf0387c4f",
+    "workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+    "workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+    "workflow-observatory/plugins/workflow-observer/tests/test_adapter_conformance.py": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d",
+    "workflow-observatory/plugins/workflow-observer/tests/test_core_parity.py": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e",
+    "workflow-observatory/plugins/workflow-observer/tests/test_eval_runner_hygiene.py": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a",
+    "workflow-observatory/plugins/workflow-observer/tests/test_learning_improving.py": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130",
+    "workflow-observatory/plugins/workflow-observer/tests/test_manifests.py": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd",
+    "workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397",
+    "workflow-observatory/plugins/workflow-observer/tests/test_portable_cli.py": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480",
+    "workflow-observatory/plugins/workflow-observer/tests/test_skill_contracts.py": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326",
+    "workflow-observatory/plugins/workflow-observer/tests/test_store_config.py": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a"
+  },
+  "repository_evidence": {
+    ".superpowers/sdd/workflow-observatory-task-6-report.md": {
+      "member": "workflow-observatory/evidence/.superpowers/sdd/workflow-observatory-task-6-report.md",
+      "normalizations": [
+        "temporary-root",
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "114f9c6bf3b01f9de61cbb0848ae519d69073087efb467a0dbec5efa8e433173",
+      "source_sha256": "1a3adb604dcef398d3b7e6e678d795e7d41d72e06ec829e92a43f9f6c93a94f1"
+    },
+    "AGENTS.md": {
+      "member": "workflow-observatory/evidence/AGENTS.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "a3862232a5bb4b5478a7e4a47bc9355709d2dfaab225bea4fb1dd16e4f55c9f9",
+      "source_sha256": "a3862232a5bb4b5478a7e4a47bc9355709d2dfaab225bea4fb1dd16e4f55c9f9"
+    },
+    "docs/superpowers/plans/2026-07-12-observation-records.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/plans/2026-07-12-observation-records.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "0fb3e706e680d25806db6f2aca987d3622b38cd5b2cbda3d705f2e95596cbf72",
+      "source_sha256": "0fb3e706e680d25806db6f2aca987d3622b38cd5b2cbda3d705f2e95596cbf72"
+    },
+    "docs/superpowers/plans/2026-07-13-observation-records-v2.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/plans/2026-07-13-observation-records-v2.md",
+      "normalizations": [
+        "repository-root",
+        "codex-home"
+      ],
+      "normalized": true,
+      "packaged_sha256": "63ed25cc3d1df7583625ba192dae5fd4cb9f1e568425a906c07acb04c86f959b",
+      "source_sha256": "2ae62e0fd51809fb9d3ca1513cb21749539d9559186314b85063a4b135acc33d"
+    },
+    "docs/superpowers/plans/2026-07-15-workflow-observatory-marketplace.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/plans/2026-07-15-workflow-observatory-marketplace.md",
+      "normalizations": [
+        "codex-home",
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "3b803cc022080a7c2f1b4b0d26f86e145bb6d8dccbaa19eaeba3f073b41158f0",
+      "source_sha256": "0bafe02808c8b3ff82b9324696ee1548a849e9fc779637771450af49be459974"
+    },
+    "docs/superpowers/plans/2026-07-15-workflow-telemetry-best-practices-research.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/plans/2026-07-15-workflow-telemetry-best-practices-research.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "aff772d21b40d67814df7bcf1e966ee3e959a13e3cbb6632794068b5fff071f2",
+      "source_sha256": "aff772d21b40d67814df7bcf1e966ee3e959a13e3cbb6632794068b5fff071f2"
+    },
+    "docs/superpowers/specs/2026-07-12-observation-records-design.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/specs/2026-07-12-observation-records-design.md",
+      "normalizations": [
+        "repository-root"
+      ],
+      "normalized": true,
+      "packaged_sha256": "c9961e6b4a758f69a20dc66be8a61c331887467d6736d2bd0757313f128a3dd3",
+      "source_sha256": "eb06c093b8be8da1c78f4a9239aeb34891ade9b388d9b049df0458a0dda235e1"
+    },
+    "docs/superpowers/specs/2026-07-15-workflow-observatory-marketplace-design.md": {
+      "member": "workflow-observatory/evidence/docs/superpowers/specs/2026-07-15-workflow-observatory-marketplace-design.md",
+      "normalizations": [
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "6d86a6cf0612cc21b67e8ebaa2f1bee5f4bafe3281b4fa96f08b3f1af3c4b75a",
+      "source_sha256": "3a9f99c5c04f6207005e4a56edda5385157cb0a9c635c87656331ce2c0edc1c2"
+    },
+    "marketplace/workflow-observatory/.agents/plugins/marketplace.json": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/.agents/plugins/marketplace.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc",
+      "source_sha256": "4ae9e86e628e7d4b5d9a6c25d9e6183d6f9ba1e842509843d8fb4e0395afdabc"
+    },
+    "marketplace/workflow-observatory/.gitignore": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/.gitignore",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de",
+      "source_sha256": "d61bc670783d497b2daf52be6163d6bb3de5b3cd59b8d885a9524c3ab042a6de"
+    },
+    "marketplace/workflow-observatory/LICENSE": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/LICENSE",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052",
+      "source_sha256": "c20d308f7191342af92cd8b743c0f716ac48da0ed84f86d64d6df3a64eb8d052"
+    },
+    "marketplace/workflow-observatory/NOTICE.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/NOTICE.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99",
+      "source_sha256": "ae765807badf487ce7aa9c1cc9ad191284740e0d63550e35c4a890ac1de7de99"
+    },
+    "marketplace/workflow-observatory/README.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/README.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1",
+      "source_sha256": "9289a4aa145c7b58a10c10bd34f540b268cfd08e5fa8d1aa2a6103ec42f713f1"
+    },
+    "marketplace/workflow-observatory/ROADMAP.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/ROADMAP.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9",
+      "source_sha256": "ab8e677cba3be35b5da6da828117311aedebe286caf2fdcb71532971385b10e9"
+    },
+    "marketplace/workflow-observatory/TODO.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/TODO.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0",
+      "source_sha256": "0f824c8bce31a52340920e42add956917c6b5f79465dd53d03128b22f7fe42d0"
+    },
+    "marketplace/workflow-observatory/docs/parallel-evaluation-plan.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/docs/parallel-evaluation-plan.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732",
+      "source_sha256": "cad74583610a228e804f208f425710c0cc6c53fd17c5286e522c5564eff41732"
+    },
+    "marketplace/workflow-observatory/docs/release-acceptance.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/docs/release-acceptance.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0",
+      "source_sha256": "2b812c70a691ea84e5feda47fe4812d2333d28c01c4331aca3974a55e57ebba0"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/.codex-plugin/plugin.json": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/.codex-plugin/plugin.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63",
+      "source_sha256": "ff4663fc906468047b31023384c4771a0855647dff045377a84deb4c38ec9a63"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/README.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/README.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b",
+      "source_sha256": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/scripts/core_source.json": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/core_source.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1",
+      "source_sha256": "d7981a2a888aec0dde1084ad8c7ce81596ec8d1884a1a76669258b763f8564e1"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/scripts/store_config.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/store_config.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967",
+      "source_sha256": "105242b03315468dca6f887972fa22ff9fbe5efdf25533b0ce1d566ccb72e967"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+      "source_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/scripts/workflow_observer_cli.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/scripts/workflow_observer_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee",
+      "source_sha256": "382809d8b759fcc56a686abd920f906a7772f1c1a7b414e4755059759b778eee"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-improving/SKILL.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-improving/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08",
+      "source_sha256": "bbdab3121cac517fcbd3678c4beb207f0b2b46e94cd142fc64c5ae135ea2ff08"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-learning/SKILL.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-learning/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf",
+      "source_sha256": "112319328aeeab1d48789b30e1c2069f5e131de2e8e655e594e52be1c963e4cf"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-observer/SKILL.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-observer/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712",
+      "source_sha256": "6eb3850a8acf7c64da9b858faf9698366bc64ca5a1e30a8b6a17a64c23692712"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry/SKILL.md": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry/SKILL.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685",
+      "source_sha256": "9c103a95c6e02bbdec5e7e853e664e3dd1e14b54d098cbac7ba91a457ee77685"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/run_marketplace_eval.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/run_marketplace_eval.py",
+      "normalizations": [
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "372835e3f90d7f47955a533653c864c86e16a179acc063f0f6b8ebbdf0387c4f",
+      "source_sha256": "b91b7f519a4e5a2a2edef97d9a2856e6fed43193a0fd1e41a7c530f0714ecbae"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_cases.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+      "source_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/skill_evals/observing_workflows_lifecycle_cases.json",
+      "normalizations": [
+        "user-home"
+      ],
+      "normalized": true,
+      "packaged_sha256": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+      "source_sha256": "17626afd2a24f232489bd51f55e23a237d5b1445f217e9769ba206ce5a09f12a"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_adapter_conformance.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_adapter_conformance.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d",
+      "source_sha256": "bd7b3b0e67f105676eac94f6591379eac6b6f07ab6fb5240446eb3f7a327085d"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_core_parity.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_core_parity.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e",
+      "source_sha256": "e9ef4ac6d67273d28308f4f2300993f7e5ec9a7dd13337634c7a36421887c20e"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_eval_runner_hygiene.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_eval_runner_hygiene.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a",
+      "source_sha256": "88614623d28ca581bc1971a61f9e43e2cd033c9149ac3de0d7b1a14ba068856a"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_learning_improving.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_learning_improving.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130",
+      "source_sha256": "4caa43f7ac271d04d4fb29c23b7047df5c3c77b2d1b5673687c8c5f97ffca130"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_manifests.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_manifests.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd",
+      "source_sha256": "7ac202641f766be69616fd88a39f01c8a0316783f23a0f7832fa92b567b142fd"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397",
+      "source_sha256": "f52d82b041344811183669d3c05475aad324d7d65127af82f4540ab96130b397"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_portable_cli.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_portable_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480",
+      "source_sha256": "28f4c903ae8fb1b0c11ba6bbf73c7d7b1f4f6ac0cc15ee4499a7e5c022eb2480"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_skill_contracts.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_skill_contracts.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326",
+      "source_sha256": "f5fff158c263cfeb9d492ccb9f5061181978e0e5f4715f493b41d5740ec03326"
+    },
+    "marketplace/workflow-observatory/plugins/workflow-observer/tests/test_store_config.py": {
+      "member": "workflow-observatory/evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_store_config.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a",
+      "source_sha256": "62d07fba03b6fe07af675f87f211767cf08d16d9508e9c9eeaa71c257704268a"
+    },
+    "scripts/__init__.py": {
+      "member": "workflow-observatory/evidence/scripts/__init__.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "6e31c2f3d9a8fd9c903cabcfb5afba60ce553b42f58c99d7a58ef276cd813efe",
+      "source_sha256": "6e31c2f3d9a8fd9c903cabcfb5afba60ce553b42f58c99d7a58ef276cd813efe"
+    },
+    "scripts/package_workflow_observatory.py": {
+      "member": "workflow-observatory/evidence/scripts/package_workflow_observatory.py",
+      "normalizations": [
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "84b13d5473a96a1b7a5ad6ad3bba9b323369859040854653abd8dc921930630c",
+      "source_sha256": "b697a7bf707ff45213d9e3a200dfed0efb888bafb00cfd70402a0360bf74ec84"
+    },
+    "scripts/run_observing_workflows_task9_eval.py": {
+      "member": "workflow-observatory/evidence/scripts/run_observing_workflows_task9_eval.py",
+      "normalizations": [
+        "repository-root",
+        "manifest-hash:17626afd2a24"
+      ],
+      "normalized": true,
+      "packaged_sha256": "527ea436211d10d648ab28c5a2a1642fb54e7964e1209932d4d91bdcfc46a266",
+      "source_sha256": "f9cc67ef324f86163dc9c384f068a04390ab51b3e1192573d651458abbd051d1"
+    },
+    "skills/observing-workflows/README.md": {
+      "member": "workflow-observatory/evidence/skills/observing-workflows/README.md",
+      "normalizations": [
+        "codex-home"
+      ],
+      "normalized": true,
+      "packaged_sha256": "c774a30e2eb2c9ba1f489217d59c9b105bca322680bdb707b14fa3290d122e99",
+      "source_sha256": "202068e4f2aae1185cceb0f8016b8380431894a0dbc5562f69d774c781fa84e5"
+    },
+    "skills/observing-workflows/SKILL.md": {
+      "member": "workflow-observatory/evidence/skills/observing-workflows/SKILL.md",
+      "normalizations": [
+        "repository-root"
+      ],
+      "normalized": true,
+      "packaged_sha256": "1911dad1b8d29beb45fffce8e37992db388c0b81f5b83c2452f14f2de7bca237",
+      "source_sha256": "a37c68843c810f564cd7f30651d336724a269376005fbd68e8dab1bac98bcd1d"
+    },
+    "skills/observing-workflows/agents/openai.yaml": {
+      "member": "workflow-observatory/evidence/skills/observing-workflows/agents/openai.yaml",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "ed4018a7add9a52904ac32bdbdaf7b54753111952fe1d5aafac2a9ecc63cf8fc",
+      "source_sha256": "ed4018a7add9a52904ac32bdbdaf7b54753111952fe1d5aafac2a9ecc63cf8fc"
+    },
+    "tests/observing_workflows_eval_harness.py": {
+      "member": "workflow-observatory/evidence/tests/observing_workflows_eval_harness.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d310760953b8233a637557f554ca4a2e7898085469e3bb50345c1804ab6fbd24",
+      "source_sha256": "d310760953b8233a637557f554ca4a2e7898085469e3bb50345c1804ab6fbd24"
+    },
+    "tests/run_observing_workflows_eval.py": {
+      "member": "workflow-observatory/evidence/tests/run_observing_workflows_eval.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "e145ac634c685225f504288aabd763e40e206acef94d646cad219693d2b9d412",
+      "source_sha256": "e145ac634c685225f504288aabd763e40e206acef94d646cad219693d2b9d412"
+    },
+    "tests/skill_evals/observing_workflows_baseline.json": {
+      "member": "workflow-observatory/evidence/tests/skill_evals/observing_workflows_baseline.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "45f46b28206c03f4a73eef9c374c89e3e09b6449307fabdff6fcd66525fab26c",
+      "source_sha256": "45f46b28206c03f4a73eef9c374c89e3e09b6449307fabdff6fcd66525fab26c"
+    },
+    "tests/skill_evals/observing_workflows_cases.json": {
+      "member": "workflow-observatory/evidence/tests/skill_evals/observing_workflows_cases.json",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2",
+      "source_sha256": "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2"
+    },
+    "tests/skill_evals/observing_workflows_lifecycle_cases.json": {
+      "member": "workflow-observatory/evidence/tests/skill_evals/observing_workflows_lifecycle_cases.json",
+      "normalizations": [
+        "user-home"
+      ],
+      "normalized": true,
+      "packaged_sha256": "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b",
+      "source_sha256": "17626afd2a24f232489bd51f55e23a237d5b1445f217e9769ba206ce5a09f12a"
+    },
+    "tests/test_inbox_flow.py": {
+      "member": "workflow-observatory/evidence/tests/test_inbox_flow.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "52f840cdcb64b9a84bc34ff585f16a7d50ff35fc31501fcc91a6a929e1638f4a",
+      "source_sha256": "52f840cdcb64b9a84bc34ff585f16a7d50ff35fc31501fcc91a6a929e1638f4a"
+    },
+    "tests/test_knowledge_loop.py": {
+      "member": "workflow-observatory/evidence/tests/test_knowledge_loop.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "564a10be9cfd379bd7d084908efa7dd3cd112cd04f7044fa75186901e74d1dc6",
+      "source_sha256": "564a10be9cfd379bd7d084908efa7dd3cd112cd04f7044fa75186901e74d1dc6"
+    },
+    "tests/test_observation_cli.py": {
+      "member": "workflow-observatory/evidence/tests/test_observation_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "3140e1ab9d3aea423718e2a1ffd6ce61b4c097f54c19238e2d96f9c2359cb297",
+      "source_sha256": "3140e1ab9d3aea423718e2a1ffd6ce61b4c097f54c19238e2d96f9c2359cb297"
+    },
+    "tests/test_observation_integration.py": {
+      "member": "workflow-observatory/evidence/tests/test_observation_integration.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d9c698a7f5c6529d03579f944069ceabc212702de10c7648dd9c4a8a942b8662",
+      "source_sha256": "d9c698a7f5c6529d03579f944069ceabc212702de10c7648dd9c4a8a942b8662"
+    },
+    "tests/test_observation_lifecycle.py": {
+      "member": "workflow-observatory/evidence/tests/test_observation_lifecycle.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "a426ade11b6366eb58f4cf4cb373f0d5b5f8f2c8b66b77ba18940b030174a687",
+      "source_sha256": "a426ade11b6366eb58f4cf4cb373f0d5b5f8f2c8b66b77ba18940b030174a687"
+    },
+    "tests/test_observation_records.py": {
+      "member": "workflow-observatory/evidence/tests/test_observation_records.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "14cee3c250c2af0b6b699a25abdbb71af8af90fc2a6478682364255e58b87c5c",
+      "source_sha256": "14cee3c250c2af0b6b699a25abdbb71af8af90fc2a6478682364255e58b87c5c"
+    },
+    "tests/test_observation_report.py": {
+      "member": "workflow-observatory/evidence/tests/test_observation_report.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "6d03e49a01d30ec41a4139f1a8720347061ba51e2da8ae14822cc7f316ddb423",
+      "source_sha256": "6d03e49a01d30ec41a4139f1a8720347061ba51e2da8ae14822cc7f316ddb423"
+    },
+    "tests/test_observing_workflows_eval_harness.py": {
+      "member": "workflow-observatory/evidence/tests/test_observing_workflows_eval_harness.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "9b123cb2f1246c1daa8cc6cdbca9d647691440029f6f3ff9dc02aeb704747391",
+      "source_sha256": "9b123cb2f1246c1daa8cc6cdbca9d647691440029f6f3ff9dc02aeb704747391"
+    },
+    "tests/test_observing_workflows_task9_eval.py": {
+      "member": "workflow-observatory/evidence/tests/test_observing_workflows_task9_eval.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "8d0c3eebf9f40d898e475e3bc43f99b8fef36215ad827392a9addbfcb928b6e0",
+      "source_sha256": "8d0c3eebf9f40d898e475e3bc43f99b8fef36215ad827392a9addbfcb928b6e0"
+    },
+    "tests/test_task_records.py": {
+      "member": "workflow-observatory/evidence/tests/test_task_records.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "852c235f406fa1be61660f814267e800952d9dc4553509a51b5b1ed37631bb92",
+      "source_sha256": "852c235f406fa1be61660f814267e800952d9dc4553509a51b5b1ed37631bb92"
+    },
+    "wiki/concept/Workflow_Observation_and_Process_Knowledge.md": {
+      "member": "workflow-observatory/evidence/wiki/concept/Workflow_Observation_and_Process_Knowledge.md",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "e11690df4bfde10d3c52650fc315114abd8b892ba099516ddbfcafd944c5967f",
+      "source_sha256": "e11690df4bfde10d3c52650fc315114abd8b892ba099516ddbfcafd944c5967f"
+    },
+    "wiki_cli.py": {
+      "member": "workflow-observatory/evidence/wiki_cli.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d131b916832c6807478b283de429324aaff82704dae8cb84f88590fa2f35bf51",
+      "source_sha256": "d131b916832c6807478b283de429324aaff82704dae8cb84f88590fa2f35bf51"
+    },
+    "wiki_observations.py": {
+      "member": "workflow-observatory/evidence/wiki_observations.py",
+      "normalizations": [],
+      "normalized": false,
+      "packaged_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f",
+      "source_sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f"
+    }
+  },
+  "schema_version": 1,
+  "zip_timestamp": "2026-07-15T00:00:00Z"
+}
