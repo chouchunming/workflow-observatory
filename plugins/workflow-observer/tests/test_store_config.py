@@ -28,6 +28,17 @@ class StoreConfigTests(unittest.TestCase):
 
         self.assertEqual(Path("/tmp/environment-home/store"), config.root)
 
+    def test_rejects_relative_explicit_home(self):
+        with self.assertRaisesRegex(ConfigError, "observation home must be absolute"):
+            load_store_config(home=Path("relative-home"), environ={})
+
+    def test_rejects_relative_environment_home(self):
+        with self.assertRaisesRegex(ConfigError, "observation home must be absolute"):
+            load_store_config(
+                home=Path("/tmp/ignored-home"),
+                environ={"WORKFLOW_OBSERVATORY_HOME": "relative-home"},
+            )
+
     def test_loads_explicit_portable_config(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

@@ -38,7 +38,11 @@ def _report_date(value: str) -> date:
         ) from error
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, agent_surface: str = "codex") -> argparse.ArgumentParser:
+    if agent_surface not in {"codex", "claude"}:
+        raise ObservationError(
+            "validation", "agent_surface must be codex or claude"
+        )
     parser = CliArgumentParser(description="Record local workflow observations")
     subparsers = parser.add_subparsers(
         dest="command", required=True, parser_class=CliArgumentParser
@@ -48,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--title", required=True)
     start.add_argument("--subject-root", required=True)
     start.add_argument("--project")
-    start.add_argument("--agent-surface", required=True, choices=("codex",))
+    start.add_argument("--agent-surface", required=True, choices=(agent_surface,))
     start.add_argument("--start-mode", required=True, choices=("planned", "late"))
     start.add_argument("--task-type", required=True, choices=sorted(wiki_observations.TAXONOMY))
     start.add_argument(
@@ -482,10 +486,15 @@ def _fail(error: ObservationError) -> int:
     return 1 if error.kind == "io" else 2
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    agent_surface: str = "codex",
+    default_home: Path | None = None,
+) -> int:
     try:
-        args = build_parser().parse_args(argv)
-        config = load_store_config()
+        args = build_parser(agent_surface=agent_surface).parse_args(argv)
+        config = load_store_config(home=default_home)
         if config.adapter == "llmwiki":
             if args.command in {"validate", "integrity"}:
                 paths = ObservationPaths.from_root(config.root)

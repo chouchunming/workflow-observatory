@@ -317,6 +317,18 @@ class ProvenanceTests(unittest.TestCase):
 
 
 class StartRequestValidationTests(unittest.TestCase):
+    def test_agent_surface_set_is_exact(self):
+        for surface in ("codex", "claude"):
+            with self.subTest(surface=surface):
+                validate_start_request(make_start_request(agent_surface=surface))
+        for surface in ("", "Claude", "codex-cli", "other"):
+            with self.subTest(surface=surface):
+                with self.assertRaisesRegex(
+                    ObservationError,
+                    "agent_surface must be codex or claude",
+                ):
+                    validate_start_request(make_start_request(agent_surface=surface))
+
     def test_taxonomy_and_provenance_are_validated(self):
         taxonomy_error = make_start_request(task_type="feature", workflow_variant="compile-basic")
         with self.assertRaisesRegex(ObservationError, "invalid taxonomy combination"):

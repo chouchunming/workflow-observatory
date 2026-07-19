@@ -89,12 +89,18 @@ def parse_store_config(config: Mapping[str, Any]) -> StoreConfig:
 def load_store_config(home=None, environ=None) -> StoreConfig:
     """Load local configuration, defaulting to the portable adapter."""
     env = dict(os.environ if environ is None else environ)
-    base = Path(
-        env.get(
-            "WORKFLOW_OBSERVATORY_HOME",
-            home or Path.home() / ".codex/workflow-observatory",
-        )
-    ).expanduser()
+    if "WORKFLOW_OBSERVATORY_HOME" in env:
+        candidate = env["WORKFLOW_OBSERVATORY_HOME"]
+    elif home is not None:
+        candidate = home
+    else:
+        candidate = Path.home() / ".codex/workflow-observatory"
+    try:
+        base = Path(candidate).expanduser()
+    except (TypeError, ValueError) as error:
+        raise ConfigError("observation home must be a path") from error
+    if not base.is_absolute():
+        raise ConfigError("observation home must be absolute")
     path = base / "config.json"
     if not path.exists():
         return StoreConfig("portable", base / "store", None)
