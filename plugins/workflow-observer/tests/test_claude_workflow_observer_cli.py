@@ -10,6 +10,9 @@ import unittest
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 CODEX_CLI = PLUGIN_ROOT / "scripts/workflow_observer_cli.py"
 CLAUDE_CLI = PLUGIN_ROOT / "scripts/claude_workflow_observer_cli.py"
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+from claude_session_bindings import lookup_session
 
 SCOPE = """## Scope
 
@@ -70,6 +73,8 @@ class ClaudeWorkflowObserverCliTests(unittest.TestCase):
         cli: Path,
         *arguments: str,
         observer_home: Path | str | None = None,
+        claude_session_id: str | None = "claude-session-opaque",
+        claude_plugin_data: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = {
             **os.environ,
@@ -77,8 +82,15 @@ class ClaudeWorkflowObserverCliTests(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         environment.pop("WORKFLOW_OBSERVATORY_HOME", None)
+        environment.pop("CLAUDE_SESSION_ID", None)
+        environment.pop("CLAUDE_PLUGIN_DATA", None)
         if observer_home is not None:
             environment["WORKFLOW_OBSERVATORY_HOME"] = str(observer_home)
+        if claude_session_id is not None:
+            environment["CLAUDE_SESSION_ID"] = claude_session_id
+            environment["CLAUDE_PLUGIN_DATA"] = str(
+                claude_plugin_data or (self.base / "claude-plugin-data")
+            )
         return subprocess.run(
             [sys.executable, str(cli), *arguments],
             cwd=PLUGIN_ROOT,
@@ -240,6 +252,168 @@ print('obs-20260719-120000-abcdef')
         self.assertFalse((claude_home / "session-bindings").exists())
         self.assertFalse((llmwiki_root / "wiki").exists())
         self.assertEqual(["config.json"], sorted(path.name for path in claude_home.iterdir()))
+
+    def test_rejected_start_creates_no_binding_and_successful_start_binds(self):
+        plugin_data = self.base / "plugin-data"
+        rejected = self.run_cli(
+            CLAUDE_CLI,
+            "start",
+            "--title",
+            "rejected",
+            claude_plugin_data=plugin_data,
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertFalse((plugin_data / "session-bindings").exists())
+
+        started = self.start(CLAUDE_CLI, "claude", observer_home=self.base / "observer")
+        self.assertEqual((0, ""), (started.returncode, started.stderr))
+        self.assertEqual(
+            started.stdout.strip(),
+            lookup_session(self.base / "claude-plugin-data", "claude-session-opaque"),
+        )
+
+    def test_successful_finish_unbinds_and_rejected_finish_retains(self):
+        observer_home = self.base / "observer"
+        started = self.start(
+            CLAUDE_CLI,
+            "claude",
+            observer_home=observer_home,
+        )
+        run_id = started.stdout.strip()
+        # The default helper plugin-data path is used by start.
+        default_plugin_data = self.base / "claude-plugin-data"
+        rejected = self.run_cli(
+            CLAUDE_CLI,
+            "finish",
+            run_id,
+            "--status",
+            "not-a-status",
+            "--from-file",
+            str(self.completion),
+            observer_home=observer_home,
+            claude_session_id="claude-session-opaque",
+            claude_plugin_data=default_plugin_data,
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertEqual(run_id, lookup_session(default_plugin_data, "claude-session-opaque"))
+
+        finished = self.run_cli(
+            CLAUDE_CLI,
+            "finish",
+            run_id,
+            "--status",
+            "success",
+            "--from-file",
+            str(self.completion),
+            observer_home=observer_home,
+            claude_session_id="claude-session-opaque",
+            claude_plugin_data=default_plugin_data,
+        )
+        self.assertEqual((0, "", ""), (finished.returncode, finished.stdout, finished.stderr))
+        self.assertIsNone(lookup_session(default_plugin_data, "claude-session-opaque"))
+
+    def test_replacement_binding_precedes_and_survives_old_superseded_finish(self):
+        observer_home = self.base / "observer"
+        old = self.start(
+            CLAUDE_CLI,
+            "claude",
+            observer_home=observer_home,
+        ).stdout.strip()
+        new = self.run_cli(
+            CLAUDE_CLI,
+            "start",
+            "--title",
+            "replacement",
+            "--subject-root",
+            str(self.subject),
+            "--agent-surface",
+            "claude",
+            "--start-mode",
+            "planned",
+            "--task-type",
+            "feature",
+            "--workflow-variant",
+            "implementation-with-review",
+            "--scope-from-file",
+            str(self.scope),
+            observer_home=observer_home,
+        ).stdout.strip()
+        default_plugin_data = self.base / "claude-plugin-data"
+        self.assertEqual(new, lookup_session(default_plugin_data, "claude-session-opaque"))
+
+        superseded = self.run_cli(
+            CLAUDE_CLI,
+            "finish",
+            old,
+            "--status",
+            "superseded",
+            "--superseded-by",
+            new,
+            "--from-file",
+            str(self.completion),
+            observer_home=observer_home,
+        )
+        self.assertEqual((0, "", ""), (superseded.returncode, superseded.stdout, superseded.stderr))
+        self.assertEqual(new, lookup_session(default_plugin_data, "claude-session-opaque"))
+
+    def test_missing_binding_environment_degrades_nonblockingly_with_bounded_disclosure(self):
+        started = self.run_cli(
+            CLAUDE_CLI,
+            "start",
+            "--title",
+            "degraded",
+            "--subject-root",
+            str(self.subject),
+            "--agent-surface",
+            "claude",
+            "--start-mode",
+            "planned",
+            "--task-type",
+            "feature",
+            "--workflow-variant",
+            "implementation-with-review",
+            "--scope-from-file",
+            str(self.scope),
+            observer_home=self.base / "degraded-observer",
+            claude_session_id=None,
+        )
+
+        self.assertEqual(0, started.returncode)
+        self.assertRegex(started.stdout, r"^obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\n$")
+        self.assertEqual(
+            "workflow observer notice: hook-assisted parent propagation unavailable\n",
+            started.stderr,
+        )
+        self.assertNotIn(str(self.base), started.stderr)
+
+    def test_missing_finish_binding_environment_discloses_degradation_and_retains_binding(self):
+        observer_home = self.base / "finish-degraded-observer"
+        started = self.start(
+            CLAUDE_CLI,
+            "claude",
+            observer_home=observer_home,
+        )
+        run_id = started.stdout.strip()
+        plugin_data = self.base / "claude-plugin-data"
+        finished = self.run_cli(
+            CLAUDE_CLI,
+            "finish",
+            run_id,
+            "--status",
+            "success",
+            "--from-file",
+            str(self.completion),
+            observer_home=observer_home,
+            claude_session_id=None,
+        )
+
+        self.assertEqual(0, finished.returncode)
+        self.assertEqual("", finished.stdout)
+        self.assertEqual(
+            "workflow observer notice: hook-assisted parent propagation unavailable\n",
+            finished.stderr,
+        )
+        self.assertEqual(run_id, lookup_session(plugin_data, "claude-session-opaque"))
 
 
 if __name__ == "__main__":
