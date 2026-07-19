@@ -78,7 +78,7 @@ Do not ignore arbitrary dot-directories, change the public allowlist, relax syml
 ```bash
 caffeinate -dimsu -- python3 -m unittest plugins.workflow-observer.tests.test_package_archive
 caffeinate -dimsu -- python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
-caffeinate -dimsu -- python3 -m unittest discover -s evidence/tests -p 'test_*.py'
+caffeinate -dimsu -- sh -c 'cd evidence && python3 -m unittest discover -s tests -p "test_*.py"'
 ```
 
 Verify package completeness, personal-path rejection, symlink rejection, SHA inventory, and byte reproducibility tests still pass.
@@ -177,7 +177,7 @@ caffeinate -dimsu -- python3 -m unittest \
   plugins.workflow-observer.tests.test_store_config \
   plugins.workflow-observer.tests.test_claude_workflow_observer_cli
 caffeinate -dimsu -- python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
-caffeinate -dimsu -- python3 -m unittest discover -s evidence/tests -p 'test_*.py'
+caffeinate -dimsu -- sh -c 'cd evidence && python3 -m unittest discover -s tests -p "test_*.py"'
 ```
 
 If the repository maintains canonical source copies, run their existing sync/check command and update only the required generated/canonical files.
@@ -261,7 +261,7 @@ caffeinate -dimsu -- python3 -m unittest \
   plugins.workflow-observer.tests.test_claude_hook \
   plugins.workflow-observer.tests.test_claude_workflow_observer_cli
 caffeinate -dimsu -- python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
-caffeinate -dimsu -- python3 -m unittest discover -s evidence/tests -p 'test_*.py'
+caffeinate -dimsu -- sh -c 'cd evidence && python3 -m unittest discover -s tests -p "test_*.py"'
 ```
 
 **Step 7: Commit**
@@ -408,7 +408,7 @@ If you validate it, find a compatibility issue, or implement a fix, please submi
 
 ```bash
 caffeinate -dimsu -- python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
-caffeinate -dimsu -- python3 -m unittest discover -s evidence/tests -p 'test_*.py'
+caffeinate -dimsu -- sh -c 'cd evidence && python3 -m unittest discover -s tests -p "test_*.py"'
 caffeinate -dimsu -- python3 /Users/vincent/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/workflow-observer
 caffeinate -dimsu -- claude plugin validate --strict plugins/workflow-observer
 ```
