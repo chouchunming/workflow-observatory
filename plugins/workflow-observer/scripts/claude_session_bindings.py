@@ -38,6 +38,26 @@ class _Layout:
     locks_fd: int
 
 
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class _BindingSnapshot:
+    run_id: str
+    identity: _FileIdentity
+
+
+@dataclass(frozen=True)
+class _SessionLock:
+    descriptor: int
+    name: str
+    identity: _FileIdentity
+
+
 def _unavailable() -> BindingError:
     return BindingError("session binding unavailable")
 
@@ -48,6 +68,19 @@ def _invalid() -> BindingError:
 
 def _same_identity(*entries: os.stat_result) -> bool:
     return len({(entry.st_dev, entry.st_ino) for entry in entries}) == 1
+
+
+def _file_identity(entry: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(entry.st_dev, entry.st_ino, stat.S_IMODE(entry.st_mode))
+
+
+def _matches_identity(entry: os.stat_result, identity: _FileIdentity) -> bool:
+    return (
+        stat.S_ISREG(entry.st_mode)
+        and entry.st_dev == identity.device
+        and entry.st_ino == identity.inode
+        and stat.S_IMODE(entry.st_mode) == identity.mode
+    )
 
 
 def _directory_flags() -> int:
@@ -197,7 +230,7 @@ def _entry_stat(directory_fd: int, name: str) -> os.stat_result | None:
 @contextmanager
 def _exclusive_lock(
     layout: _Layout, digest: str, *, create: bool
-) -> Iterator[bool]:
+) -> Iterator[_SessionLock | None]:
     if fcntl is None:
         raise _unavailable()
     name = f"{digest}.lock"
@@ -205,7 +238,7 @@ def _exclusive_lock(
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     if before is None:
         if not create:
-            yield False
+            yield None
             return
         try:
             descriptor = os.open(
@@ -262,7 +295,9 @@ def _exclusive_lock(
             or not _same_identity(opened, locked, current)
         ):
             raise _invalid()
-        yield True
+        session_lock = _SessionLock(descriptor, name, _file_identity(locked))
+        _verify_lock(layout, session_lock)
+        yield session_lock
     except BindingError:
         raise
     except OSError as error:
@@ -275,7 +310,24 @@ def _exclusive_lock(
         os.close(descriptor)
 
 
-def _read_binding(layout: _Layout, digest: str) -> str | None:
+def _verify_lock(layout: _Layout, session_lock: _SessionLock) -> None:
+    try:
+        opened = os.fstat(session_lock.descriptor)
+        current = os.stat(
+            session_lock.name,
+            dir_fd=layout.locks_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise _unavailable() from error
+    if (
+        not _matches_identity(opened, session_lock.identity)
+        or not _matches_identity(current, session_lock.identity)
+    ):
+        raise _invalid()
+
+
+def _read_binding(layout: _Layout, digest: str) -> _BindingSnapshot | None:
     name = f"{digest}.json"
     before = _entry_stat(layout.bindings_fd, name)
     if before is None:
@@ -337,10 +389,163 @@ def _read_binding(layout: _Layout, digest: str) -> str | None:
         or decoded.get("state") != "active"
     ):
         raise _invalid()
-    return decoded["run_id"]
+    return _BindingSnapshot(decoded["run_id"], _file_identity(opened))
 
 
-def _write_binding(layout: _Layout, digest: str, run_id: str, state: str) -> None:
+def _unique_available_name(layout: _Layout, prefix: str, digest: str) -> str:
+    for _ in range(16):
+        candidate = f".{prefix}-{digest}-{secrets.token_hex(8)}"
+        if _entry_stat(layout.bindings_fd, candidate) is None:
+            return candidate
+    raise _unavailable()
+
+
+def _link_backup(
+    layout: _Layout,
+    destination: str,
+    digest: str,
+    prior: _BindingSnapshot,
+) -> str:
+    for _ in range(16):
+        backup = f".backup-{digest}-{secrets.token_hex(8)}"
+        try:
+            os.link(
+                destination,
+                backup,
+                src_dir_fd=layout.bindings_fd,
+                dst_dir_fd=layout.bindings_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise _unavailable() from error
+        linked = _entry_stat(layout.bindings_fd, backup)
+        if linked is None or not _matches_identity(linked, prior.identity):
+            raise _invalid()
+        try:
+            os.fsync(layout.bindings_fd)
+        except OSError as error:
+            raise _unavailable() from error
+        return backup
+    raise _unavailable()
+
+
+def _unlink_if_identity(
+    layout: _Layout,
+    name: str,
+    identity: _FileIdentity,
+) -> bool:
+    current = _entry_stat(layout.bindings_fd, name)
+    if current is None:
+        return True
+    if not _matches_identity(current, identity):
+        return False
+    try:
+        os.unlink(name, dir_fd=layout.bindings_fd)
+        os.fsync(layout.bindings_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _move_to_quarantine(
+    layout: _Layout,
+    source: str,
+    prefix: str,
+    digest: str,
+    identity: _FileIdentity,
+) -> str:
+    quarantine = _unique_available_name(layout, prefix, digest)
+    try:
+        os.replace(
+            source,
+            quarantine,
+            src_dir_fd=layout.bindings_fd,
+            dst_dir_fd=layout.bindings_fd,
+        )
+        moved = os.stat(
+            quarantine,
+            dir_fd=layout.bindings_fd,
+            follow_symlinks=False,
+        )
+        if not _matches_identity(moved, identity):
+            raise _invalid()
+        os.fsync(layout.bindings_fd)
+    except BindingError:
+        raise
+    except OSError as error:
+        raise _unavailable() from error
+    return quarantine
+
+
+def _restore_quarantine(
+    layout: _Layout,
+    quarantine: str,
+    destination: str,
+    identity: _FileIdentity,
+) -> None:
+    before = _entry_stat(layout.bindings_fd, quarantine)
+    if before is None or not _matches_identity(before, identity):
+        raise _invalid()
+    try:
+        os.replace(
+            quarantine,
+            destination,
+            src_dir_fd=layout.bindings_fd,
+            dst_dir_fd=layout.bindings_fd,
+        )
+        restored = os.stat(
+            destination,
+            dir_fd=layout.bindings_fd,
+            follow_symlinks=False,
+        )
+        if not _matches_identity(restored, identity):
+            raise _invalid()
+        os.fsync(layout.bindings_fd)
+    except BindingError:
+        raise
+    except OSError as error:
+        raise _unavailable() from error
+
+
+def _recover_write(
+    layout: _Layout,
+    destination: str,
+    digest: str,
+    prior: _BindingSnapshot | None,
+    backup: str | None,
+) -> None:
+    current = _entry_stat(layout.bindings_fd, destination)
+    if current is not None and (
+        prior is None or not _matches_identity(current, prior.identity)
+    ):
+        _move_to_quarantine(
+            layout,
+            destination,
+            "rejected",
+            digest,
+            _file_identity(current),
+        )
+    if prior is not None:
+        if backup is None:
+            raise _invalid()
+        _restore_quarantine(
+            layout,
+            backup,
+            destination,
+            prior.identity,
+        )
+
+
+def _write_binding(
+    layout: _Layout,
+    digest: str,
+    run_id: str,
+    state: str,
+    prior: _BindingSnapshot | None,
+    session_lock: _SessionLock,
+) -> None:
     payload = json.dumps(
         {"schema_version": 1, "run_id": run_id, "state": state},
         separators=(",", ":"),
@@ -350,8 +555,14 @@ def _write_binding(layout: _Layout, digest: str, run_id: str, state: str) -> Non
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = -1
     temporary: str | None = None
-    created = False
+    temporary_identity: _FileIdentity | None = None
+    backup: str | None = None
+    replaced = False
+    recovery_failed = False
     try:
+        _verify_lock(layout, session_lock)
+        if prior is not None:
+            backup = _link_backup(layout, destination, digest, prior)
         for _ in range(16):
             candidate = f".tmp-{digest}-{secrets.token_hex(8)}"
             try:
@@ -361,32 +572,48 @@ def _write_binding(layout: _Layout, digest: str, run_id: str, state: str) -> Non
             except FileExistsError:
                 continue
             temporary = candidate
-            created = True
             break
         if descriptor < 0 or temporary is None:
             raise _unavailable()
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o600:
             raise _invalid()
+        temporary_identity = _file_identity(opened)
         offset = 0
         while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise _unavailable()
+            offset += written
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
+        temporary_entry = os.stat(
+            temporary,
+            dir_fd=layout.bindings_fd,
+            follow_symlinks=False,
+        )
+        if not _matches_identity(temporary_entry, temporary_identity):
+            raise _invalid()
+        _verify_lock(layout, session_lock)
         os.replace(
             temporary,
             destination,
             src_dir_fd=layout.bindings_fd,
             dst_dir_fd=layout.bindings_fd,
         )
+        replaced = True
         os.fsync(layout.bindings_fd)
         current = os.stat(destination, dir_fd=layout.bindings_fd, follow_symlinks=False)
-        if not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) != 0o600:
+        if not _matches_identity(current, temporary_identity):
             raise _invalid()
-    except BindingError:
-        raise
-    except OSError as error:
+        _verify_lock(layout, session_lock)
+    except (BindingError, OSError) as error:
+        if replaced:
+            try:
+                _recover_write(layout, destination, digest, prior, backup)
+            except (BindingError, OSError):
+                recovery_failed = True
+        if isinstance(error, BindingError):
+            raise
         raise _unavailable() from error
     finally:
         if descriptor >= 0:
@@ -394,13 +621,10 @@ def _write_binding(layout: _Layout, digest: str, run_id: str, state: str) -> Non
                 os.close(descriptor)
             except OSError:
                 pass
-        if created and temporary is not None:
-            try:
-                os.unlink(temporary, dir_fd=layout.bindings_fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+        if temporary is not None and temporary_identity is not None:
+            _unlink_if_identity(layout, temporary, temporary_identity)
+        if backup is not None and prior is not None and not recovery_failed:
+            _unlink_if_identity(layout, backup, prior.identity)
 
 
 def bind_session(
@@ -420,9 +644,17 @@ def bind_session(
         raise _invalid()
     with _open_layout(root, create=True) as layout:
         assert layout is not None
-        with _exclusive_lock(layout, digest, create=True):
-            _read_binding(layout, digest)
-            _write_binding(layout, digest, run_id, state)
+        with _exclusive_lock(layout, digest, create=True) as session_lock:
+            assert session_lock is not None
+            prior = _read_binding(layout, digest)
+            _write_binding(
+                layout,
+                digest,
+                run_id,
+                state,
+                prior,
+                session_lock,
+            )
 
 
 def lookup_session(plugin_data: Path | str, session_id: str) -> str | None:
@@ -433,12 +665,15 @@ def lookup_session(plugin_data: Path | str, session_id: str) -> str | None:
         if layout is None:
             return None
         binding_exists = _entry_stat(layout.bindings_fd, f"{digest}.json") is not None
-        with _exclusive_lock(layout, digest, create=False) as locked:
-            if not locked:
+        with _exclusive_lock(layout, digest, create=False) as session_lock:
+            if session_lock is None:
                 if binding_exists:
                     raise _invalid()
                 return None
-            return _read_binding(layout, digest)
+            _verify_lock(layout, session_lock)
+            snapshot = _read_binding(layout, digest)
+            _verify_lock(layout, session_lock)
+            return None if snapshot is None else snapshot.run_id
 
 
 def unbind_session(
@@ -456,17 +691,56 @@ def unbind_session(
         if layout is None:
             return False
         binding_exists = _entry_stat(layout.bindings_fd, f"{digest}.json") is not None
-        with _exclusive_lock(layout, digest, create=False) as locked:
-            if not locked:
+        with _exclusive_lock(layout, digest, create=False) as session_lock:
+            if session_lock is None:
                 if binding_exists:
                     raise _invalid()
                 return False
+            _verify_lock(layout, session_lock)
             current = _read_binding(layout, digest)
-            if current is None or current != expected_run_id:
+            if current is None or current.run_id != expected_run_id:
+                _verify_lock(layout, session_lock)
                 return False
+            _verify_lock(layout, session_lock)
+            destination = f"{digest}.json"
+            quarantine = _unique_available_name(layout, "remove", digest)
+            moved_identity: _FileIdentity | None = None
             try:
-                os.unlink(f"{digest}.json", dir_fd=layout.bindings_fd)
+                os.replace(
+                    destination,
+                    quarantine,
+                    src_dir_fd=layout.bindings_fd,
+                    dst_dir_fd=layout.bindings_fd,
+                )
+                moved = os.stat(
+                    quarantine,
+                    dir_fd=layout.bindings_fd,
+                    follow_symlinks=False,
+                )
+                moved_identity = _file_identity(moved)
+                if not _matches_identity(moved, current.identity):
+                    _restore_quarantine(
+                        layout,
+                        quarantine,
+                        destination,
+                        moved_identity,
+                    )
+                    raise _invalid()
                 os.fsync(layout.bindings_fd)
+                try:
+                    _verify_lock(layout, session_lock)
+                except BindingError:
+                    _restore_quarantine(
+                        layout,
+                        quarantine,
+                        destination,
+                        current.identity,
+                    )
+                    raise
+                if not _unlink_if_identity(layout, quarantine, current.identity):
+                    raise _unavailable()
+            except BindingError:
+                raise
             except OSError as error:
                 raise _unavailable() from error
             return True

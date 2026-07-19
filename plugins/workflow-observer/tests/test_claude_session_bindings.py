@@ -19,6 +19,7 @@ import claude_session_bindings as bindings
 
 RUN_ONE = "obs-20260719-120000-abcdef"
 RUN_TWO = "obs-20260719-120001-123abc"
+RUN_THREE = "obs-20260719-120002-fedcba"
 
 
 class ClaudeSessionBindingTests(unittest.TestCase):
@@ -40,6 +41,23 @@ class ClaudeSessionBindingTests(unittest.TestCase):
         self.assertLessEqual(len(message), 200)
         self.assertNotIn(self.session_id, message)
         self.assertNotIn(str(self.base), message)
+
+    @staticmethod
+    def write_binding_payload(path: Path, run_id: str) -> None:
+        path.write_text(
+            json.dumps(
+                {"schema_version": 1, "run_id": run_id, "state": "active"},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+    @staticmethod
+    def payload_run(path: Path) -> str:
+        return json.loads(path.read_text(encoding="utf-8"))["run_id"]
 
     def test_bind_lookup_unbind_use_only_private_hashed_state(self):
         bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
@@ -244,6 +262,115 @@ class ClaudeSessionBindingTests(unittest.TestCase):
         self.assertEqual(RUN_ONE, bindings.lookup_session(self.plugin_data, self.session_id))
         self.assertEqual([], list(self.binding.parent.glob(".tmp-*")))
 
+    def test_temp_path_substitution_cannot_commit_foreign_payload(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign = self.binding.parent / "foreign-write.json"
+        self.write_binding_payload(foreign, RUN_THREE)
+        real_replace = bindings.os.replace
+        injected = False
+
+        def substitute_temp(source, destination, *args, **kwargs):
+            nonlocal injected
+            if (
+                not injected
+                and os.fspath(source).startswith(".tmp-")
+                and os.fspath(destination) == self.binding.name
+            ):
+                injected = True
+                real_replace(
+                    foreign.name,
+                    source,
+                    src_dir_fd=kwargs["src_dir_fd"],
+                    dst_dir_fd=kwargs["src_dir_fd"],
+                )
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch.object(bindings.os, "replace", side_effect=substitute_temp):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.bind_session(self.plugin_data, self.session_id, RUN_TWO)
+
+        self.assert_bounded(rejected.exception)
+        self.assertTrue(injected)
+        self.assertEqual(RUN_ONE, bindings.lookup_session(self.plugin_data, self.session_id))
+        rejected_files = list(self.binding.parent.glob(".rejected-*"))
+        self.assertEqual([RUN_THREE], [self.payload_run(path) for path in rejected_files])
+
+    def test_temp_substitution_quarantine_failure_preserves_both_inodes(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign = self.binding.parent / "foreign-quarantine.json"
+        self.write_binding_payload(foreign, RUN_THREE)
+        real_replace = bindings.os.replace
+        injected = False
+
+        def fail_quarantine(source, destination, *args, **kwargs):
+            nonlocal injected
+            source_name = os.fspath(source)
+            destination_name = os.fspath(destination)
+            if (
+                not injected
+                and source_name.startswith(".tmp-")
+                and destination_name == self.binding.name
+            ):
+                injected = True
+                real_replace(
+                    foreign.name,
+                    source,
+                    src_dir_fd=kwargs["src_dir_fd"],
+                    dst_dir_fd=kwargs["src_dir_fd"],
+                )
+            elif source_name == self.binding.name and destination_name.startswith(
+                ".rejected-"
+            ):
+                raise OSError("injected quarantine failure")
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch.object(bindings.os, "replace", side_effect=fail_quarantine):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.bind_session(self.plugin_data, self.session_id, RUN_TWO)
+
+        self.assert_bounded(rejected.exception)
+        self.assertEqual(RUN_THREE, bindings.lookup_session(self.plugin_data, self.session_id))
+        backups = list(self.binding.parent.glob(".backup-*"))
+        self.assertEqual([RUN_ONE], [self.payload_run(path) for path in backups])
+
+    def test_temp_substitution_restore_failure_retains_verified_backup(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign = self.binding.parent / "foreign-restore.json"
+        self.write_binding_payload(foreign, RUN_THREE)
+        real_replace = bindings.os.replace
+        injected = False
+
+        def fail_restore(source, destination, *args, **kwargs):
+            nonlocal injected
+            source_name = os.fspath(source)
+            destination_name = os.fspath(destination)
+            if (
+                not injected
+                and source_name.startswith(".tmp-")
+                and destination_name == self.binding.name
+            ):
+                injected = True
+                real_replace(
+                    foreign.name,
+                    source,
+                    src_dir_fd=kwargs["src_dir_fd"],
+                    dst_dir_fd=kwargs["src_dir_fd"],
+                )
+            elif source_name.startswith(".backup-") and destination_name == self.binding.name:
+                raise OSError("injected restore failure")
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch.object(bindings.os, "replace", side_effect=fail_restore):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.bind_session(self.plugin_data, self.session_id, RUN_TWO)
+
+        self.assert_bounded(rejected.exception)
+        self.assertFalse(self.binding.exists())
+        backups = list(self.binding.parent.glob(".backup-*"))
+        rejected_files = list(self.binding.parent.glob(".rejected-*"))
+        self.assertEqual([RUN_ONE], [self.payload_run(path) for path in backups])
+        self.assertEqual([RUN_THREE], [self.payload_run(path) for path in rejected_files])
+
     def test_temp_name_collision_retries_without_removing_foreign_file(self):
         bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
         collision_token = "1" * 16
@@ -286,6 +413,155 @@ class ClaudeSessionBindingTests(unittest.TestCase):
             )
         )
         self.assertEqual(RUN_TWO, bindings.lookup_session(self.plugin_data, self.session_id))
+
+    def test_conditional_unbind_restores_binding_substituted_after_read(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign = self.binding.parent / "foreign-unbind.json"
+        self.write_binding_payload(foreign, RUN_THREE)
+        real_read = bindings._read_binding
+        real_replace = bindings.os.replace
+        injected = False
+
+        def substitute_after_read(layout, digest):
+            nonlocal injected
+            result = real_read(layout, digest)
+            run_id = result.run_id if hasattr(result, "run_id") else result
+            if not injected and run_id == RUN_ONE:
+                injected = True
+                real_replace(
+                    foreign.name,
+                    self.binding.name,
+                    src_dir_fd=layout.bindings_fd,
+                    dst_dir_fd=layout.bindings_fd,
+                )
+            return result
+
+        with mock.patch.object(bindings, "_read_binding", side_effect=substitute_after_read):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.unbind_session(
+                    self.plugin_data, self.session_id, expected_run_id=RUN_ONE
+                )
+
+        self.assert_bounded(rejected.exception)
+        self.assertTrue(injected)
+        self.assertEqual(RUN_THREE, bindings.lookup_session(self.plugin_data, self.session_id))
+
+    def test_conditional_unbind_restore_failure_quarantines_foreign_inode(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign = self.binding.parent / "foreign-unbind-restore.json"
+        self.write_binding_payload(foreign, RUN_THREE)
+        real_read = bindings._read_binding
+        real_replace = bindings.os.replace
+        injected = False
+
+        def substitute_after_read(layout, digest):
+            nonlocal injected
+            result = real_read(layout, digest)
+            run_id = result.run_id if hasattr(result, "run_id") else result
+            if not injected and run_id == RUN_ONE:
+                injected = True
+                real_replace(
+                    foreign.name,
+                    self.binding.name,
+                    src_dir_fd=layout.bindings_fd,
+                    dst_dir_fd=layout.bindings_fd,
+                )
+            return result
+
+        def fail_restore(source, destination, *args, **kwargs):
+            if os.fspath(source).startswith(".remove-") and os.fspath(
+                destination
+            ) == self.binding.name:
+                raise OSError("injected unbind restore failure")
+            return real_replace(source, destination, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                bindings,
+                "_read_binding",
+                side_effect=substitute_after_read,
+            ),
+            mock.patch.object(
+                bindings.os,
+                "replace",
+                side_effect=fail_restore,
+            ),
+        ):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.unbind_session(
+                    self.plugin_data, self.session_id, expected_run_id=RUN_ONE
+                )
+
+        self.assert_bounded(rejected.exception)
+        self.assertFalse(self.binding.exists())
+        quarantined = list(self.binding.parent.glob(".remove-*"))
+        self.assertEqual([RUN_THREE], [self.payload_run(path) for path in quarantined])
+
+    def test_lock_replacement_before_write_prevents_mutation_and_success(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign_lock = self.binding.parent / "foreign-before.lock"
+        foreign_lock.touch(mode=0o600)
+        real_read = bindings._read_binding
+        real_replace = bindings.os.replace
+        injected = False
+
+        def replace_lock_after_read(layout, digest):
+            nonlocal injected
+            result = real_read(layout, digest)
+            if not injected:
+                injected = True
+                real_replace(
+                    foreign_lock.name,
+                    self.lock.name,
+                    src_dir_fd=layout.bindings_fd,
+                    dst_dir_fd=layout.locks_fd,
+                )
+            return result
+
+        with mock.patch.object(bindings, "_read_binding", side_effect=replace_lock_after_read):
+            with self.assertRaises(bindings.BindingError) as rejected:
+                bindings.bind_session(self.plugin_data, self.session_id, RUN_TWO)
+
+        self.assert_bounded(rejected.exception)
+        self.assertEqual(RUN_ONE, bindings.lookup_session(self.plugin_data, self.session_id))
+
+    def test_lock_replacement_after_write_restores_old_binding_and_rejects(self):
+        bindings.bind_session(self.plugin_data, self.session_id, RUN_ONE)
+        foreign_lock = self.binding.parent / "foreign-after.lock"
+        foreign_lock.touch(mode=0o600)
+        real_replace = bindings.os.replace
+        injected = False
+
+        # Use a direct lock-directory descriptor because the write replacement
+        # callback receives only the binding-directory descriptor.
+        lock_directory_fd = os.open(self.lock.parent, os.O_RDONLY)
+        try:
+            def race(source, destination, *args, **kwargs):
+                nonlocal injected
+                result = real_replace(source, destination, *args, **kwargs)
+                if (
+                    not injected
+                    and os.fspath(source).startswith(".tmp-")
+                    and os.fspath(destination) == self.binding.name
+                ):
+                    injected = True
+                    real_replace(
+                        foreign_lock.name,
+                        self.lock.name,
+                        src_dir_fd=kwargs["src_dir_fd"],
+                        dst_dir_fd=lock_directory_fd,
+                    )
+                return result
+
+            with mock.patch.object(bindings.os, "replace", side_effect=race):
+                with self.assertRaises(bindings.BindingError) as rejected:
+                    bindings.bind_session(self.plugin_data, self.session_id, RUN_TWO)
+        finally:
+            os.close(lock_directory_fd)
+
+        self.assert_bounded(rejected.exception)
+        self.assertTrue(injected)
+        self.assertEqual(RUN_ONE, bindings.lookup_session(self.plugin_data, self.session_id))
 
     def test_concurrent_binds_leave_one_complete_valid_binding(self):
         program = """
