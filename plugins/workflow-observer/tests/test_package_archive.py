@@ -156,6 +156,37 @@ class ArchiveTests(unittest.TestCase):
 
         self.assertEqual(digest, verify_archive(self.archive))
 
+    def test_repository_git_file_is_ignored(self):
+        (self.source / ".git").write_text(
+            "gitdir: ../checkout.git/worktrees/release\n", encoding="utf-8"
+        )
+
+        digest = build_archive(self.source, self.archive, self.evidence)
+
+        self.assertEqual(digest, verify_archive(self.archive))
+
+    def test_repository_git_directory_symlink_is_rejected(self):
+        outside = self.root / "outside-git"
+        outside.mkdir()
+        (self.source / ".git").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            PackageError, r"symlink is forbidden in marketplace: \.git$"
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
+    def test_repository_git_entry_symlink_is_rejected(self):
+        git_dir = self.source / ".git"
+        git_dir.mkdir()
+        outside = self.root / "outside-head"
+        outside.write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (git_dir / "HEAD").symlink_to(outside)
+
+        with self.assertRaisesRegex(
+            PackageError, r"symlink is forbidden in marketplace: \.git/HEAD$"
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
     def test_archive_still_rejects_unrelated_dotfile(self):
         (self.source / ".unexpected").write_text(
             "must still fail\n", encoding="utf-8"

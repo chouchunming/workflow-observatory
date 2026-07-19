@@ -153,11 +153,11 @@ def _marketplace_files(source_root: Path) -> list[tuple[str, bytes, str]]:
     rows: list[tuple[str, bytes, str]] = []
     for path in sorted(source_root.rglob("*"), key=lambda item: item.as_posix()):
         relative = PurePosixPath(path.relative_to(source_root).as_posix())
-        if relative.parts and relative.parts[0] == ".git":
-            continue
         details = path.lstat()
         if stat.S_ISLNK(details.st_mode):
             raise PackageError(f"symlink is forbidden in marketplace: {relative}")
+        if relative.parts and relative.parts[0] == ".git":
+            continue
         if stat.S_ISDIR(details.st_mode):
             continue
         if relative.parts[0] == "evidence" or relative.as_posix() == "SHA256SUMS.json":
