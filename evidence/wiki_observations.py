@@ -366,7 +366,10 @@ def _start_request_errors(request: StartRequest) -> list[str]:
         or request.working_tree not in {"clean", "dirty", "unknown"}
     ):
         errors.append("working_tree must be clean, dirty, or unknown")
-    if request.agent_surface not in {"codex", "claude"}:
+    if (
+        not isinstance(request.agent_surface, str)
+        or request.agent_surface not in {"codex", "claude"}
+    ):
         errors.append("agent_surface must be codex or claude")
     if not isinstance(request.start_mode, str) or request.start_mode not in {"planned", "late"}:
         errors.append("start_mode must be planned or late")

@@ -212,6 +212,29 @@ class PortableCliTests(unittest.TestCase):
         self.assertEqual((0, "healthy records=1 invalidated=0\n", ""),
                          (accepted.returncode, accepted.stdout, accepted.stderr))
 
+    def test_read_only_commands_bound_unhashable_record_surface_errors(self):
+        run_id = self.start().stdout.strip()
+        record = self.home / f"store/wiki/observations/{run_id}.md"
+        record.write_text(
+            record.read_text(encoding="utf-8").replace(
+                'agent_surface: "codex"',
+                "agent_surface: []",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        for command in ("validate", "integrity"):
+            with self.subTest(command=command):
+                rejected = run_cli(self.home, command)
+                self.assertEqual(2, rejected.returncode)
+                self.assertEqual("", rejected.stdout)
+                self.assertIn(
+                    "agent_surface must be codex or claude",
+                    rejected.stderr,
+                )
+                self.assertNotIn("Traceback", rejected.stderr)
+
     def test_integrity_rejects_existing_root_through_symlink_ancestor(self):
         outside = self.base / "outside"
         store = outside / "store"

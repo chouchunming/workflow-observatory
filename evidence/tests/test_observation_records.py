@@ -321,7 +321,7 @@ class StartRequestValidationTests(unittest.TestCase):
         for surface in ("codex", "claude"):
             with self.subTest(surface=surface):
                 validate_start_request(make_start_request(agent_surface=surface))
-        for surface in ("", "Claude", "codex-cli", "other"):
+        for surface in ("", "Claude", "codex-cli", "other", [], {}):
             with self.subTest(surface=surface):
                 with self.assertRaisesRegex(
                     ObservationError,
@@ -558,6 +558,16 @@ class RecordValidationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_record_rejects_unhashable_agent_surfaces_without_crashing(self):
+        for surface in ([], {}):
+            with self.subTest(surface=surface):
+                errors = validate_record(
+                    valid_metadata(agent_surface=surface),
+                    SCOPE_TEXT,
+                    self.paths,
+                )
+                self.assertIn("agent_surface must be codex or claude", errors)
 
     def write_record(self, metadata, body=SCOPE_TEXT):
         lines = ["---"]

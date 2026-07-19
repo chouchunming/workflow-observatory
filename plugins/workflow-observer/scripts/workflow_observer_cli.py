@@ -39,7 +39,10 @@ def _report_date(value: str) -> date:
 
 
 def build_parser(*, agent_surface: str = "codex") -> argparse.ArgumentParser:
-    if agent_surface not in {"codex", "claude"}:
+    if (
+        not isinstance(agent_surface, str)
+        or agent_surface not in {"codex", "claude"}
+    ):
         raise ObservationError(
             "validation", "agent_surface must be codex or claude"
         )
