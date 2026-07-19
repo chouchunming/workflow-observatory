@@ -15,9 +15,14 @@ import zipfile
 _TEST_PATH = Path(__file__).resolve()
 _SOURCE_REPOSITORY = _TEST_PATH.parents[5]
 _SOURCE_MARKETPLACE = _SOURCE_REPOSITORY / "marketplace/workflow-observatory"
+_CHECKOUT_REPOSITORY = _TEST_PATH.parents[3] / "evidence"
+_CHECKOUT_MARKETPLACE = _CHECKOUT_REPOSITORY / "marketplace/workflow-observatory"
 if _SOURCE_MARKETPLACE.is_dir():
     REPOSITORY_ROOT = _SOURCE_REPOSITORY
     MARKETPLACE_ROOT = _SOURCE_MARKETPLACE
+elif _CHECKOUT_MARKETPLACE.is_dir():
+    REPOSITORY_ROOT = _CHECKOUT_REPOSITORY
+    MARKETPLACE_ROOT = _CHECKOUT_MARKETPLACE
 else:
     MARKETPLACE_ROOT = _TEST_PATH.parents[3]
     REPOSITORY_ROOT = MARKETPLACE_ROOT / "evidence"
@@ -136,6 +141,26 @@ class ArchiveTests(unittest.TestCase):
 
         (self.source / "linked").unlink()
         (self.source / "secret.env").write_text("TOKEN=secret", encoding="utf-8")
+        with self.assertRaisesRegex(PackageError, "unexpected marketplace file"):
+            build_archive(self.source, self.archive, self.evidence)
+
+    def test_repository_git_metadata_is_ignored(self):
+        git_dir = self.source / ".git" / "refs" / "heads"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        (self.source / ".git" / "HEAD").write_text(
+            "ref: refs/heads/main\n", encoding="utf-8"
+        )
+        (git_dir / "main").write_text("deadbeef\n", encoding="utf-8")
+
+        digest = build_archive(self.source, self.archive, self.evidence)
+
+        self.assertEqual(digest, verify_archive(self.archive))
+
+    def test_archive_still_rejects_unrelated_dotfile(self):
+        (self.source / ".unexpected").write_text(
+            "must still fail\n", encoding="utf-8"
+        )
+
         with self.assertRaisesRegex(PackageError, "unexpected marketplace file"):
             build_archive(self.source, self.archive, self.evidence)
 
