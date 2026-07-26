@@ -7501,6 +7501,49 @@ class ProgressProtocolTests(unittest.TestCase):
             tombstone_receipt_sha256=None,
         )
 
+    def _relabel_success_attempt_as_two(self, paths, message):
+        attempt_one = sharding.paths_for_attempt(paths, 1)
+        attempt_two = sharding.paths_for_attempt(paths, 2)
+        attempt_one.root.rename(attempt_two.root)
+        start = json.loads(attempt_two.start.read_text(encoding="ascii"))
+        terminal = json.loads(
+            attempt_two.terminal.read_text(encoding="ascii")
+        )
+        start["attempt"] = 2
+        start_content = sharding._atomic_write_record(
+            attempt_two.start, start
+        )
+        start_sha256 = hashlib.sha256(start_content).hexdigest()
+        terminal["attempt"] = 2
+        terminal["start_sha256"] = start_sha256
+        terminal_content = sharding._atomic_write_record(
+            attempt_two.terminal, terminal
+        )
+        terminal_sha256 = hashlib.sha256(terminal_content).hexdigest()
+        evidence_path = paths.sealed / "case-evidence.json"
+        commit_path = paths.sealed / "case-commit.json"
+        evidence = json.loads(evidence_path.read_text(encoding="ascii"))
+        commit = json.loads(commit_path.read_text(encoding="ascii"))
+        evidence["attempt"] = 2
+        evidence["attempt_start_sha256"] = start_sha256
+        evidence["attempt_terminal_sha256"] = terminal_sha256
+        evidence_content = sharding._atomic_write_record(
+            evidence_path, evidence
+        )
+        commit["attempt"] = 2
+        commit["attempt_start_sha256"] = start_sha256
+        commit["attempt_terminal_sha256"] = terminal_sha256
+        commit["evidence_sha256"] = hashlib.sha256(
+            evidence_content
+        ).hexdigest()
+        commit_content = sharding._atomic_write_record(commit_path, commit)
+        return replace(
+            message,
+            attempt=2,
+            attempt_terminal_sha256=terminal_sha256,
+            case_commit_sha256=hashlib.sha256(commit_content).hexdigest(),
+        )
+
     def test_progress_rejects_rehashed_identity_and_cross_case_result(self):
         for name, mutation in (
             ("forged-authoritative-identity", {"forged_identity": True}),
@@ -7651,6 +7694,38 @@ class ProgressProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sharding.write_progress(worker_root, message)
 
+    def test_progress_rejects_invalid_attempt_root_inventory(self):
+        for name, prepare in (
+            (
+                "attempt-root-03",
+                lambda attempts: (attempts / "03").mkdir(mode=0o700),
+            ),
+            (
+                "attempt-root-partial-02",
+                lambda attempts: (attempts / "02").mkdir(mode=0o700),
+            ),
+            (
+                "attempt-root-file-02",
+                lambda attempts: sharding._atomic_write_record(
+                    attempts / "02", {"invalid": True}
+                ),
+            ),
+        ):
+            with self.subTest(layout=name):
+                worker_root, paths, message = (
+                    self._success_terminal_scenario(name)
+                )
+                prepare(paths.attempts)
+                with self.assertRaises(ValueError):
+                    sharding.write_progress(worker_root, message)
+
+        worker_root, paths, message = self._success_terminal_scenario(
+            "attempt-root-only-02"
+        )
+        message = self._relabel_success_attempt_as_two(paths, message)
+        with self.assertRaises(ValueError):
+            sharding.write_progress(worker_root, message)
+
     def test_terminal_requires_continue_ack_launch_authority(self):
         terminal = self._success_terminal_message()
         unauthorized = sharding.ProgressAckLedger(max_total_tokens=None)
@@ -7683,6 +7758,42 @@ class ProgressProtocolTests(unittest.TestCase):
                 replace(terminal, seq=2, attempt=2)
             )
         self.assertEqual(0, ledger.total_tokens)
+
+    def test_completed_attempt_cannot_be_reauthorized_or_recounted(self):
+        terminal = self._success_terminal_message()
+        started = self._case_started_for_terminal(terminal, seq=1)
+        terminal = replace(terminal, seq=2)
+        ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        self.assertEqual("continue", ledger.accept_progress(started))
+        self.assertEqual("continue", ledger.accept_progress(terminal))
+        self.assertEqual(self.usage["total_tokens"], ledger.total_tokens)
+        self.assertEqual("continue", ledger.accept_progress(terminal))
+        self.assertEqual(self.usage["total_tokens"], ledger.total_tokens)
+
+        replayed_start = replace(started, seq=3)
+        with self.assertRaises(ValueError):
+            ledger.accept_progress(replayed_start)
+        self.assertEqual(self.usage["total_tokens"], ledger.total_tokens)
+
+        next_key = dict(sharding.FROZEN_LANE_CASES)["E1"][1]
+        next_start = replace(started, seq=3, case=next_key)
+        self.assertEqual("continue", ledger.accept_progress(next_start))
+        with self.assertRaises(ValueError):
+            ledger.accept_progress(replace(terminal, seq=4))
+        self.assertEqual(self.usage["total_tokens"], ledger.total_tokens)
+
+    def test_duplicate_active_start_does_not_consume_sequence(self):
+        terminal = self._success_terminal_message()
+        started = self._case_started_for_terminal(terminal, seq=1)
+        ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        self.assertEqual("continue", ledger.accept_progress(started))
+        with self.assertRaises(ValueError):
+            ledger.accept_progress(replace(started, seq=2))
+        self.assertEqual(
+            "continue",
+            ledger.accept_progress(replace(terminal, seq=2)),
+        )
+        self.assertEqual(self.usage["total_tokens"], ledger.total_tokens)
 
     def test_case_terminal_truth_table_drives_exact_ack_decisions(self):
         self.assertTrue(
@@ -7903,6 +8014,68 @@ class ProgressProtocolTests(unittest.TestCase):
             2 * sharding.MAX_TOKEN_COUNT,
             large_ledger.total_tokens,
         )
+
+    def test_progress_polling_rejects_missing_or_invalid_prefix(self):
+        def polling_root(name):
+            run_root = self.root / name / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            return self._worker_root(run_root)
+
+        worker_root = polling_root("missing-progress-prefix")
+        second = self._lane_message(seq=2, progress_type="lane-ready")
+        sharding.write_progress(worker_root, second)
+        with self.assertRaises(ValueError):
+            sharding.wait_for_progress(
+                worker_root=worker_root,
+                expected_lane="E1",
+                expected_seq=2,
+                timeout=0.1,
+            )
+
+        worker_root = polling_root("invalid-progress-prefix")
+        first = self._lane_message(seq=1, progress_type="lane-ready")
+        second = self._lane_message(seq=2, progress_type="lane-ready")
+        first_path = sharding.write_progress(worker_root, first)
+        sharding.write_progress(worker_root, second)
+        first_payload = json.loads(first_path.read_text(encoding="ascii"))
+        first_payload["prompt"] = "unsafe prefix"
+        sharding._atomic_write_record(first_path, first_payload)
+        with self.assertRaises(ValueError):
+            sharding.wait_for_progress(
+                worker_root=worker_root,
+                expected_lane="E1",
+                expected_seq=2,
+                timeout=0.1,
+            )
+
+    def test_ack_polling_rejects_missing_or_invalid_prefix(self):
+        def polling_root(name):
+            run_root = self.root / name / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            return self._worker_root(run_root)
+
+        worker_root = polling_root("missing-ack-prefix")
+        first = self._lane_message(seq=1, progress_type="lane-ready")
+        second = self._lane_message(seq=2, progress_type="lane-ready")
+        sharding.write_progress(worker_root, first)
+        sharding.write_progress(worker_root, second)
+        sharding.write_ack(worker_root, second, "continue")
+        with self.assertRaises(ValueError):
+            sharding.wait_for_ack(worker_root, second, 0.1)
+
+        worker_root = polling_root("invalid-ack-prefix")
+        first_path = sharding.write_progress(worker_root, first)
+        sharding.write_progress(worker_root, second)
+        first_ack = sharding.write_ack(worker_root, first, "continue")
+        sharding.write_ack(worker_root, second, "continue")
+        first_ack_payload = json.loads(first_ack.read_text(encoding="ascii"))
+        first_ack_payload["message_sha256"] = "f" * 64
+        sharding._atomic_write_record(first_ack, first_ack_payload)
+        with self.assertRaises(ValueError):
+            sharding.wait_for_ack(worker_root, second, 0.1)
+        self.assertTrue(first_path.exists())
 
     def test_duplicate_gap_reorder_truncation_oversize_and_prompt_are_rejected(self):
         worker_root = self._worker_root()

@@ -5287,7 +5287,7 @@ def _find_attempt_for_shard_terminal(
     )
     with directory:
         inventory = directory.inventory()
-        if not inventory or any(name not in {"01", "02"} for name in inventory):
+        if inventory not in (("01",), ("01", "02")):
             raise ValueError("shard attempt inventory is invalid")
         with ExitStack() as child_stack:
             children = {
@@ -5995,16 +5995,16 @@ def _read_progress_attempt(
 ) -> tuple[dict[str, object], CasePaths]:
     if message.case is None or message.attempt is None:
         raise AssertionError("case-terminal progress lacks a case binding")
-    attempt_seal = read_attempt_seal(
+    attempt_seal = _find_attempt_for_shard_terminal(
         plan=plan,
-        paths=paths,
         assignment=assignment,
-        attempt=message.attempt,
+        paths=paths,
         manifest_case=manifest_case,
+        expected_sha256=message.attempt_terminal_sha256,
     )
     terminal = attempt_seal.terminal
     if (
-        attempt_seal.terminal_sha256 != message.attempt_terminal_sha256
+        terminal.get("attempt") != message.attempt
         or terminal.get("status") != message.status
         or terminal.get("classification") != message.classification
         or terminal.get("model_started") != message.model_started
@@ -6294,6 +6294,21 @@ def _protocol_sequence_inventory(
     return tuple(sequences)
 
 
+def _require_protocol_sequence_prefix(
+    sequences: tuple[int, ...], *, expected_seq: int, label: str
+) -> None:
+    prefix_count = 0
+    for sequence in sequences:
+        if sequence > expected_seq:
+            raise ValueError(f"{label} records are gapped or reordered")
+        if sequence < expected_seq:
+            prefix_count += 1
+            if sequence != prefix_count:
+                raise ValueError(f"{label} records are gapped or reordered")
+    if prefix_count != expected_seq - 1:
+        raise ValueError(f"{label} records are gapped or reordered")
+
+
 def wait_for_progress(
     *,
     worker_root: Path,
@@ -6319,8 +6334,22 @@ def wait_for_progress(
         sequences = _protocol_sequence_inventory(
             progress_root, label="progress"
         )
-        if any(sequence > expected_seq for sequence in sequences):
-            raise ValueError("progress records are gapped or reordered")
+        _require_protocol_sequence_prefix(
+            sequences,
+            expected_seq=expected_seq,
+            label="progress",
+        )
+        for sequence in range(1, expected_seq):
+            read_progress(
+                progress_root / f"{sequence:06d}.json",
+                expected_lane,
+                sequence,
+            )
+        if (
+            _protocol_sequence_inventory(progress_root, label="progress")
+            != sequences
+        ):
+            raise RuntimeError("progress inventory changed while polling")
         if expected_seq in sequences:
             message = read_progress(path, expected_lane, expected_seq)
             if expected_sha256 is not None:
@@ -6329,6 +6358,13 @@ def wait_for_progress(
                 )
                 if hashlib.sha256(content).hexdigest() != expected_sha256:
                     raise ValueError("progress wake-up digest differs")
+            if (
+                _protocol_sequence_inventory(
+                    progress_root, label="progress"
+                )
+                != sequences
+            ):
+                raise RuntimeError("progress inventory changed while reading")
             return message
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -6386,6 +6422,26 @@ def _durable_progress_hash(worker_root: Path, message: ProgressMessage) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _read_ack_for_progress(
+    worker_root: Path, message: ProgressMessage
+) -> Ack:
+    expected_hash = _durable_progress_hash(worker_root, message)
+    path = worker_root / "acks" / f"{message.seq:06d}.json"
+    payload, _ = _read_canonical_record(
+        path, "ack", byte_cap=MAX_PROGRESS_BYTES
+    )
+    ack = _decode_ack(payload)
+    if (
+        ack.epoch_id != message.epoch_id
+        or ack.run_kind != message.run_kind
+        or ack.lane != message.lane
+        or ack.seq != message.seq
+        or ack.message_sha256 != expected_hash
+    ):
+        raise ValueError("ACK differs from durable progress")
+    return ack
+
+
 def write_ack(
     worker_root: Path, message: ProgressMessage, decision: AckDecision
 ) -> Path:
@@ -6412,28 +6468,32 @@ def wait_for_ack(
 ) -> Ack:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
-    expected_hash = _durable_progress_hash(bound_worker, message)
+    _durable_progress_hash(bound_worker, message)
     timeout_value = _validate_wait_timeout(timeout)
     deadline = time.monotonic() + timeout_value
     ack_root = bound_worker / "acks"
-    path = ack_root / f"{message.seq:06d}.json"
     while True:
         sequences = _protocol_sequence_inventory(ack_root, label="ACK")
-        if any(sequence > message.seq for sequence in sequences):
-            raise ValueError("ACK records are gapped or reordered")
-        if message.seq in sequences:
-            payload, _ = _read_canonical_record(
-                path, "ack", byte_cap=MAX_PROGRESS_BYTES
+        _require_protocol_sequence_prefix(
+            sequences,
+            expected_seq=message.seq,
+            label="ACK",
+        )
+        for sequence in range(1, message.seq):
+            prior_progress = read_progress(
+                bound_worker / "progress" / f"{sequence:06d}.json",
+                message.lane,
+                sequence,
             )
-            ack = _decode_ack(payload)
-            if (
-                ack.epoch_id != message.epoch_id
-                or ack.run_kind != message.run_kind
-                or ack.lane != message.lane
-                or ack.seq != message.seq
-                or ack.message_sha256 != expected_hash
-            ):
-                raise ValueError("ACK differs from durable progress")
+            _read_ack_for_progress(bound_worker, prior_progress)
+        if _protocol_sequence_inventory(ack_root, label="ACK") != sequences:
+            raise RuntimeError("ACK inventory changed while polling")
+        if message.seq in sequences:
+            ack = _read_ack_for_progress(bound_worker, message)
+            if _protocol_sequence_inventory(
+                ack_root, label="ACK"
+            ) != sequences:
+                raise RuntimeError("ACK inventory changed while reading")
             return ack
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -6461,6 +6521,7 @@ class ProgressAckLedger:
         self._active_cases: dict[LaneName, tuple[CaseKey, int] | None] = {
             lane: None for lane in ("E1", "E2", "E3", "APP")
         }
+        self._completed_attempts: set[tuple[CaseKey, int]] = set()
         self._aborted = False
         self._stop_launches = max_total_tokens == 0
         self._exited: set[LaneName] = set()
@@ -6500,12 +6561,20 @@ class ProgressAckLedger:
             raise ValueError("progress arrived after worker exit")
 
         active = self._active_cases[message.lane]
-        if message.type == "case-started" and active is not None:
-            raise ValueError("worker started a case before its prior terminal")
+        case_attempt: tuple[CaseKey, int] | None = None
+        if message.type in ("case-started", "case-terminal"):
+            if message.case is None or message.attempt is None:
+                raise AssertionError("case progress lacks its identity")
+            case_attempt = (message.case, message.attempt)
+            if case_attempt in self._completed_attempts:
+                raise ValueError("completed case attempt cannot be replayed")
+        if message.type == "case-started":
+            if active is not None:
+                raise ValueError("worker started a case before its prior terminal")
         if message.type == "case-terminal":
             if active is None:
                 raise ValueError("case terminal lacks launch authority")
-            if active != (message.case, message.attempt):
+            if active != case_attempt:
                 raise ValueError("case terminal differs from the active attempt")
 
         new_total = self._total_tokens
@@ -6547,6 +6616,9 @@ class ProgressAckLedger:
                 message.attempt,
             )
         elif message.type == "case-terminal":
+            if case_attempt is None:
+                raise AssertionError("case terminal lacks its completed identity")
+            self._completed_attempts.add(case_attempt)
             self._active_cases[message.lane] = None
         elif message.type == "worker-stopped":
             self._exited.add(message.lane)
