@@ -19,8 +19,17 @@ if _SOURCE_MARKETPLACE.is_dir():
     REPOSITORY_ROOT = _SOURCE_REPOSITORY
     MARKETPLACE_ROOT = _SOURCE_MARKETPLACE
 else:
-    MARKETPLACE_ROOT = _TEST_PATH.parents[3]
-    REPOSITORY_ROOT = MARKETPLACE_ROOT / "evidence"
+    _LAYOUT_ROOT = _TEST_PATH.parents[3]
+    _LAYOUT_REPOSITORY = _LAYOUT_ROOT / "evidence"
+    _LAYOUT_MARKETPLACE = (
+        _LAYOUT_REPOSITORY / "marketplace/workflow-observatory"
+    )
+    if _LAYOUT_MARKETPLACE.is_dir():
+        REPOSITORY_ROOT = _LAYOUT_REPOSITORY
+        MARKETPLACE_ROOT = _LAYOUT_MARKETPLACE
+    else:
+        MARKETPLACE_ROOT = _LAYOUT_ROOT
+        REPOSITORY_ROOT = MARKETPLACE_ROOT / "evidence"
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 from package_workflow_observatory import (
@@ -126,6 +135,24 @@ class ArchiveTests(unittest.TestCase):
         self.assertNotIn(b"/" + b"Users/" + b"vincent", all_bytes)
         self.assertNotIn(b"/private/var/" + b"folders/", all_bytes)
         self.assertIn(b"/" + b"Users/" + b"alice/private/repo", all_bytes)
+
+    def test_parallel_worker_sources_are_captured_reproducibly(self):
+        second = self.root / "parallel-worker-second.zip"
+        evidence = default_evidence(REPOSITORY_ROOT)
+        required = {
+            "scripts/workflow_eval_sharding.py",
+            "scripts/run_observing_workflows_eval_worker.py",
+        }
+        first_digest = build_archive(self.source, self.archive, evidence)
+        second_digest = build_archive(self.source, second, evidence)
+        self.assertEqual(first_digest, second_digest)
+        self.assertEqual(self.archive.read_bytes(), second.read_bytes())
+        with zipfile.ZipFile(self.archive) as bundle:
+            names = set(bundle.namelist())
+        for relative_path in required:
+            self.assertIn(
+                f"workflow-observatory/evidence/{relative_path}", names
+            )
 
     def test_archive_rejects_symlinks_and_unexpected_files(self):
         outside = self.root / "outside.txt"
@@ -326,8 +353,10 @@ class ArchiveTests(unittest.TestCase):
             "docs/superpowers/plans/2026-07-15-workflow-telemetry-best-practices-research.md",
             ".superpowers/sdd/workflow-observatory-task-6-report.md",
             "scripts/run_observing_workflows_task9_eval.py",
+            "scripts/run_observing_workflows_eval_worker.py",
             "scripts/__init__.py",
             "scripts/package_workflow_observatory.py",
+            "scripts/workflow_eval_sharding.py",
             "tests/observing_workflows_eval_harness.py",
             "tests/run_observing_workflows_eval.py",
             "marketplace/workflow-observatory/plugins/workflow-observer/"

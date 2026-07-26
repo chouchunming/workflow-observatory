@@ -1,0 +1,6438 @@
+from dataclasses import asdict, fields, replace
+import errno
+import hashlib
+import inspect
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import get_args, get_type_hints
+import unittest
+from unittest import mock
+
+from scripts import workflow_eval_sharding as sharding
+
+
+FIXTURES = Path(__file__).parent / "skill_evals"
+
+
+def load_cases(filename):
+    return json.loads((FIXTURES / filename).read_text(encoding="utf-8"))
+
+
+def input_fingerprints(run_kind):
+    return sharding.InputFingerprints(
+        schema_version=1,
+        epoch_id="",
+        run_kind=run_kind,
+        archive_sha256="a" * 64,
+        marketplace_sha256="b" * 64,
+        evaluator_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
+        forward_manifest_sha256=(
+            "f3bd3b758e5fff43ed3bc50359d3799c111174a6bc8a225208b6c9989b7358a2"
+        ),
+        lifecycle_manifest_sha256=(
+            "d3f91c1359b4087ed5d336fb079f020eed3c42e132360b5d5ca684518a411e8b"
+        ),
+    )
+
+
+class PlannerTests(unittest.TestCase):
+    def test_public_planner_types_match_the_frozen_contract(self):
+        self.assertEqual(get_args(sharding.EvalMode), ("forward", "lifecycle"))
+        self.assertEqual(get_args(sharding.LaneName), ("E1", "E2", "E3", "APP"))
+        self.assertEqual(
+            [field.name for field in fields(sharding.CaseKey)],
+            ["mode", "ordinal", "case_id"],
+        )
+        self.assertEqual(
+            [field.name for field in fields(sharding.CaseAssignment)],
+            ["key", "lane", "route", "manifest_sha256"],
+        )
+        self.assertLess(
+            sharding.CaseKey("forward", 1, "first"),
+            sharding.CaseKey("forward", 2, "second"),
+        )
+
+    def test_frozen_plan_has_exact_8_8_8_4_coverage(self):
+        forward_cases = load_cases("observing_workflows_cases.json")
+        lifecycle_cases = load_cases("observing_workflows_lifecycle_cases.json")
+        manifests = {
+            "forward": forward_cases,
+            "lifecycle": lifecycle_cases,
+        }
+
+        discovery = sharding.build_epoch_plan(
+            run_kind="discovery",
+            fingerprints=input_fingerprints("discovery"),
+            manifests=manifests,
+        )
+        formal = sharding.build_epoch_plan(
+            run_kind="formal",
+            fingerprints=input_fingerprints("formal"),
+            manifests=manifests,
+        )
+
+        self.assertEqual(len(discovery.assignments), 28)
+        self.assertEqual(
+            len({assignment.key for assignment in discovery.assignments}), 28
+        )
+        self.assertEqual(
+            [assignment.route for assignment in discovery.assignments].count("exec"),
+            24,
+        )
+        self.assertEqual(
+            [assignment.route for assignment in discovery.assignments].count(
+                "app-server"
+            ),
+            4,
+        )
+
+        expected_lanes = {
+            "E1": (
+                ("forward", 1, "multi-file-feature"),
+                ("forward", 5, "wiki-compile"),
+                ("forward", 11, "chat"),
+                ("forward", 14, "plan-only"),
+                ("forward", 16, "single-file-copy"),
+                ("forward", 19, "worker-with-parent-marker"),
+                ("lifecycle", 1, "planned-success"),
+                ("lifecycle", 6, "central-cli-unavailable"),
+            ),
+            "E2": (
+                ("forward", 2, "tested-bugfix"),
+                ("forward", 4, "multi-file-docs"),
+                ("forward", 6, "durable-query"),
+                ("forward", 10, "parent-managed-subagent"),
+                ("forward", 15, "single-file-typo"),
+                ("forward", 17, "status-question"),
+                ("lifecycle", 5, "task-failure"),
+                ("lifecycle", 8, "incomplete-eval-override"),
+            ),
+            "E3": (
+                ("forward", 3, "reviewed-refactor"),
+                ("forward", 7, "inbox-processing"),
+                ("forward", 12, "read-only-search"),
+                ("forward", 13, "answer-only"),
+                ("forward", 18, "review-only"),
+                ("forward", 20, "ambiguous-default-no-trigger"),
+                ("lifecycle", 4, "parent-managed-subagent"),
+                ("lifecycle", 7, "complete-eval-override"),
+            ),
+            "APP": (
+                ("forward", 8, "late-trigger"),
+                ("forward", 9, "scope-supersession"),
+                ("lifecycle", 2, "late-success"),
+                ("lifecycle", 3, "scope-supersession"),
+            ),
+        }
+        for lane, expected_keys in expected_lanes.items():
+            lane_assignments = [
+                assignment
+                for assignment in discovery.assignments
+                if assignment.lane == lane
+            ]
+            self.assertEqual(
+                tuple(
+                    (
+                        assignment.key.mode,
+                        assignment.key.ordinal,
+                        assignment.key.case_id,
+                    )
+                    for assignment in lane_assignments
+                ),
+                expected_keys,
+            )
+
+        canonical_keys = tuple(
+            sharding.CaseKey("forward", ordinal, case["id"])
+            for ordinal, case in enumerate(forward_cases, start=1)
+        ) + tuple(
+            sharding.CaseKey("lifecycle", ordinal, case["id"])
+            for ordinal, case in enumerate(lifecycle_cases, start=1)
+        )
+        self.assertEqual(
+            tuple(assignment.key for assignment in discovery.assignments),
+            canonical_keys,
+        )
+        for assignment in discovery.assignments:
+            expected_hash = (
+                discovery.fingerprints.forward_manifest_sha256
+                if assignment.key.mode == "forward"
+                else discovery.fingerprints.lifecycle_manifest_sha256
+            )
+            self.assertEqual(assignment.manifest_sha256, expected_hash)
+        self.assertNotEqual(discovery.epoch_id, formal.epoch_id)
+        self.assertEqual(discovery.epoch_id, discovery.fingerprints.epoch_id)
+        self.assertEqual(discovery.run_kind, discovery.fingerprints.run_kind)
+
+    def test_epoch_id_matches_the_exact_independent_canonical_payload(self):
+        manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases("observing_workflows_lifecycle_cases.json"),
+        }
+        plan = sharding.build_epoch_plan(
+            run_kind="discovery",
+            manifests=manifests,
+            fingerprints=input_fingerprints("discovery"),
+        )
+
+        fingerprint_fields = asdict(plan.fingerprints)
+        fingerprint_fields.pop("epoch_id")
+        assignment_fields = [
+            {
+                "key": {
+                    "mode": assignment.key.mode,
+                    "ordinal": assignment.key.ordinal,
+                    "case_id": assignment.key.case_id,
+                },
+                "lane": assignment.lane,
+                "route": assignment.route,
+                "manifest_sha256": assignment.manifest_sha256,
+            }
+            for assignment in plan.assignments
+        ]
+        payload = json.dumps(
+            {
+                "run_kind": "discovery",
+                "fingerprints": fingerprint_fields,
+                "assignments": assignment_fields,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        self.assertEqual(plan.epoch_id, hashlib.sha256(payload).hexdigest())
+
+
+class FingerprintTests(unittest.TestCase):
+    def test_canonical_config_bytes_are_sorted_compact_ascii_json(self):
+        self.assertEqual(
+            sharding.canonical_config_bytes({"z": "雪", "a": [2, 1]}),
+            b'{"a":[2,1],"z":"\\u96ea"}',
+        )
+
+    def test_component_digest_uses_sorted_inventory_member_pairs(self):
+        entries = [
+            ("z/member.py", "a" * 64),
+            ("a/member.py", "b" * 64),
+        ]
+        self.assertEqual(
+            sharding.component_digest(entries),
+            "08475606f78449a9db38e0634b32df59cc827ed786c0f63ebca30c32dc80c5d6",
+        )
+        self.assertEqual(
+            sharding.component_digest(entries), sharding.component_digest(entries[::-1])
+        )
+
+
+class WriterLeaseTests(unittest.TestCase):
+    class EqualitySpoof:
+        def __eq__(self, _other):
+            return True
+
+    @staticmethod
+    def _git_repository(root: Path, name: str = "repository") -> Path:
+        repository = (root / name).resolve()
+        subprocess.run(
+            ["git", "init", "-q", str(repository)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return repository
+
+    def test_run_lease_acquires_exact_lock_and_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "formal-run"
+            lease = sharding.RunCoordinatorLease.acquire(
+                run_root=run_root,
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            try:
+                self.assertTrue(lease.active)
+                self.assertEqual(0o700, stat.S_IMODE(run_root.stat().st_mode))
+                coordinator = run_root / "coordinator"
+                self.assertEqual(0o700, stat.S_IMODE(coordinator.stat().st_mode))
+                lock = coordinator / "coordinator.lock"
+                self.assertTrue(lock.is_file())
+                self.assertEqual(0o600, stat.S_IMODE(lock.stat().st_mode))
+                with self.assertRaises((BlockingIOError, RuntimeError)):
+                    sharding.RunCoordinatorLease.acquire(
+                        run_root=run_root,
+                        epoch_id="e" * 64,
+                        run_kind="formal",
+                    )
+            finally:
+                lease.close()
+
+            self.assertFalse(lease.active)
+            reacquired = sharding.RunCoordinatorLease.acquire(
+                run_root=run_root,
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            self.assertTrue(reacquired.active)
+            reacquired.close()
+
+    def test_managed_lock_post_create_stat_failure_retires_opened_fd_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve(strict=True)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            real_open = sharding.os.open
+            real_close = sharding.os.close
+            real_stat = sharding.os.stat
+            real_slot = sharding._DescriptorSlot
+            opened: list[int] = []
+            slotted: list[int] = []
+            closed: list[int] = []
+            stat_calls = 0
+
+            def injected_stat(path, *args, **kwargs):
+                nonlocal stat_calls
+                if path == "created.lock":
+                    stat_calls += 1
+                    if stat_calls == 1:
+                        raise FileNotFoundError(path)
+                    if stat_calls == 2:
+                        raise RuntimeError("POST_CREATE_STAT_FAILURE")
+                return real_stat(path, *args, **kwargs)
+
+            def recording_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if path == "created.lock":
+                    opened.append(descriptor)
+                return descriptor
+
+            def recording_slot(descriptor):
+                slotted.append(descriptor)
+                return real_slot(descriptor)
+
+            def recording_close(descriptor):
+                if descriptor in opened:
+                    closed.append(descriptor)
+                return real_close(descriptor)
+
+            try:
+                with mock.patch.object(
+                    sharding.os, "stat", side_effect=injected_stat
+                ), mock.patch.object(
+                    sharding.os, "open", side_effect=recording_open
+                ), mock.patch.object(
+                    sharding.os, "close", side_effect=recording_close
+                ), mock.patch.object(
+                    sharding, "_DescriptorSlot", side_effect=recording_slot
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "POST_CREATE_STAT_FAILURE"
+                    ):
+                        sharding._open_managed_lock_at(
+                            directory_fd,
+                            "created.lock",
+                            label="created lock",
+                        )
+
+                self.assertEqual(1, len(opened))
+                self.assertEqual(opened, slotted)
+                self.assertEqual(opened, closed)
+                with self.assertRaises(OSError):
+                    os.fstat(opened[0])
+            finally:
+                for descriptor in opened:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError:
+                        continue
+                    real_close(descriptor)
+                real_close(directory_fd)
+
+    def test_managed_lock_post_create_close_reuse_poison_is_one_shot(self):
+        evidence_root = Path(__file__).parents[1]
+        program = r'''
+from pathlib import Path
+import os
+import sys
+
+from scripts import workflow_eval_sharding as sharding
+
+run_root = Path(sys.argv[1])
+real_open = os.open
+real_close = os.close
+real_stat = os.stat
+target = None
+target_identity = None
+target_parent_fd = None
+target_close_calls = 0
+close_calls = []
+stat_calls = 0
+
+def injected_stat(path, *args, **kwargs):
+    global stat_calls
+    if path == "coordinator.lock":
+        stat_calls += 1
+        if stat_calls == 1:
+            raise FileNotFoundError(path)
+        if stat_calls == 2:
+            raise RuntimeError("POST_CREATE_STAT_FAILURE")
+    return real_stat(path, *args, **kwargs)
+
+def recording_open(path, flags, *args, **kwargs):
+    global target, target_identity, target_parent_fd
+    descriptor = real_open(path, flags, *args, **kwargs)
+    if path == "coordinator.lock" and target is None:
+        target = descriptor
+        metadata = os.fstat(descriptor)
+        target_identity = (metadata.st_dev, metadata.st_ino)
+        target_parent_fd = kwargs.get("dir_fd")
+    return descriptor
+
+def close_then_reuse(descriptor):
+    global target_close_calls
+    close_calls.append(descriptor)
+    real_close(descriptor)
+    if descriptor == target:
+        target_close_calls += 1
+        replacement = real_open(
+            "coordinator.lock",
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=target_parent_fd,
+        )
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) != target_identity:
+            raise SystemExit(2)
+        raise OSError("indeterminate managed-lock close")
+
+sharding.os.stat = injected_stat
+sharding.os.open = recording_open
+sharding.os.close = close_then_reuse
+try:
+    try:
+        sharding.RunCoordinatorLease.acquire(
+            run_root=run_root,
+            epoch_id="e" * 64,
+            run_kind="formal",
+        )
+    except BaseException as error:
+        if not sharding.is_indeterminate_descriptor_close(error):
+            raise SystemExit(3)
+    else:
+        raise SystemExit(4)
+    if target is None or target_close_calls != 1:
+        raise SystemExit(5)
+    os.fstat(target)
+    first_close_calls = tuple(close_calls)
+    try:
+        sharding.RunCoordinatorLease.acquire(
+            run_root=run_root,
+            epoch_id="e" * 64,
+            run_kind="formal",
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise SystemExit(6)
+    if tuple(close_calls) != first_close_calls:
+        raise SystemExit(7)
+finally:
+    sharding.os.stat = real_stat
+    sharding.os.open = real_open
+    sharding.os.close = real_close
+    if target is not None:
+        real_close(target)
+'''
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    program,
+                    str(Path(temporary, "formal-run").resolve()),
+                ],
+                cwd=evidence_root,
+                env={**os.environ, "PYTHONPATH": str(evidence_root)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_trusted_parent_policy_accepts_sticky_and_rejects_writable_nonsticky(self):
+        def directory_metadata(mode, uid):
+            values = [0] * 10
+            values[0] = stat.S_IFDIR | mode
+            values[4] = uid
+            return os.stat_result(values)
+
+        for uid in {0, os.geteuid()}:
+            with self.subTest(uid=uid, mode="sticky"):
+                sharding._validate_trusted_parent(
+                    directory_metadata(0o1777, uid), label="trusted parent"
+                )
+            with self.subTest(uid=uid, mode="non-writable"):
+                sharding._validate_trusted_parent(
+                    directory_metadata(0o755, uid), label="trusted parent"
+                )
+            with self.subTest(uid=uid, mode="writable-nonsticky"):
+                with self.assertRaises(PermissionError):
+                    sharding._validate_trusted_parent(
+                        directory_metadata(0o777, uid), label="trusted parent"
+                    )
+
+        with self.assertRaises(PermissionError):
+            sharding._validate_trusted_parent(
+                directory_metadata(0o755, os.geteuid() + 10000),
+                label="trusted parent",
+            )
+
+    def test_lease_ownership_uses_effective_uid_but_lock_namespace_uses_real_uid(self):
+        def metadata(mode, uid, *, directory=True):
+            values = [0] * 10
+            values[0] = (stat.S_IFDIR if directory else stat.S_IFREG) | mode
+            values[4] = uid
+            return os.stat_result(values)
+
+        with mock.patch.object(sharding.os, "getuid", return_value=1001), \
+             mock.patch.object(sharding.os, "geteuid", return_value=2002):
+            sharding._validate_owned_entry(
+                metadata(0o700, 2002),
+                label="effective-owner directory",
+                kind="directory",
+                mode=0o700,
+            )
+            sharding._validate_trusted_parent(
+                metadata(0o1777, 2002), label="effective-owner sticky parent"
+            )
+            with self.assertRaises(PermissionError):
+                sharding._validate_owned_entry(
+                    metadata(0o700, 1001),
+                    label="real-owner directory",
+                    kind="directory",
+                    mode=0o700,
+                )
+            with mock.patch.object(
+                sharding,
+                "_canonical_git_repository_root",
+                return_value=(Path("/repository"), (1, 2)),
+            ):
+                self.assertEqual(
+                    Path(
+                        "/var/tmp/workflow-observatory-result-locks-uid-1001/"
+                        + hashlib.sha256(b"/repository").hexdigest()
+                        + ".lock"
+                    ),
+                    sharding.result_writer_lock_path(Path("/repository")),
+                )
+
+    def test_result_writer_remains_live_under_root_owned_sticky_parent(self):
+        repository = Path(
+            tempfile.mkdtemp(
+                prefix="workflow-result-repository-", dir="/private/tmp"
+            )
+        ).resolve(strict=True)
+        try:
+            if repository.parent.stat().st_uid == os.geteuid():
+                self.skipTest("repository parent is not externally owned")
+            subprocess.run(
+                ["git", "init", "-q", str(repository)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            lease = sharding.ResultWriterLease.acquire(
+                repository,
+                role="serial-coordinator",
+                run_kind="formal",
+                run_lease=None,
+            )
+            authority = lease.authority()
+            self.assertFalse(authority.consumed)
+            lease.close()
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                lease._validate_live()
+        finally:
+            shutil.rmtree(repository, ignore_errors=True)
+
+    def test_result_writer_binds_exact_git_root_and_issues_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary, "repository").resolve()
+            subprocess.run(
+                ["git", "init", "-q", str(repository)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            lease = sharding.ResultWriterLease.acquire(
+                repository,
+                role="serial-coordinator",
+                run_kind="formal",
+                run_lease=None,
+            )
+            try:
+                expected_key = hashlib.sha256(os.fsencode(repository)).hexdigest()
+                expected_path = Path(
+                    f"/var/tmp/workflow-observatory-result-locks-uid-{os.getuid()}",
+                    f"{expected_key}.lock",
+                )
+                self.assertEqual(expected_path, sharding.result_writer_lock_path(repository))
+                self.assertEqual(0o700, stat.S_IMODE(expected_path.parent.stat().st_mode))
+                self.assertEqual(0o600, stat.S_IMODE(expected_path.stat().st_mode))
+                authority = lease.authority()
+                self.assertEqual(expected_key, authority.repository_key)
+                self.assertEqual("serial-coordinator", authority.role)
+                self.assertEqual("formal", authority.run_kind)
+                self.assertFalse(authority.consumed)
+                with self.assertRaises(RuntimeError):
+                    lease.authority()
+            finally:
+                lease.close()
+
+            child = repository / "child"
+            child.mkdir()
+            with self.assertRaises(ValueError):
+                sharding.ResultWriterLease.acquire(
+                    child,
+                    role="serial-coordinator",
+                    run_kind="formal",
+                    run_lease=None,
+                )
+
+    def test_run_lease_is_nominal_pid_bound_nonreentrant_and_writer_closes_first(self):
+        with self.assertRaises(ValueError):
+            sharding.RunCoordinatorLease.acquire(
+                run_root=Path("/var/tmp/equality-spoof-must-not-exist"),
+                epoch_id="d" * 64,
+                run_kind=self.EqualitySpoof(),
+            )
+        root_owned_run = Path(
+            tempfile.mkdtemp(prefix="workflow-run-lease-", dir="/var/tmp")
+        ).resolve(strict=True)
+        try:
+            if root_owned_run.parent.stat().st_uid == os.getuid():
+                self.skipTest("run-root parent is not externally owned on this system")
+            external_parent_lease = sharding.RunCoordinatorLease.acquire(
+                run_root=root_owned_run,
+                epoch_id="d" * 64,
+                run_kind="formal",
+            )
+            self.assertTrue(external_parent_lease.active)
+            external_parent_lease.close()
+        finally:
+            shutil.rmtree(root_owned_run, ignore_errors=True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            repository = self._git_repository(root)
+            run_root = root / "formal-run"
+            run_lease = sharding.RunCoordinatorLease.acquire(
+                run_root=run_root,
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            try:
+                with self.assertRaises(RuntimeError):
+                    sharding.RunCoordinatorLease.acquire(
+                        run_root=root / "other-run",
+                        epoch_id="f" * 64,
+                        run_kind="formal",
+                    )
+
+                writer = sharding.ResultWriterLease.acquire(
+                    repository,
+                    role="parallel-coordinator",
+                    run_kind="formal",
+                    run_lease=run_lease,
+                )
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "writer.*close"):
+                        run_lease.close()
+                    with self.assertRaises(RuntimeError):
+                        sharding.ResultWriterLease.acquire(
+                            repository,
+                            role="parallel-coordinator",
+                            run_kind="formal",
+                            run_lease=run_lease,
+                        )
+                finally:
+                    writer.close()
+            finally:
+                run_lease.close()
+
+            class FakeRunLease(sharding.RunCoordinatorLease):
+                pass
+
+            with self.assertRaises(TypeError):
+                FakeRunLease.acquire(
+                    run_root=root / "fake-run",
+                    epoch_id="e" * 64,
+                    run_kind="formal",
+                )
+
+            pid_program = r"""
+from pathlib import Path
+import os
+import sys
+from scripts.workflow_eval_sharding import RunCoordinatorLease
+
+lease = RunCoordinatorLease.acquire(
+    run_root=Path(sys.argv[1]), epoch_id="e" * 64, run_kind="formal"
+)
+child = os.fork()
+if child == 0:
+    try:
+        lease.active
+    except RuntimeError as error:
+        os._exit(0 if "another process" in str(error) else 2)
+    os._exit(3)
+_, status = os.waitpid(child, 0)
+if os.waitstatus_to_exitcode(status) != 0:
+    raise SystemExit(4)
+if not lease.active:
+    raise SystemExit(5)
+lease.close()
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", pid_program, str(root / "pid-run")],
+                cwd=Path(__file__).parents[1],
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+
+            swap_program = r"""
+from pathlib import Path
+import sys
+from scripts.workflow_eval_sharding import RunCoordinatorLease
+
+parent = Path(sys.argv[1])
+parent.mkdir(mode=0o700)
+lease = RunCoordinatorLease.acquire(
+    run_root=parent / "formal-run", epoch_id="e" * 64, run_kind="formal"
+)
+moved = parent.with_name("moved-anchor")
+parent.rename(moved)
+parent.mkdir(mode=0o700)
+try:
+    lease.active
+except RuntimeError as error:
+    raise SystemExit(0 if "parent name changed" in str(error) else 2)
+raise SystemExit(3)
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", swap_program, str(root / "anchor")],
+                cwd=Path(__file__).parents[1],
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_fixed_result_lock_root_rejects_unsafe_entries_and_repository_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            repository = self._git_repository(root)
+            child = repository / "child"
+            child.mkdir()
+            alias = root / "repository-alias"
+            alias.symlink_to(repository, target_is_directory=True)
+            for candidate in (child, alias):
+                with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                    sharding.ResultWriterLease.acquire(
+                        candidate,
+                        role="serial-coordinator",
+                        run_kind="formal",
+                        run_lease=None,
+                    )
+
+            lock_path = sharding.result_writer_lock_path(repository)
+            if lock_path.exists() or lock_path.is_symlink():
+                lock_path.unlink()
+            unsafe_target = root / "unsafe-target"
+            unsafe_target.write_text("do not lock\n", encoding="utf-8")
+            lock_path.symlink_to(unsafe_target)
+            try:
+                with self.assertRaises((OSError, PermissionError, ValueError)):
+                    sharding.ResultWriterLease.acquire(
+                        repository,
+                        role="serial-coordinator",
+                        run_kind="formal",
+                        run_lease=None,
+                    )
+                self.assertTrue(lock_path.is_symlink())
+                self.assertEqual("do not lock\n", unsafe_target.read_text(encoding="utf-8"))
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_parallel_writer_requires_exact_live_run_lease(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            repository = self._git_repository(root)
+            for role, run_kind in (
+                (self.EqualitySpoof(), "formal"),
+                ("serial-coordinator", self.EqualitySpoof()),
+            ):
+                with self.subTest(role=role, run_kind=run_kind), self.assertRaises(
+                    ValueError
+                ):
+                    sharding.ResultWriterLease.acquire(
+                        repository,
+                        role=role,
+                        run_kind=run_kind,
+                        run_lease=None,
+                    )
+            for run_lease in (None, object(), True):
+                with self.subTest(run_lease=run_lease), self.assertRaises(TypeError):
+                    sharding.ResultWriterLease.acquire(
+                        repository,
+                        role="parallel-coordinator",
+                        run_kind="formal",
+                        run_lease=run_lease,
+                    )
+
+            run_lease = sharding.RunCoordinatorLease.acquire(
+                run_root=root / "formal-run",
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            run_lease.close()
+            with self.assertRaises(RuntimeError):
+                sharding.ResultWriterLease.acquire(
+                    repository,
+                    role="parallel-coordinator",
+                    run_kind="formal",
+                    run_lease=run_lease,
+                )
+
+    def test_authority_issues_and_consumes_once_before_any_destination_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            repository = self._git_repository(root)
+            lease = sharding.ResultWriterLease.acquire(
+                repository,
+                role="serial-coordinator",
+                run_kind="formal",
+                run_lease=None,
+            )
+            try:
+                authority = lease.authority()
+                destinations = {
+                    "forward": repository / "results" / "forward.json",
+                    "lifecycle": repository / "results" / "lifecycle.json",
+                }
+                with mock.patch.object(
+                    Path,
+                    "resolve",
+                    side_effect=AssertionError(
+                        "destination consume must remain lexical-only"
+                    ),
+                ), mock.patch.object(
+                    sharding.os,
+                    "lstat",
+                    side_effect=AssertionError(
+                        "destination consume must not inspect the filesystem"
+                    ),
+                ), mock.patch.object(
+                    sharding.os,
+                    "stat",
+                    side_effect=AssertionError(
+                        "destination consume must not inspect the filesystem"
+                    ),
+                ), mock.patch.object(
+                    sharding.os,
+                    "fstat",
+                    side_effect=AssertionError(
+                        "destination consume must not inspect descriptors"
+                    ),
+                ), mock.patch.object(
+                    sharding.os,
+                    "open",
+                    side_effect=AssertionError(
+                        "destination consume must not open filesystem entries"
+                    ),
+                ):
+                    authority._consume(destinations)
+                self.assertTrue(authority.consumed)
+                self.assertFalse((repository / "results").exists())
+                with self.assertRaises(RuntimeError):
+                    authority._consume(destinations)
+            finally:
+                lease.close()
+
+    def test_lease_close_failures_are_one_shot_and_poison_process(self):
+        evidence_root = Path(__file__).parents[1]
+        program = r"""
+from pathlib import Path
+import os
+import subprocess
+import sys
+from scripts import workflow_eval_sharding as sharding
+
+root = Path(sys.argv[1])
+kind = sys.argv[2]
+role = sys.argv[3]
+if kind == "run":
+    lease = sharding.RunCoordinatorLease.acquire(
+        run_root=root / "formal-run", epoch_id="e" * 64, run_kind="formal"
+    )
+else:
+    repository = root / "repository"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    lease = sharding.ResultWriterLease.acquire(
+        repository, role="serial-coordinator", run_kind="formal", run_lease=None
+    )
+
+if kind == "run":
+    slots = {
+        "parent": (lease._parent_slot, root),
+        "run": (lease._run_slot, root / "formal-run"),
+        "coordinator": (lease._coordinator_slot, root / "formal-run" / "coordinator"),
+        "lock": (lease._lock_slot, root / "formal-run" / "coordinator" / "coordinator.lock"),
+    }
+    expected_order = ["coordinator", "run", "parent", "lock"]
+else:
+    lock_path = sharding.result_writer_lock_path(repository)
+    slots = {
+        "repository-parent": (lease._repository_parent_slot, repository.parent),
+        "repository": (lease._repository_slot, repository),
+        "lock-parent": (lease._parent_slot, Path("/var/tmp").resolve(strict=True)),
+        "lock-root": (lease._root_slot, lock_path.parent),
+        "lock": (lease._lock_slot, lock_path),
+    }
+    expected_order = [
+        "repository", "repository-parent", "lock-root", "lock-parent", "lock"
+    ]
+target_slot, target_path = slots[role]
+target = target_slot.descriptor
+slot_by_descriptor = {slot.descriptor: name for name, (slot, _path) in slots.items()}
+real_close = sharding.os.close
+real_open = sharding.os.open
+calls = []
+def close_then_fail(descriptor):
+    if descriptor in slot_by_descriptor:
+        calls.append(slot_by_descriptor[descriptor])
+    real_close(descriptor)
+    if descriptor == target:
+        flags = os.O_RDWR if target_path.is_file() else os.O_RDONLY | os.O_DIRECTORY
+        replacement = real_open(target_path, flags)
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        raise OSError("indeterminate lease close")
+sharding.os.close = close_then_fail
+try:
+    try:
+        lease.close()
+    except OSError as error:
+        if not sharding.is_indeterminate_descriptor_close(error):
+            raise SystemExit(2)
+    else:
+        raise SystemExit(3)
+    first_calls = tuple(calls)
+    if first_calls != tuple(expected_order):
+        raise SystemExit(4)
+    os.fstat(target)
+    for operation in (
+        lambda: lease.close(),
+        lambda: sharding.RunCoordinatorLease.acquire(
+            run_root=root / "second-run", epoch_id="f" * 64, run_kind="formal"
+        ),
+    ):
+        try:
+            operation()
+        except RuntimeError:
+            pass
+        else:
+            raise SystemExit(5)
+    if tuple(calls) != first_calls:
+        raise SystemExit(6)
+finally:
+    sharding.os.close = real_close
+    real_close(target)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            roles = {
+                "run": ("parent", "run", "coordinator", "lock"),
+                "result": (
+                    "repository-parent",
+                    "repository",
+                    "lock-parent",
+                    "lock-root",
+                    "lock",
+                ),
+            }
+            for kind, kind_roles in roles.items():
+                for role in kind_roles:
+                    with self.subTest(kind=kind, role=role):
+                        process_root = root / f"{kind}-{role}"
+                        process_root.mkdir()
+                        completed = subprocess.run(
+                            [
+                                sys.executable,
+                                "-c",
+                                program,
+                                str(process_root),
+                                kind,
+                                role,
+                            ],
+                            cwd=evidence_root,
+                            env={**os.environ, "PYTHONPATH": str(evidence_root)},
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_indeterminate_rollback_primary_poison_is_terminal(self):
+        evidence_root = Path(__file__).parents[1]
+        program = r'''
+from pathlib import Path
+import tempfile
+from scripts import workflow_eval_sharding as sharding
+
+error = OSError("nested rollback close became indeterminate")
+setattr(error, sharding._INDETERMINATE_CLOSE_MARKER, True)
+try:
+    sharding._raise_task_failures(
+        primary=error, close_errors=[], label="nested rollback"
+    )
+except OSError as caught:
+    if caught is not error:
+        raise SystemExit(2)
+else:
+    raise SystemExit(3)
+with tempfile.TemporaryDirectory() as temporary:
+    try:
+        sharding.RunCoordinatorLease.acquire(
+            run_root=Path(temporary).resolve(strict=True) / "run",
+            epoch_id="e" * 64,
+            run_kind="formal",
+        )
+    except RuntimeError as caught:
+        if "poisoned" not in str(caught):
+            raise SystemExit(4)
+    else:
+        raise SystemExit(5)
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=evidence_root,
+            env={**os.environ, "PYTHONPATH": str(evidence_root)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_validation_failure_close_retires_all_and_allows_reacquire(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_parent = root / "run-parent"
+            run_parent.mkdir(mode=0o700)
+            run_root = run_parent / "formal-run"
+            lease = sharding.RunCoordinatorLease.acquire(
+                run_root=run_root,
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            moved_parent = root / "moved-run-parent"
+            run_parent.rename(moved_parent)
+            run_parent.mkdir(mode=0o700)
+            with self.assertRaisesRegex(RuntimeError, "parent name changed"):
+                lease.close()
+            self.assertTrue(
+                all(
+                    slot.descriptor_close_state == "closed"
+                    for slot in (
+                        lease._parent_slot,
+                        lease._run_slot,
+                        lease._coordinator_slot,
+                        lease._lock_slot,
+                    )
+                )
+            )
+            shutil.rmtree(run_parent)
+            moved_parent.rename(run_parent)
+            reacquired = sharding.RunCoordinatorLease.acquire(
+                run_root=run_root,
+                epoch_id="e" * 64,
+                run_kind="formal",
+            )
+            reacquired.close()
+
+            repository = self._git_repository(root)
+            writer = sharding.ResultWriterLease.acquire(
+                repository,
+                role="serial-coordinator",
+                run_kind="formal",
+                run_lease=None,
+            )
+            moved_repository = root / "moved-repository"
+            repository.rename(moved_repository)
+            subprocess.run(
+                ["git", "init", "-q", str(repository)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "repository root name changed"):
+                writer.close()
+            self.assertTrue(
+                all(
+                    slot.descriptor_close_state == "closed"
+                    for slot in (
+                        writer._repository_slot,
+                        writer._repository_parent_slot,
+                        writer._root_slot,
+                        writer._parent_slot,
+                        writer._lock_slot,
+                    )
+                )
+            )
+            shutil.rmtree(repository)
+            moved_repository.rename(repository)
+            reacquired_writer = sharding.ResultWriterLease.acquire(
+                repository,
+                role="serial-coordinator",
+                run_kind="formal",
+                run_lease=None,
+            )
+            reacquired_writer.close()
+
+    def test_serial_and_parallel_writers_contend_across_processes(self):
+        evidence_root = Path(__file__).parents[1]
+        holder_program = r"""
+from pathlib import Path
+import sys
+import time
+
+from scripts import run_observing_workflows_task9_eval as evaluator
+from scripts.workflow_eval_sharding import RunCoordinatorLease, ResultWriterLease
+
+repository = Path(sys.argv[1])
+run_root = Path(sys.argv[2])
+ready = Path(sys.argv[3])
+release = Path(sys.argv[4])
+readback = Path(sys.argv[5])
+results_root = Path(sys.argv[6])
+run_lease = RunCoordinatorLease.acquire(
+    run_root=run_root,
+    epoch_id="e" * 64,
+    run_kind="formal",
+)
+writer_lease = ResultWriterLease.acquire(
+    repository,
+    role="parallel-coordinator",
+    run_kind="formal",
+    run_lease=run_lease,
+)
+manifests = {"forward": [], "lifecycle": []}
+results = {"forward": [], "lifecycle": []}
+original_readback = evaluator._readback_result_pair_at
+
+def readback_after_barrier(*args, **kwargs):
+    ready.write_text("pointer-replaced-before-readback\n", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("test release marker was not created")
+        time.sleep(0.01)
+    resolved = original_readback(*args, **kwargs)
+    readback.write_text("readback-complete\n", encoding="utf-8")
+    return resolved
+
+evaluator._readback_result_pair_at = readback_after_barrier
+try:
+    evaluator.persist_result_pair(
+        {
+            "forward": results_root / "forward.json",
+            "lifecycle": results_root / "lifecycle.json",
+        },
+        results,
+        manifests,
+        authority=writer_lease.authority(),
+    )
+finally:
+    writer_lease.close()
+    run_lease.close()
+"""
+        serial_program = r"""
+from pathlib import Path
+import sys
+import time
+
+from scripts import run_observing_workflows_task9_eval as evaluator
+
+evaluator_root = Path(sys.argv[1])
+repository = Path(sys.argv[2])
+ready = Path(sys.argv[3])
+persistence_entered = Path(sys.argv[4])
+results_root = Path(sys.argv[5])
+forward_manifest = Path(sys.argv[6])
+lifecycle_manifest = Path(sys.argv[7])
+deadline = time.monotonic() + 3
+while not ready.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("parallel writer never became ready")
+    time.sleep(0.01)
+
+evaluator.validate_frozen_manifests = lambda *args, **kwargs: None
+evaluator.snapshot_production = lambda *args, **kwargs: object()
+evaluator.assert_production_unchanged = lambda *args, **kwargs: None
+original_persist = evaluator._persist_result_pair_retained
+
+def persist_with_entry_marker(*args, **kwargs):
+    persistence_entered.write_text("entered\n", encoding="utf-8")
+    return original_persist(*args, **kwargs)
+
+evaluator._persist_result_pair_retained = persist_with_entry_marker
+try:
+    evaluator.run_suite(
+        evaluator_root,
+        repository_root=repository,
+        manifest_paths={
+            "forward": forward_manifest,
+            "lifecycle": lifecycle_manifest,
+        },
+        result_destinations={
+            "forward": results_root / "forward.json",
+            "lifecycle": results_root / "lifecycle.json",
+        },
+        coordinator_role="serial-coordinator",
+    )
+except BaseException as error:
+    print(f"lease-failed:{type(error).__name__}", file=sys.stderr)
+    raise SystemExit(23)
+print("serial-success")
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            repository = root / "repository"
+            subprocess.run(
+                ["git", "init", "-q", str(repository)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            run_root = root / "parallel-run"
+            ready = root / "parallel-ready"
+            release = root / "parallel-release"
+            holder_readback = root / "parallel-readback"
+            holder_results = repository / "holder-results"
+            holder_pointer = (
+                holder_results / "observing_workflows_results_commit.json"
+            )
+            manifest_root = repository / "serial-inputs"
+            manifest_root.mkdir()
+            forward_manifest = manifest_root / "forward.json"
+            lifecycle_manifest = manifest_root / "lifecycle.json"
+            forward_manifest.write_text("[]\n", encoding="utf-8")
+            lifecycle_manifest.write_text("[]\n", encoding="utf-8")
+            first_persistence_entered = root / "first-serial-persistence-entered"
+            first_results = repository / "first-serial-results"
+            second_persistence_entered = root / "second-serial-persistence-entered"
+            second_results = repository / "second-serial-results"
+            environments = []
+            for process_name in ("parallel", "serial"):
+                process_root = root / process_name
+                tmpdir = process_root / "tmp"
+                home = process_root / "home"
+                codex_home = process_root / "codex-home"
+                tmpdir.mkdir(parents=True)
+                home.mkdir()
+                codex_home.mkdir()
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "TMPDIR": str(tmpdir),
+                        "HOME": str(home),
+                        "CODEX_HOME": str(codex_home),
+                        "PYTHONPATH": str(evidence_root),
+                    }
+                )
+                environments.append(environment)
+
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    holder_program,
+                    str(repository),
+                    str(run_root),
+                    str(ready),
+                    str(release),
+                    str(holder_readback),
+                    str(holder_results),
+                ],
+                cwd=evidence_root,
+                env=environments[0],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            serial = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    serial_program,
+                    str(evidence_root),
+                    str(repository),
+                    str(ready),
+                    str(first_persistence_entered),
+                    str(first_results),
+                    str(forward_manifest),
+                    str(lifecycle_manifest),
+                ],
+                cwd=evidence_root,
+                env=environments[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            holder_stdout = ""
+            holder_stderr = ""
+            holder_output_collected = False
+            try:
+                serial_stdout, serial_stderr = serial.communicate(timeout=10)
+                holder_was_live = holder.poll() is None
+                if not holder_was_live:
+                    holder_stdout, holder_stderr = holder.communicate(timeout=1)
+                    holder_output_collected = True
+                self.assertTrue(
+                    ready.exists(),
+                    "parallel holder never reached readback barrier:\n"
+                    f"stdout={holder_stdout}\nstderr={holder_stderr}",
+                )
+                self.assertTrue(holder_pointer.is_file())
+                self.assertFalse(holder_readback.exists())
+                self.assertTrue(
+                    holder_was_live,
+                    "parallel lease was not held between pointer replace and readback",
+                )
+                self.assertEqual("", serial_stdout)
+                self.assertEqual(23, serial.returncode, serial_stderr)
+                self.assertIn("lease-failed:", serial_stderr)
+                self.assertFalse(first_persistence_entered.exists())
+                self.assertFalse(first_results.exists())
+            finally:
+                release.touch(exist_ok=True)
+                if not holder_output_collected:
+                    try:
+                        holder_stdout, holder_stderr = holder.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        holder.kill()
+                        holder_stdout, holder_stderr = holder.communicate(timeout=5)
+                if serial.poll() is None:
+                    serial.kill()
+                    serial_stdout, serial_stderr = serial.communicate(timeout=5)
+
+            self.assertEqual(
+                0,
+                holder.returncode,
+                "parallel holder failed after release:\n"
+                f"stdout={holder_stdout}\nstderr={holder_stderr}",
+            )
+            self.assertTrue(holder_readback.is_file())
+
+            reacquired = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    serial_program,
+                    str(evidence_root),
+                    str(repository),
+                    str(ready),
+                    str(second_persistence_entered),
+                    str(second_results),
+                    str(forward_manifest),
+                    str(lifecycle_manifest),
+                ],
+                cwd=evidence_root,
+                env=environments[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            reacquired_stdout, reacquired_stderr = reacquired.communicate(timeout=10)
+            self.assertEqual(0, reacquired.returncode, reacquired_stderr)
+            self.assertEqual("serial-success\n", reacquired_stdout)
+            self.assertTrue(second_persistence_entered.is_file())
+            self.assertTrue(
+                (
+                    second_results
+                    / "observing_workflows_results_commit.json"
+                ).is_file()
+            )
+
+
+class ResolvedTransportConfigTests(unittest.TestCase):
+    @staticmethod
+    def _write_fake_codex(path: Path, version: str = "codex-cli 9.9.9") -> None:
+        path.write_text(
+            "#!/bin/sh\nprintf '%s\\n' " + json.dumps(version) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+
+    @staticmethod
+    def _assignment_and_plan(case_id="auth-case"):
+        assignment = sharding.CaseAssignment(
+            key=sharding.CaseKey("forward", 1, case_id),
+            lane="E1",
+            route="exec",
+            manifest_sha256="a" * 64,
+        )
+        epoch_id = "e" * 64
+        plan = sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind="diagnostic",
+            fingerprints=replace(
+                input_fingerprints("diagnostic"), epoch_id=epoch_id
+            ),
+            assignments=(assignment,),
+        )
+        return assignment, plan
+
+    def test_public_transport_config_matches_exact_contract_and_canonical_bytes(self):
+        expected_fields = [
+            "schema_version",
+            "codex_version",
+            "codex_executable_path",
+            "codex_executable_sha256",
+            "codex_executable_device",
+            "codex_executable_inode",
+            "codex_executable_size",
+            "model",
+            "model_reasoning_effort",
+            "approval_policy",
+            "sandbox_mode",
+            "network_access",
+            "web_search",
+            "multi_agent",
+            "exec_timeout_seconds",
+            "app_server_timeout_seconds",
+            "gate_timeout_seconds",
+        ]
+        self.assertEqual(
+            expected_fields,
+            [field.name for field in fields(sharding.ResolvedTransportConfig)],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            (source_home / "config.toml").write_text(
+                'model = "config-model"\nmodel_reasoning_effort = "high"\n',
+                encoding="utf-8",
+            )
+            executable = root / "fake-codex"
+            self._write_fake_codex(executable)
+
+            config = sharding.resolve_transport_config(
+                codex_executable=executable,
+                source_codex_home=source_home,
+                requested_model=None,
+                requested_reasoning_effort=None,
+            )
+
+        serialized = sharding.transport_config_bytes(config)
+        self.assertEqual(
+            serialized,
+            json.dumps(
+                asdict(config),
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+        )
+        self.assertEqual("config-model", config.model)
+        self.assertEqual("high", config.model_reasoning_effort)
+        self.assertEqual("never", config.approval_policy)
+        self.assertEqual("workspace-write", config.sandbox_mode)
+        self.assertIs(False, config.network_access)
+        self.assertEqual("disabled", config.web_search)
+        self.assertIs(True, config.multi_agent)
+        self.assertEqual(1200, config.exec_timeout_seconds)
+        self.assertEqual(600, config.app_server_timeout_seconds)
+        self.assertEqual(300, config.gate_timeout_seconds)
+
+    def test_resolved_executable_identity_rejects_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            executable = root / "fake-codex"
+            self._write_fake_codex(executable)
+            config = sharding.resolve_transport_config(
+                codex_executable=executable,
+                source_codex_home=source_home,
+                requested_model="requested-model",
+                requested_reasoning_effort="medium",
+            )
+            self.assertEqual(
+                executable.resolve(), sharding.verify_codex_executable(config)
+            )
+
+            executable.unlink()
+            self._write_fake_codex(executable, "codex-cli replacement")
+            with self.assertRaisesRegex(RuntimeError, "executable identity changed"):
+                sharding.verify_codex_executable(config)
+
+    def test_auth_bootstrap_and_case_install_are_private_auth_only_copies(self):
+        secret = b'{"token":"AUTH_SECRET_SENTINEL"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_bytes(secret)
+            auth.chmod(0o600)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            assignment, plan = self._assignment_and_plan()
+
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            installed = sharding.install_case_auth(
+                bootstrap=bootstrap.path,
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+
+            self.assertEqual({"auth.json"}, {path.name for path in bootstrap.path.iterdir()})
+            self.assertEqual({"auth.json"}, {path.name for path in paths.codex_home.iterdir()})
+            self.assertEqual(secret, (bootstrap.path / "auth.json").read_bytes())
+            self.assertEqual(secret, (paths.codex_home / "auth.json").read_bytes())
+            self.assertEqual(0o700, stat.S_IMODE(bootstrap.path.stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(paths.codex_home.stat().st_mode))
+            self.assertEqual(
+                0o600, stat.S_IMODE((bootstrap.path / "auth.json").stat().st_mode)
+            )
+            self.assertEqual(
+                0o600, stat.S_IMODE((paths.codex_home / "auth.json").stat().st_mode)
+            )
+            os.close(installed.descriptor)
+            os.close(bootstrap.descriptor)
+
+    def test_auth_bootstrap_rejects_missing_symlinked_and_unsafe_auth(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            coordinator = root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            _, plan = self._assignment_and_plan()
+
+            missing_home = root / "missing-home"
+            missing_home.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, "safe auth.json"):
+                sharding.prepare_auth_bootstrap(
+                    source_codex_home=missing_home,
+                    coordinator_root=coordinator,
+                    plan=plan,
+                )
+
+            target = root / "target-auth.json"
+            target.write_text("SYMLINK_AUTH_SECRET", encoding="utf-8")
+            target.chmod(0o600)
+            symlink_home = root / "symlink-home"
+            symlink_home.mkdir(mode=0o700)
+            (symlink_home / "auth.json").symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "safe auth.json"):
+                sharding.prepare_auth_bootstrap(
+                    source_codex_home=symlink_home,
+                    coordinator_root=coordinator,
+                    plan=plan,
+                )
+
+            unsafe_home = root / "unsafe-home"
+            unsafe_home.mkdir(mode=0o700)
+            unsafe_auth = unsafe_home / "auth.json"
+            unsafe_auth.write_text("UNSAFE_AUTH_SECRET", encoding="utf-8")
+            unsafe_auth.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "safe auth.json") as caught:
+                sharding.prepare_auth_bootstrap(
+                    source_codex_home=unsafe_home,
+                    coordinator_root=coordinator,
+                    plan=plan,
+                )
+            self.assertNotIn("UNSAFE_AUTH_SECRET", str(caught.exception))
+
+    def test_case_auth_install_rejects_symlinked_or_unsafe_bootstrap_auth(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(parents=True, mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            source_auth = source_home / "auth.json"
+            source_auth.write_text("BOOTSTRAP_AUTH_SECRET", encoding="utf-8")
+            source_auth.chmod(0o600)
+            assignment, plan = self._assignment_and_plan()
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            target = root / "target-auth.json"
+            target.write_text("BOOTSTRAP_AUTH_SECRET", encoding="utf-8")
+            target.chmod(0o600)
+            (bootstrap.path / "auth.json").unlink()
+            (bootstrap.path / "auth.json").symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "safe bootstrap auth.json"):
+                sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+
+            (bootstrap.path / "auth.json").unlink()
+            unsafe_auth = bootstrap.path / "auth.json"
+            unsafe_auth.write_text("UNSAFE_BOOTSTRAP_SECRET", encoding="utf-8")
+            unsafe_auth.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "safe bootstrap auth.json"):
+                sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+            self.assertFalse(paths.codex_home.exists())
+            os.close(bootstrap.descriptor)
+
+    def test_source_auth_fifo_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            os_fifo = source_home / "auth.json"
+            os.mkfifo(os_fifo, mode=0o600)
+            coordinator = root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            code = "\n".join(
+                (
+                    "import sys",
+                    "from pathlib import Path",
+                    "from scripts import workflow_eval_sharding as sharding",
+                    "root = Path(sys.argv[1])",
+                    "try:",
+                    "    sharding.prepare_legacy_auth_bootstrap(source_codex_home=root / 'source-home', coordinator_root=root / 'coordinator')",
+                    "except ValueError:",
+                    "    print('rejected')",
+                    "else:",
+                    "    raise SystemExit(3)",
+                )
+            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", code, str(root)],
+                    cwd=Path(__file__).resolve().parents[1],
+                    text=True,
+                    capture_output=True,
+                    timeout=1,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("mode-0600 source auth FIFO blocked preflight")
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("rejected", completed.stdout.strip())
+
+    def test_bootstrap_auth_fifo_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bootstrap = root / "bootstrap"
+            bootstrap.mkdir(mode=0o700)
+            os.mkfifo(bootstrap / "auth.json", mode=0o600)
+            code = "\n".join(
+                (
+                    "import sys",
+                    "from pathlib import Path",
+                    "from scripts import workflow_eval_sharding as sharding",
+                    "root = Path(sys.argv[1])",
+                    "try:",
+                    "    sharding.install_legacy_case_auth(bootstrap=root / 'bootstrap', case_codex_home=root / 'case-home')",
+                    "except ValueError:",
+                    "    print('rejected')",
+                    "else:",
+                    "    raise SystemExit(3)",
+                )
+            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", code, str(root)],
+                    cwd=Path(__file__).resolve().parents[1],
+                    text=True,
+                    capture_output=True,
+                    timeout=1,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("mode-0600 bootstrap auth FIFO blocked preflight")
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("rejected", completed.stdout.strip())
+
+    def test_transport_config_explicit_values_and_partial_fallback_precedence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            (source_home / "config.toml").write_text(
+                'model = "fallback-model"\nmodel_reasoning_effort = "fallback-reasoning"\n',
+                encoding="utf-8",
+            )
+            executable = root / "fake-codex"
+            self._write_fake_codex(executable)
+            cases = (
+                ("explicit-model", "explicit-reasoning", "explicit-model", "explicit-reasoning"),
+                ("explicit-model", None, "explicit-model", "fallback-reasoning"),
+                (None, "explicit-reasoning", "fallback-model", "explicit-reasoning"),
+                (None, None, "fallback-model", "fallback-reasoning"),
+            )
+            for requested_model, requested_reasoning, expected_model, expected_reasoning in cases:
+                with self.subTest(
+                    model=requested_model, reasoning=requested_reasoning
+                ):
+                    config = sharding.resolve_transport_config(
+                        codex_executable=executable,
+                        source_codex_home=source_home,
+                        requested_model=requested_model,
+                        requested_reasoning_effort=requested_reasoning,
+                    )
+                    self.assertEqual(expected_model, config.model)
+                    self.assertEqual(
+                        expected_reasoning, config.model_reasoning_effort
+                    )
+
+
+class RuntimeIsolationTests(unittest.TestCase):
+    @staticmethod
+    def _sha256_tree(root: Path) -> dict[str, tuple[int, str]]:
+        inventory = {}
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            details = path.lstat()
+            digest = ""
+            if path.is_file():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            inventory[relative] = (stat.S_IMODE(details.st_mode), digest)
+        return inventory
+
+    @staticmethod
+    def _write_read_only_marketplace(root: Path) -> None:
+        files = {
+            ".agents/plugins/marketplace.json": b'{"name":"test"}\n',
+            "plugins/workflow-observer/.codex-plugin/plugin.json": b"{}\n",
+            "plugins/workflow-observer/scripts/workflow_observer_cli.py": (
+                b"#!/usr/bin/env python3\nraise SystemExit(0)\n"
+            ),
+            "plugins/workflow-observer/scripts/store_config.py": b"VALUE = 1\n",
+            "plugins/workflow-observer/scripts/core_source.json": b"{}\n",
+            "plugins/workflow-observer/skills/workflow-observer/SKILL.md": (
+                b"---\nname: workflow-observer\n---\n"
+            ),
+            "README.md": b"captured marketplace\n",
+        }
+        root.mkdir(parents=True, mode=0o700)
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        for path in sorted(root.rglob("*"), reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        root.chmod(0o555)
+
+    @staticmethod
+    def _assignment(mode: str, ordinal: int, case_id: str):
+        return sharding.CaseAssignment(
+            key=sharding.CaseKey(mode, ordinal, case_id),
+            lane="E1",
+            route="exec",
+            manifest_sha256="f" * 64,
+        )
+
+    @staticmethod
+    def _transport_config(executable: Path):
+        return sharding.ResolvedTransportConfig(
+            schema_version=1,
+            codex_version="codex-cli test",
+            codex_executable_path=str(executable),
+            codex_executable_sha256="0" * 64,
+            codex_executable_device=1,
+            codex_executable_inode=2,
+            codex_executable_size=3,
+            model="test-model",
+            model_reasoning_effort="high",
+            approval_policy="never",
+            sandbox_mode="workspace-write",
+            network_access=False,
+            web_search="disabled",
+            multi_agent=True,
+            exec_timeout_seconds=1200,
+            app_server_timeout_seconds=600,
+            gate_timeout_seconds=300,
+        )
+
+    @staticmethod
+    def _plan(assignment, run_kind="diagnostic"):
+        epoch_id = "e" * 64
+        fingerprints = replace(
+            input_fingerprints(run_kind), epoch_id=epoch_id
+        )
+        return sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind=run_kind,
+            fingerprints=fingerprints,
+            assignments=(assignment,),
+        )
+
+    @staticmethod
+    def _fd_count():
+        for candidate in (Path("/dev/fd"), Path("/proc/self/fd")):
+            if candidate.is_dir():
+                return len(list(candidate.iterdir()))
+        raise unittest.SkipTest("open-descriptor inventory is unavailable")
+
+    @staticmethod
+    def _exception_leaves(error):
+        if isinstance(error, BaseExceptionGroup):
+            return tuple(
+                leaf
+                for nested in error.exceptions
+                for leaf in RuntimeIsolationTests._exception_leaves(nested)
+            )
+        return (error,)
+
+    def _prepare_bootstrap(self, root, plan, secret=b'{"token":"SECRET"}\n'):
+        source_home = root / "source-home"
+        source_home.mkdir(mode=0o700)
+        auth = source_home / "auth.json"
+        auth.write_bytes(secret)
+        auth.chmod(0o600)
+        coordinator = root / "run/coordinator"
+        coordinator.mkdir(parents=True, mode=0o700)
+        return sharding.prepare_auth_bootstrap(
+            source_codex_home=source_home,
+            coordinator_root=coordinator,
+            plan=plan,
+        )
+
+    def _install_case(self, root, plan, assignment):
+        bootstrap = self._prepare_bootstrap(root, plan)
+        paths = sharding.paths_for_case(root / "run", assignment)
+        paths.root.mkdir(parents=True, mode=0o700)
+        paths.cleanup.mkdir(mode=0o700)
+        installed = sharding.install_case_auth(
+            bootstrap=bootstrap.path,
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+        )
+        return bootstrap, paths, installed
+
+    def test_cleanup_public_contract_matches_amended_plan(self):
+        self.assertEqual(
+            ("active", "scrubbing", "tombstoned"),
+            get_args(sharding.CleanupState),
+        )
+        self.assertEqual(
+            ("owned", "closing", "closed", "indeterminate"),
+            get_args(sharding.DescriptorCloseState),
+        )
+
+    def test_worker_exit_required_is_exact_recursive_terminal_signal(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        signature = inspect.signature(worker.worker_exit_required)
+        self.assertEqual(("error", "factory"), tuple(signature.parameters))
+        hints = get_type_hints(worker.worker_exit_required)
+        self.assertIs(BaseException, hints["error"])
+        self.assertIs(bool, hints["return"])
+
+        ordinary = RuntimeError("ordinary")
+        factory = mock.Mock(poisoned=False)
+        self.assertFalse(worker.worker_exit_required(ordinary, factory))
+        factory.poisoned = True
+        self.assertTrue(worker.worker_exit_required(ordinary, factory))
+
+        marked = RuntimeError("indeterminate")
+        setattr(
+            marked,
+            sharding._INDETERMINATE_CLOSE_MARKER,
+            True,
+        )
+        nested = ExceptionGroup("nested", [ordinary, marked])
+        factory.poisoned = False
+        self.assertTrue(worker.worker_exit_required(nested, factory))
+        with self.assertRaises(TypeError):
+            worker.worker_exit_required("not-an-error", factory)
+        expected = {
+            sharding.BootstrapOwnership: (
+                "schema_version", "epoch_id", "run_kind",
+                "bootstrap_device", "bootstrap_inode",
+            ),
+            sharding.InstalledAuthBootstrap: (
+                "path", "ownership", "descriptor", "state",
+                "descriptor_close_state", "descriptor_close_error",
+            ),
+            sharding.CaseAuthOwnership: (
+                "schema_version", "epoch_id", "run_kind", "case",
+                "case_root_device", "case_root_inode",
+                "codex_home_device", "codex_home_inode",
+            ),
+            sharding.InstalledCaseAuth: (
+                "ownership", "descriptor", "state",
+                "descriptor_close_state", "descriptor_close_error",
+            ),
+            sharding.TombstoneReceipt: (
+                "schema_version", "epoch_id", "run_kind", "case",
+                "ownership_sha256", "case_root_device", "case_root_inode",
+                "codex_home_device", "codex_home_inode", "scrubbed", "empty",
+                "canonical_binding", "producer",
+            ),
+        }
+        for record, names in expected.items():
+            with self.subTest(record=record.__name__):
+                self.assertEqual(names, tuple(field.name for field in fields(record)))
+        self.assertEqual(
+            ("source_codex_home", "coordinator_root", "plan"),
+            tuple(inspect.signature(sharding.prepare_auth_bootstrap).parameters),
+        )
+        self.assertEqual(
+            ("bootstrap", "plan", "assignment", "paths"),
+            tuple(inspect.signature(sharding.install_case_auth).parameters),
+        )
+
+    def test_indeterminate_close_predicate_marks_exact_leaves_and_groups(self):
+        failures = (
+            RuntimeError("runtime close failure"),
+            KeyboardInterrupt("close interrupted"),
+            OSError(errno.EBADF, "bad descriptor"),
+            OSError(errno.EIO, "I/O close failure"),
+        )
+        real_close = os.close
+        for failure in failures:
+            with self.subTest(failure=repr(failure)):
+                descriptor = os.open(os.devnull, os.O_RDONLY)
+                slot = sharding._DescriptorSlot(descriptor)
+
+                def close_then_raise(candidate):
+                    real_close(candidate)
+                    raise failure
+
+                with mock.patch.object(os, "close", side_effect=close_then_raise):
+                    returned = sharding._retire_descriptor_capability(slot)
+
+                self.assertIs(failure, returned)
+                self.assertTrue(
+                    sharding.is_indeterminate_descriptor_close(failure)
+                )
+                ordinary = RuntimeError("ordinary")
+                group_type = (
+                    ExceptionGroup
+                    if isinstance(failure, Exception)
+                    else BaseExceptionGroup
+                )
+                group = group_type("nested", [ordinary, failure])
+                nested = BaseExceptionGroup("outer", [group])
+                self.assertTrue(
+                    sharding.is_indeterminate_descriptor_close(nested)
+                )
+                self.assertFalse(
+                    sharding.is_indeterminate_descriptor_close(ordinary)
+                )
+
+    def test_atomic_record_temp_close_reuse_is_retired_without_publish_or_unlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            root.chmod(0o700)
+            destination = root / "record.json"
+            failure = RuntimeError("temporary descriptor close indeterminate")
+            real_open = os.open
+            real_close = os.close
+            captured = {}
+            replacement = None
+            close_calls = 0
+            parent_close_calls = 0
+            mutations_after_failure = []
+            close_failed = False
+
+            def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if dir_fd is None and Path(path) == root:
+                    captured["parent"] = descriptor
+                elif (
+                    dir_fd == captured.get("parent")
+                    and isinstance(path, str)
+                    and path.startswith(".record.json.tmp-")
+                ):
+                    captured["temporary"] = descriptor
+                    captured["temporary_name"] = path
+                return descriptor
+
+            def close_then_reuse(descriptor):
+                nonlocal replacement, close_calls, close_failed, parent_close_calls
+                if descriptor == captured.get("temporary"):
+                    close_calls += 1
+                    if close_calls == 1:
+                        before = os.fstat(descriptor)
+                        real_close(descriptor)
+                        opened = real_open(
+                            captured["temporary_name"],
+                            os.O_RDWR,
+                            dir_fd=captured["parent"],
+                        )
+                        if opened != descriptor:
+                            os.dup2(opened, descriptor)
+                            real_close(opened)
+                        replacement = descriptor
+                        after = os.fstat(replacement)
+                        self.assertEqual(
+                            (before.st_dev, before.st_ino),
+                            (after.st_dev, after.st_ino),
+                        )
+                        close_failed = True
+                        raise failure
+                if descriptor == captured.get("parent"):
+                    parent_close_calls += 1
+                return real_close(descriptor)
+
+            real_replace = os.replace
+            real_unlink = os.unlink
+            real_fsync = os.fsync
+
+            def tracked_replace(*args, **kwargs):
+                if close_failed:
+                    mutations_after_failure.append("replace")
+                return real_replace(*args, **kwargs)
+
+            def tracked_unlink(*args, **kwargs):
+                if close_failed:
+                    mutations_after_failure.append("unlink")
+                return real_unlink(*args, **kwargs)
+
+            def tracked_fsync(*args, **kwargs):
+                if close_failed:
+                    mutations_after_failure.append("fsync")
+                return real_fsync(*args, **kwargs)
+
+            try:
+                with mock.patch.object(os, "open", side_effect=tracked_open), \
+                        mock.patch.object(os, "close", side_effect=close_then_reuse), \
+                        mock.patch.object(os, "replace", side_effect=tracked_replace), \
+                        mock.patch.object(os, "unlink", side_effect=tracked_unlink), \
+                        mock.patch.object(os, "fsync", side_effect=tracked_fsync):
+                    with self.assertRaises(RuntimeError) as caught:
+                        sharding._atomic_write_record(
+                            destination, {"schema_version": 1}
+                        )
+                self.assertIs(failure, caught.exception)
+                self.assertTrue(
+                    sharding.is_indeterminate_descriptor_close(caught.exception)
+                )
+                self.assertEqual(1, close_calls)
+                self.assertEqual(1, parent_close_calls)
+                self.assertEqual([], mutations_after_failure)
+                self.assertFalse(destination.exists())
+                self.assertTrue(
+                    (root / captured["temporary_name"]).is_file()
+                )
+                os.fstat(replacement)
+            finally:
+                if replacement is not None:
+                    try:
+                        real_close(replacement)
+                    except OSError:
+                        pass
+                temporary_path = root / captured.get("temporary_name", "missing")
+                temporary_path.unlink(missing_ok=True)
+
+    def test_atomic_record_parent_close_reuse_is_marked_and_replacement_survives(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            root.chmod(0o700)
+            destination = root / "record.json"
+            failure = KeyboardInterrupt("parent descriptor close indeterminate")
+            real_open = os.open
+            real_close = os.close
+            captured = {}
+            replacement = None
+            close_calls = 0
+
+            def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if dir_fd is None and Path(path) == root:
+                    captured["parent"] = descriptor
+                return descriptor
+
+            def close_then_reuse(descriptor):
+                nonlocal replacement, close_calls
+                if descriptor == captured.get("parent"):
+                    close_calls += 1
+                    if close_calls == 1:
+                        before = os.fstat(descriptor)
+                        real_close(descriptor)
+                        opened = real_open(
+                            root,
+                            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        )
+                        if opened != descriptor:
+                            os.dup2(opened, descriptor)
+                            real_close(opened)
+                        replacement = descriptor
+                        after = os.fstat(replacement)
+                        self.assertEqual(
+                            (before.st_dev, before.st_ino),
+                            (after.st_dev, after.st_ino),
+                        )
+                        raise failure
+                return real_close(descriptor)
+
+            try:
+                with mock.patch.object(os, "open", side_effect=tracked_open), \
+                        mock.patch.object(os, "close", side_effect=close_then_reuse):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        sharding._atomic_write_record(
+                            destination, {"schema_version": 1}
+                        )
+                self.assertIs(failure, caught.exception)
+                self.assertTrue(
+                    sharding.is_indeterminate_descriptor_close(caught.exception)
+                )
+                self.assertEqual(1, close_calls)
+                self.assertEqual(
+                    b'{"schema_version":1}', destination.read_bytes()
+                )
+                os.fstat(replacement)
+            finally:
+                if replacement is not None:
+                    try:
+                        real_close(replacement)
+                    except OSError:
+                        pass
+
+    def test_read_only_capture_stages_disjoint_writable_cases(self):
+        self.assertEqual(
+            ["root", "start", "terminal"],
+            [field.name for field in fields(sharding.AttemptPaths)],
+        )
+        self.assertEqual(
+            [
+                "root", "cleanup", "attempts", "staging", "workspace", "store",
+                "audit", "payload", "output", "home", "codex_home", "tmp",
+                "config", "cache", "sealed",
+            ],
+            [field.name for field in fields(sharding.CasePaths)],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            before = self._sha256_tree(snapshot)
+
+            forward = self._assignment("forward", 9, "scope-supersession")
+            lifecycle = self._assignment("lifecycle", 3, "scope-supersession")
+            forward_paths = sharding.paths_for_case(root / "run", forward)
+            lifecycle_paths = sharding.paths_for_case(root / "run", lifecycle)
+            self.assertNotEqual(forward_paths.root, lifecycle_paths.root)
+            self.assertEqual(
+                "forward-09-scope-supersession", forward_paths.root.name
+            )
+            self.assertEqual(
+                "lifecycle-03-scope-supersession", lifecycle_paths.root.name
+            )
+            self.assertEqual(
+                forward_paths.root / "workspace" / "scope-supersession",
+                forward_paths.workspace,
+            )
+            self.assertEqual(
+                lifecycle_paths.root / "workspace" / "scope-supersession",
+                lifecycle_paths.workspace,
+            )
+
+            forward_stage = sharding.stage_marketplace_for_case(
+                read_only_snapshot=snapshot,
+                destination=forward_paths.staging / "workflow-observatory",
+            )
+            lifecycle_stage = sharding.stage_marketplace_for_case(
+                read_only_snapshot=snapshot,
+                destination=lifecycle_paths.staging / "workflow-observatory",
+            )
+            for staged in (forward_stage, lifecycle_stage):
+                cli = staged / (
+                    "plugins/workflow-observer/scripts/workflow_observer_cli.py"
+                )
+                library = staged / (
+                    "plugins/workflow-observer/scripts/store_config.py"
+                )
+                self.assertEqual(0o700, stat.S_IMODE(cli.stat().st_mode))
+                self.assertEqual(0o600, stat.S_IMODE(library.stat().st_mode))
+                self.assertTrue(all(
+                    stat.S_IMODE(path.stat().st_mode) == 0o700
+                    for path in (staged, cli.parent, library.parent)
+                ))
+                self.assertEqual(
+                    (snapshot / cli.relative_to(staged)).read_bytes(),
+                    cli.read_bytes(),
+                )
+            self.assertEqual(before, self._sha256_tree(snapshot))
+
+            attempt_1 = sharding.paths_for_attempt(forward_paths, 1)
+            attempt_2 = sharding.paths_for_attempt(forward_paths, 2)
+            self.assertEqual(forward_paths.attempts / "01", attempt_1.root)
+            self.assertEqual(attempt_1.root / "start.json", attempt_1.start)
+            self.assertEqual(attempt_1.root / "terminal.json", attempt_1.terminal)
+            self.assertEqual(forward_paths.attempts / "02", attempt_2.root)
+            self.assertEqual(attempt_2.root / "start.json", attempt_2.start)
+            self.assertEqual(attempt_2.root / "terminal.json", attempt_2.terminal)
+
+    def test_production_runtime_factory_uses_writable_stage(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            before = self._sha256_tree(snapshot)
+
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            source_home = root / "source-codex-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_bytes(b'{"token":"TEST_ONLY_SECRET"}\n')
+            auth.chmod(0o600)
+            assignment = self._assignment("forward", 1, "shared-id")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            runtime = factory(
+                assignment=assignment,
+                manifest_case={"id": "shared-id", "setup": {"cli": "available"}},
+                paths=paths,
+                transport_config=config,
+            )
+
+            staged_cli = paths.staging / (
+                "workflow-observatory/plugins/workflow-observer/scripts/"
+                "workflow_observer_cli.py"
+            )
+            captured_cli = snapshot / (
+                "plugins/workflow-observer/scripts/workflow_observer_cli.py"
+            )
+            self.assertEqual(staged_cli, runtime.audited_wrapper_path)
+            self.assertNotEqual(captured_cli, runtime.audited_wrapper_path)
+            self.assertEqual(0o700, stat.S_IMODE(staged_cli.stat().st_mode))
+            self.assertEqual(config, runtime.transport_config)
+            self.assertEqual(
+                tuple[Path, ...],
+                get_type_hints(task9_eval.CaseRuntime)["writable_roots"],
+            )
+            self.assertIsInstance(runtime.writable_roots, tuple)
+            self.assertEqual(str(paths.home), runtime.environment["HOME"])
+            self.assertEqual(
+                str(paths.codex_home), runtime.environment["CODEX_HOME"]
+            )
+            self.assertEqual(str(paths.tmp), runtime.environment["TMPDIR"])
+            self.assertEqual(
+                str(paths.config), runtime.environment["XDG_CONFIG_HOME"]
+            )
+            self.assertEqual(
+                str(paths.cache), runtime.environment["XDG_CACHE_HOME"]
+            )
+            self.assertEqual(str(paths.store), str(runtime.store_root))
+            self.assertEqual(
+                b'{"token":"TEST_ONLY_SECRET"}\n',
+                (paths.codex_home / "auth.json").read_bytes(),
+            )
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE((paths.codex_home / "auth.json").stat().st_mode),
+            )
+            self.assertFalse((paths.codex_home / "config.toml").exists())
+            self.assertNotIn(paths.codex_home, runtime.writable_roots)
+            for isolated in (
+                paths.root,
+                paths.workspace,
+                paths.store,
+                paths.audit,
+                paths.payload,
+                paths.output,
+                paths.home,
+                paths.codex_home,
+                paths.tmp,
+                paths.config,
+                paths.cache,
+            ):
+                self.assertEqual(0o700, stat.S_IMODE(isolated.stat().st_mode))
+            self.assertEqual(before, self._sha256_tree(snapshot))
+
+            unrelated = root / "unrelated-codex-home"
+            unrelated.mkdir(mode=0o700)
+            keep = unrelated / "keep.txt"
+            keep.write_text("keep", encoding="utf-8")
+            keep.chmod(0o600)
+            forged = replace(paths, codex_home=unrelated)
+            with self.assertRaisesRegex(ValueError, "ownership|canonical"):
+                factory.cleanup_case(forged)
+            self.assertEqual("keep", keep.read_text(encoding="utf-8"))
+
+            first = factory.cleanup_case(paths)
+            second = factory.cleanup_case(paths)
+            self.assertEqual(first, second)
+            self.assertTrue(paths.codex_home.is_dir())
+            self.assertEqual([], list(paths.codex_home.iterdir()))
+            self.assertTrue((bootstrap.path / "auth.json").is_file())
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_production_driver_uses_captured_evaluator_with_transport_stub(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        self.assertTrue(
+            hasattr(worker, "build_production_case_driver"),
+            "production case driver is missing",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            assignment = self._assignment("forward", 1, "shared-id")
+            plan = self._plan(assignment)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            paths = sharding.paths_for_case(run_root, assignment)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            captured_calls = []
+            transport_calls = []
+            expected_execution = task9_eval.CaseExecution(
+                "completed", "done", (), (), task9_eval.ZERO_TOKEN_USAGE
+            )
+
+            class CapturedEvaluator:
+                @staticmethod
+                def _run_case(
+                    case,
+                    destination,
+                    lifecycle,
+                    runtime_factory=None,
+                    *,
+                    workspace_parent,
+                    transport_runner,
+                    event_sink,
+                    execution_sink,
+                ):
+                    captured_calls.append(
+                        (case["id"], destination, workspace_parent, lifecycle)
+                    )
+                    workspace = workspace_parent / case["id"]
+                    workspace.mkdir()
+                    runtime = runtime_factory(
+                        case, destination, workspace, lifecycle
+                    )
+                    execution = transport_runner(
+                        case,
+                        workspace,
+                        runtime,
+                        runtime.store_root,
+                        None,
+                        event_sink=event_sink,
+                    )
+                    execution_sink(execution)
+                    return {"id": case["id"], "captured": True}
+
+            def transport_stub(*args, **kwargs):
+                transport_calls.append((args, kwargs))
+                return expected_execution
+
+            with mock.patch.object(
+                worker,
+                "_load_captured_evaluator",
+                return_value=CapturedEvaluator,
+            ):
+                driver = worker.build_production_case_driver(
+                    snapshot_root=snapshot,
+                    transport_config=config,
+                    transport_runner=transport_stub,
+                )
+            driven = driver(
+                assignment=assignment,
+                manifest_case={
+                    "id": "shared-id",
+                    "fixture": "empty",
+                    "turns": [{"prompt": "one"}],
+                },
+                paths=paths,
+                runtime_factory=factory,
+                event_sink=lambda *_: None,
+            )
+
+            self.assertEqual(
+                [
+                    (
+                        "shared-id",
+                        paths.root,
+                        paths.workspace.parent,
+                        False,
+                    )
+                ],
+                captured_calls,
+            )
+            self.assertEqual(1, len(transport_calls))
+            self.assertIs(expected_execution, driven.execution)
+            self.assertEqual(
+                {"id": "shared-id", "captured": True}, driven.result
+            )
+            self.assertTrue(
+                paths.staging.joinpath(
+                    "workflow-observatory/plugins/workflow-observer/scripts/"
+                    "workflow_observer_cli.py"
+                ).is_file()
+            )
+            self.assertEqual([], list(paths.codex_home.iterdir()))
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_production_driver_loads_actual_captured_run_case(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+        from tests import observing_workflows_eval_harness as harness
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            captured = root / "captured-input"
+            marketplace = captured / "workflow-observatory"
+            self._write_read_only_marketplace(marketplace)
+            evaluator_path = (
+                captured
+                / "evidence/scripts/run_observing_workflows_task9_eval.py"
+            )
+            evaluator_path.parent.mkdir(parents=True)
+            evaluator_path.write_bytes(Path(task9_eval.__file__).read_bytes())
+            evaluator_path.chmod(0o444)
+            for directory in (
+                evaluator_path.parent,
+                evaluator_path.parent.parent,
+                captured,
+            ):
+                directory.chmod(0o555)
+
+            assignment = self._assignment("forward", 1, "shared-id")
+            plan = self._plan(assignment)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            paths = sharding.paths_for_case(run_root, assignment)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=captured,
+                transport_config=config,
+                plan=plan,
+            )
+            calls = []
+
+            def transport_stub(
+                case,
+                workspace,
+                runtime,
+                wiki_root,
+                after_first_turn=None,
+                event_sink=None,
+            ):
+                calls.append((case["id"], workspace, runtime, wiki_root))
+                self.assertEqual(paths.workspace, workspace)
+                self.assertTrue((workspace / ".git").is_dir())
+                self.assertTrue(
+                    workspace.joinpath(
+                        ".agents/skills/workflow-observer/SKILL.md"
+                    ).is_file()
+                )
+                self.assertEqual(paths.store, runtime.store_root)
+                self.assertEqual(paths.store, wiki_root)
+                self.assertEqual(workspace, harness._GATE_ROOTS[case["id"]])
+                driver._evaluator.release_gate(case["id"])
+                return task9_eval.CaseExecution(
+                    "completed",
+                    "done",
+                    (),
+                    (),
+                    task9_eval.ZERO_TOKEN_USAGE,
+                )
+
+            driver = worker.build_production_case_driver(
+                snapshot_root=captured,
+                transport_config=config,
+                transport_runner=transport_stub,
+            )
+            self.assertEqual(
+                evaluator_path.resolve(strict=True),
+                Path(driver._evaluator.__file__).resolve(strict=True),
+            )
+            driver._evaluator.run_configured_integrity = lambda *a, **k: None
+            driven = driver(
+                assignment=assignment,
+                manifest_case={
+                    "id": "shared-id",
+                    "fixture": "empty",
+                    "turns": [{"prompt": "run scripts/gate.py"}],
+                    "expected_run_count": 0,
+                    "expected_draft_count": 0,
+                    "expected_final_statuses": [],
+                    "expected_decisions": [
+                        {"after_turn": 1, "triggered": False}
+                    ],
+                },
+                paths=paths,
+                runtime_factory=factory,
+                event_sink=lambda *_: None,
+            )
+
+            self.assertEqual("shared-id", driven.result["id"])
+            self.assertEqual(1, len(calls))
+            self.assertEqual(paths.workspace, calls[0][1])
+            self.assertNotIn("shared-id", harness._GATE_ROOTS)
+            self.assertEqual([], list(paths.codex_home.iterdir()))
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_captured_evaluator_loader_never_reuses_another_snapshot_module(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            sources = []
+            for name in ("capture-a", "capture-b"):
+                source = (
+                    root
+                    / name
+                    / "evidence/scripts/run_observing_workflows_task9_eval.py"
+                )
+                source.parent.mkdir(parents=True, mode=0o700)
+                source.write_bytes(Path(task9_eval.__file__).read_bytes())
+                source.chmod(0o444)
+                sources.append(source)
+
+            first = worker._load_captured_evaluator(sources[0].parents[2])
+            second = worker._load_captured_evaluator(sources[1].parents[2])
+
+        self.assertIsNot(first, second)
+        self.assertEqual(sources[0], Path(first.__file__))
+        self.assertEqual(sources[1], Path(second.__file__))
+
+    def test_production_driver_honors_captured_process_survival_type(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        class ForeignProcessSurvival(RuntimeError):
+            pass
+
+        class CapturedEvaluator:
+            @staticmethod
+            def _contains_process_survival_failure(error):
+                return isinstance(error, ForeignProcessSurvival)
+
+            @staticmethod
+            def _run_case(
+                case,
+                destination,
+                lifecycle,
+                runtime_factory=None,
+                *,
+                workspace_parent,
+                transport_runner,
+                event_sink,
+                execution_sink,
+            ):
+                workspace = workspace_parent / case["id"]
+                workspace.mkdir()
+                runtime_factory(case, destination, workspace, lifecycle)
+                raise ForeignProcessSurvival("foreign captured survival")
+
+        class Factory:
+            poisoned = False
+
+            def __init__(self):
+                self.cleaned = []
+
+            def __call__(self, **kwargs):
+                return mock.sentinel.runtime
+
+            def cleanup_case(self, paths):
+                self.cleaned.append(paths)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            assignment = self._assignment("forward", 1, "shared-id")
+            paths = sharding.paths_for_case(run_root, assignment)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            with mock.patch.object(
+                worker,
+                "_load_captured_evaluator",
+                return_value=CapturedEvaluator,
+            ):
+                driver = worker.build_production_case_driver(
+                    snapshot_root=root,
+                    transport_config=config,
+                    transport_runner=mock.Mock(),
+                )
+            factory = Factory()
+            with self.assertRaises(ForeignProcessSurvival):
+                driver(
+                    assignment=assignment,
+                    manifest_case={"id": "shared-id"},
+                    paths=paths,
+                    runtime_factory=factory,
+                    event_sink=lambda *_: None,
+                )
+
+        self.assertEqual([], factory.cleaned)
+
+    def test_staging_and_attempt_scans_reject_unsafe_or_partial_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            mutable_snapshot = root / "mutable-snapshot"
+            self._write_read_only_marketplace(mutable_snapshot)
+            mutable_file = mutable_snapshot / "README.md"
+            mutable_file.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "0444"):
+                sharding.stage_marketplace_for_case(
+                    read_only_snapshot=mutable_snapshot,
+                    destination=root / "mutable-stage",
+                )
+
+            snapshot = root / "snapshot"
+            self._write_read_only_marketplace(snapshot)
+            outside = root / "outside"
+            outside.write_text("outside", encoding="utf-8")
+            snapshot.chmod(0o755)
+            (snapshot / "unsafe-link").symlink_to(outside)
+            snapshot.chmod(0o555)
+            with self.assertRaisesRegex(ValueError, "symlink|special"):
+                sharding.stage_marketplace_for_case(
+                    read_only_snapshot=snapshot,
+                    destination=root / "stage",
+                )
+
+            special_snapshot = root / "special-snapshot"
+            self._write_read_only_marketplace(special_snapshot)
+            special_snapshot.chmod(0o755)
+            os.mkfifo(special_snapshot / "unsafe-fifo", mode=0o444)
+            special_snapshot.chmod(0o555)
+            with self.assertRaisesRegex(ValueError, "special"):
+                sharding.stage_marketplace_for_case(
+                    read_only_snapshot=special_snapshot,
+                    destination=root / "special-stage",
+                )
+
+            assignment = self._assignment("forward", 1, "case")
+            paths = sharding.paths_for_case(root / "run", assignment)
+            attempt = sharding.paths_for_attempt(paths, 1)
+            attempt.root.mkdir(parents=True, mode=0o700)
+            attempt.start.write_text("{}", encoding="utf-8")
+            attempt.start.chmod(0o600)
+            plan = type("Plan", (), {"assignments": (assignment,)})()
+            with self.assertRaisesRegex(ValueError, "partial"):
+                sharding.scan_attempts(paths, plan=plan)
+            attempt.terminal.write_text("{}", encoding="utf-8")
+            attempt.terminal.chmod(0o600)
+            self.assertEqual(1, len(sharding.scan_attempts(paths, plan=plan)))
+            gap = paths.attempts / "02"
+            attempt.root.rename(gap)
+            with self.assertRaisesRegex(ValueError, "gap"):
+                sharding.scan_attempts(paths, plan=plan)
+            gap.rename(attempt.root)
+            extra = paths.attempts / "03"
+            extra.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, "attempt"):
+                sharding.scan_attempts(paths, plan=plan)
+
+    def test_runtime_factory_rejects_symlinked_case_ancestor(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            (run_root / "cases").symlink_to(outside, target_is_directory=True)
+
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            paths = sharding.paths_for_case(run_root, assignment)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                factory(
+                    assignment=assignment,
+                    manifest_case={"id": "case"},
+                    paths=paths,
+                    transport_config=config,
+                )
+            self.assertEqual([], list(outside.iterdir()))
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_runtime_factory_rejects_symlink_immediately_above_run_root(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            target = root / "symlink-target"
+            target.mkdir(mode=0o700)
+            alias = root / "run-alias"
+            alias.symlink_to(target, target_is_directory=True)
+            run_root = alias / "run"
+            run_root.mkdir(mode=0o700)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            with self.assertRaisesRegex(ValueError, "canonical|symlink"):
+                sharding.paths_for_case(run_root, assignment)
+            canonical_paths = sharding.paths_for_case(target / "run", assignment)
+            paths = sharding.CasePaths(**{
+                field.name: alias
+                / getattr(canonical_paths, field.name).relative_to(target)
+                for field in fields(sharding.CasePaths)
+            })
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+
+            with self.assertRaisesRegex(ValueError, "canonical|symlink"):
+                factory(
+                    assignment=assignment,
+                    manifest_case={"id": "case"},
+                    paths=paths,
+                    transport_config=config,
+                )
+            self.assertFalse(
+                (target / "run/cases/forward-01-case").exists(),
+                "factory wrote through the symlinked run-root ancestor",
+            )
+
+    def test_scan_attempts_rejects_every_forged_case_path_field(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            assignment = self._assignment("forward", 1, "case")
+            paths = sharding.paths_for_case(run_root, assignment)
+            attempt = sharding.paths_for_attempt(paths, 1)
+            attempt.root.mkdir(parents=True, mode=0o700)
+            for artifact in (attempt.start, attempt.terminal):
+                artifact.write_text("{}", encoding="utf-8")
+                artifact.chmod(0o600)
+            plan = type("Plan", (), {"assignments": (assignment,)})()
+            self.assertEqual(1, len(sharding.scan_attempts(paths, plan=plan)))
+
+            unrelated = root / "unrelated"
+            unrelated.mkdir(mode=0o700)
+            external_attempt = unrelated / "attempts/01"
+            external_attempt.mkdir(parents=True, mode=0o700)
+            for name in ("start.json", "terminal.json"):
+                artifact = external_attempt / name
+                artifact.write_text("{}", encoding="utf-8")
+                artifact.chmod(0o600)
+
+            for field in fields(sharding.CasePaths):
+                redirected = unrelated / field.name
+                if field.name == "attempts":
+                    redirected = unrelated / "attempts"
+                forged = replace(paths, **{field.name: redirected})
+                with self.subTest(field=field.name):
+                    with self.assertRaises(ValueError):
+                        sharding.scan_attempts(forged, plan=plan)
+
+            dotdot = replace(
+                paths,
+                attempts=paths.root / "nested" / ".." / "attempts",
+            )
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                sharding.scan_attempts(dotdot, plan=plan)
+
+            alias = root / "attempt-alias"
+            alias.symlink_to(paths.attempts, target_is_directory=True)
+            symlinked = replace(paths, attempts=alias)
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                sharding.scan_attempts(symlinked, plan=plan)
+
+    def test_runtime_factory_preserves_setup_and_auth_cleanup_failures(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            setup_error = ValueError("post-auth setup failed")
+            cleanup_error = RuntimeError("auth cleanup failed")
+
+            with mock.patch.object(
+                worker,
+                "inventory_external_skill_paths",
+                side_effect=setup_error,
+            ), mock.patch.object(
+                worker,
+                "cleanup_case_auth",
+                side_effect=cleanup_error,
+            ):
+                with self.assertRaises(ExceptionGroup) as caught:
+                    factory(
+                        assignment=assignment,
+                        manifest_case={"id": "case"},
+                        paths=paths,
+                        transport_config=config,
+                    )
+            self.assertEqual(
+                (setup_error, cleanup_error), caught.exception.exceptions
+            )
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_runtime_cleanup_rejects_forged_codex_home(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            factory(
+                assignment=assignment,
+                manifest_case={"id": "case"},
+                paths=paths,
+                transport_config=config,
+            )
+            unrelated = root / "unrelated-codex-home"
+            unrelated.mkdir(mode=0o700)
+            keep = unrelated / "keep.txt"
+            keep.write_text("keep", encoding="utf-8")
+            keep.chmod(0o600)
+
+            forged = replace(paths, codex_home=unrelated)
+            with self.assertRaisesRegex(ValueError, "ownership|canonical"):
+                factory.cleanup_case(forged)
+            self.assertEqual("keep", keep.read_text(encoding="utf-8"))
+            factory.cleanup_case(paths)
+            self.assertTrue(paths.codex_home.is_dir())
+            self.assertEqual([], list(paths.codex_home.iterdir()))
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_runtime_cleanup_scrubs_owned_descriptor_and_records_replacement(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            factory(
+                assignment=assignment,
+                manifest_case={"id": "case"},
+                paths=paths,
+                transport_config=config,
+            )
+
+            owned_home = root / "displaced-owned-codex-home"
+            paths.codex_home.rename(owned_home)
+            paths.codex_home.mkdir(mode=0o700)
+            keep = paths.codex_home / "keep.txt"
+            keep.write_text("keep", encoding="utf-8")
+            keep.chmod(0o600)
+
+            receipt = factory.cleanup_case(paths)
+            self.assertEqual("replaced", receipt.canonical_binding)
+            self.assertEqual("keep", keep.read_text(encoding="utf-8"))
+            self.assertEqual([], list(owned_home.iterdir()))
+            factory.close()
+            os.close(bootstrap.descriptor)
+
+    def test_runtime_factory_retains_one_descriptor_and_close_releases_it(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-input" / "workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir(mode=0o700)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            assignment = self._assignment("forward", 1, "case")
+            plan = self._plan(assignment)
+            bootstrap = sharding.prepare_auth_bootstrap(
+                source_codex_home=source_home,
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+            baseline = self._fd_count()
+            factory(
+                assignment=assignment,
+                manifest_case={"id": "case"},
+                paths=paths,
+                transport_config=config,
+            )
+            self.assertEqual(baseline + 1, self._fd_count())
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                factory(
+                    assignment=assignment,
+                    manifest_case={"id": "case"},
+                    paths=paths,
+                    transport_config=config,
+                )
+            self.assertEqual(baseline + 1, self._fd_count())
+            factory.close()
+            self.assertEqual(baseline, self._fd_count())
+            self.assertTrue((paths.codex_home / "auth.json").is_file())
+            factory.close()
+            self.assertEqual(baseline, self._fd_count())
+            os.close(bootstrap.descriptor)
+
+    def test_bootstrap_ownership_precedes_secret_and_interruption_closes(self):
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("BOOTSTRAP_SECRET", encoding="utf-8")
+            auth.chmod(0o600)
+            coordinator = root / "run/coordinator"
+            coordinator.mkdir(parents=True, mode=0o700)
+            baseline = self._fd_count()
+
+            def interrupt_after_ownership(source_descriptor, directory_descriptor, name):
+                ownership_path = coordinator / "cleanup/bootstrap-ownership.json"
+                self.assertTrue(ownership_path.is_file())
+                ownership = sharding.read_bootstrap_ownership(
+                    coordinator_root=coordinator,
+                    plan=plan,
+                )
+                self.assertEqual(plan.epoch_id, ownership.epoch_id)
+                self.assertFalse((coordinator / "auth-bootstrap/auth.json").exists())
+                raise OSError("interrupted before auth copy")
+
+            with mock.patch.object(
+                sharding,
+                "_copy_auth_descriptor_at",
+                side_effect=interrupt_after_ownership,
+            ):
+                with self.assertRaisesRegex(ValueError, "bootstrap"):
+                    sharding.prepare_auth_bootstrap(
+                        source_codex_home=source_home,
+                        coordinator_root=coordinator,
+                        plan=plan,
+                    )
+
+            self.assertEqual(baseline, self._fd_count())
+            ownership = sharding.read_bootstrap_ownership(
+                coordinator_root=coordinator,
+                plan=plan,
+            )
+            self.assertEqual(plan.run_kind, ownership.run_kind)
+            self.assertTrue((coordinator / "auth-bootstrap").is_dir())
+            self.assertFalse((coordinator / "auth-bootstrap/auth.json").exists())
+
+    def test_case_ownership_precedes_secret_and_interruption_closes(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            paths = sharding.paths_for_case(root / "run", assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            baseline = self._fd_count()
+
+            def interrupt_after_ownership(source_descriptor, directory_descriptor, name):
+                ownership = worker.read_case_auth_ownership(
+                    plan=plan, assignment=assignment, paths=paths
+                )
+                self.assertEqual(assignment.key, ownership.case)
+                self.assertFalse((paths.codex_home / "auth.json").exists())
+                raise KeyboardInterrupt("interrupted before case auth copy")
+
+            with mock.patch.object(
+                sharding,
+                "_copy_auth_descriptor_at",
+                side_effect=interrupt_after_ownership,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "interrupted before case auth copy"
+                ):
+                    sharding.install_case_auth(
+                        bootstrap=bootstrap.path,
+                        plan=plan,
+                        assignment=assignment,
+                        paths=paths,
+                    )
+            self.assertEqual(baseline, self._fd_count())
+            self.assertTrue((paths.cleanup / "ownership.json").is_file())
+            self.assertTrue(paths.codex_home.is_dir())
+            self.assertFalse((paths.codex_home / "auth.json").exists())
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_bootstrap_namespace_fsync_barriers_precede_secret_copy(self):
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("BOOTSTRAP_SECRET", encoding="utf-8")
+            auth.chmod(0o600)
+            coordinator = root / "run/coordinator"
+            coordinator.mkdir(parents=True, mode=0o700)
+            coordinator_identity = (
+                coordinator.stat().st_dev,
+                coordinator.stat().st_ino,
+            )
+            events = []
+            bootstrap_identities = set()
+            real_fsync = os.fsync
+            real_record = sharding._atomic_write_record
+            real_copy = sharding._copy_auth_descriptor_at
+
+            def traced_fsync(descriptor):
+                identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+                if identity == coordinator_identity:
+                    events.append("coordinator-fsync")
+                elif identity in bootstrap_identities:
+                    events.append("bootstrap-fsync")
+                return real_fsync(descriptor)
+
+            def traced_record(path, payload):
+                if path.name == "bootstrap-ownership.json":
+                    events.append("ownership")
+                return real_record(path, payload)
+
+            def traced_copy(source_descriptor, directory_descriptor, name):
+                metadata = os.fstat(directory_descriptor)
+                bootstrap_identities.add((metadata.st_dev, metadata.st_ino))
+                events.append("secret-copy")
+                return real_copy(source_descriptor, directory_descriptor, name)
+
+            with mock.patch.object(os, "fsync", side_effect=traced_fsync), \
+                    mock.patch.object(
+                        sharding, "_atomic_write_record", side_effect=traced_record
+                    ), mock.patch.object(
+                        sharding, "_copy_auth_descriptor_at", side_effect=traced_copy
+                    ):
+                bootstrap = sharding.prepare_auth_bootstrap(
+                    source_codex_home=source_home,
+                    coordinator_root=coordinator,
+                    plan=plan,
+                )
+
+            parent_barriers = [
+                index for index, event in enumerate(events)
+                if event == "coordinator-fsync"
+            ]
+            self.assertGreaterEqual(len(parent_barriers), 2, events)
+            ownership_index = events.index("ownership")
+            copy_index = events.index("secret-copy")
+            self.assertTrue(all(index < ownership_index for index in parent_barriers[:2]))
+            self.assertLess(ownership_index, copy_index)
+            self.assertGreater(events.index("bootstrap-fsync"), copy_index)
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_case_namespace_fsync_barriers_precede_secret_copy(self):
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            paths = sharding.paths_for_case(root / "run", assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            case_root_identity = (
+                paths.root.stat().st_dev,
+                paths.root.stat().st_ino,
+            )
+            events = []
+            codex_identities = set()
+            real_fsync = os.fsync
+            real_record = sharding._atomic_write_record
+            real_copy = sharding._copy_auth_descriptor_at
+
+            def traced_fsync(descriptor):
+                metadata = os.fstat(descriptor)
+                identity = (metadata.st_dev, metadata.st_ino)
+                if identity == case_root_identity:
+                    events.append("case-root-fsync")
+                elif identity in codex_identities:
+                    events.append("codex-home-fsync")
+                return real_fsync(descriptor)
+
+            def traced_record(path, payload):
+                if path.name == "ownership.json":
+                    events.append("ownership")
+                return real_record(path, payload)
+
+            def traced_copy(source_descriptor, directory_descriptor, name):
+                metadata = os.fstat(directory_descriptor)
+                codex_identities.add((metadata.st_dev, metadata.st_ino))
+                events.append("secret-copy")
+                return real_copy(source_descriptor, directory_descriptor, name)
+
+            with mock.patch.object(os, "fsync", side_effect=traced_fsync), \
+                    mock.patch.object(
+                        sharding, "_atomic_write_record", side_effect=traced_record
+                    ), mock.patch.object(
+                        sharding, "_copy_auth_descriptor_at", side_effect=traced_copy
+                    ):
+                installed = sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+
+            parent_barriers = [
+                index for index, event in enumerate(events)
+                if event == "case-root-fsync"
+            ]
+            self.assertGreaterEqual(len(parent_barriers), 2, events)
+            ownership_index = events.index("ownership")
+            copy_index = events.index("secret-copy")
+            self.assertTrue(all(index < ownership_index for index in parent_barriers[:2]))
+            self.assertLess(ownership_index, copy_index)
+            self.assertGreater(events.index("codex-home-fsync"), copy_index)
+            os.close(installed.descriptor)
+            installed.descriptor = -1
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_worker_fsyncs_empty_owned_home_before_tombstone_publish(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap, paths, installed = self._install_case(
+                root, plan, assignment
+            )
+            events = []
+            removed = False
+            real_remove = worker._remove_tree_entry
+            real_fstat = os.fstat
+            real_scandir = os.scandir
+            real_fsync = os.fsync
+            real_record = worker._atomic_write_record
+
+            def traced_remove(*args, **kwargs):
+                nonlocal removed
+                result = real_remove(*args, **kwargs)
+                removed = True
+                events.append("delete")
+                return result
+
+            def traced_fstat(descriptor):
+                metadata = real_fstat(descriptor)
+                if descriptor == installed.descriptor and removed:
+                    events.append("identity")
+                return metadata
+
+            def traced_scandir(path):
+                if path == installed.descriptor and removed:
+                    events.append("empty")
+                return real_scandir(path)
+
+            def traced_fsync(descriptor):
+                if descriptor == installed.descriptor:
+                    events.append("codex-home-fsync")
+                return real_fsync(descriptor)
+
+            def traced_record(path, payload):
+                if path.name == "tombstone.json":
+                    events.append("tombstone-publish")
+                return real_record(path, payload)
+
+            with mock.patch.object(
+                worker, "_remove_tree_entry", side_effect=traced_remove
+            ), mock.patch.object(os, "fstat", side_effect=traced_fstat), \
+                    mock.patch.object(os, "scandir", side_effect=traced_scandir), \
+                    mock.patch.object(os, "fsync", side_effect=traced_fsync), \
+                    mock.patch.object(
+                        worker, "_atomic_write_record", side_effect=traced_record
+                    ):
+                worker.cleanup_case_auth(installed=installed, paths=paths)
+
+            self.assertLess(events.index("delete"), events.index("identity"))
+            self.assertLess(events.index("identity"), events.index("empty"))
+            self.assertLess(events.index("empty"), events.index("codex-home-fsync"))
+            self.assertLess(
+                events.index("codex-home-fsync"),
+                events.index("tombstone-publish"),
+            )
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_worker_base_exceptions_restore_active_descriptor_for_retry(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        for failure in (
+            RuntimeError("runtime partial scrub"),
+            KeyboardInterrupt("keyboard partial scrub"),
+        ):
+            with self.subTest(failure=type(failure).__name__), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(strict=True)
+                assignment = self._assignment(
+                    "forward", 1, f"case-{type(failure).__name__.lower()}"
+                )
+                plan = self._plan(assignment)
+                bootstrap, paths, installed = self._install_case(
+                    root, plan, assignment
+                )
+                for name in ("one", "two"):
+                    child = paths.codex_home / name
+                    child.write_text(name, encoding="utf-8")
+                    child.chmod(0o600)
+                real_remove = worker._remove_tree_entry
+                injected = False
+
+                def remove_then_fail(*args, **kwargs):
+                    nonlocal injected
+                    result = real_remove(*args, **kwargs)
+                    if not injected:
+                        injected = True
+                        raise failure
+                    return result
+
+                with mock.patch.object(
+                    worker, "_remove_tree_entry", side_effect=remove_then_fail
+                ):
+                    with self.assertRaises(type(failure)) as caught:
+                        worker.cleanup_case_auth(installed=installed, paths=paths)
+                self.assertIs(failure, caught.exception)
+                self.assertEqual("active", installed.state)
+                self.assertEqual("owned", installed.descriptor_close_state)
+                self.assertIsNone(installed.descriptor_close_error)
+                os.fstat(installed.descriptor)
+                self.assertFalse((paths.codex_home / "auth.json").exists())
+                self.assertEqual(2, len(list(paths.codex_home.iterdir())))
+
+                receipt = worker.cleanup_case_auth(
+                    installed=installed, paths=paths
+                )
+                self.assertTrue(receipt.scrubbed)
+                self.assertEqual("tombstoned", installed.state)
+                os.close(bootstrap.descriptor)
+                bootstrap.descriptor = -1
+
+    def test_worker_close_failure_retires_capability_without_closing_same_identity_reuse(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        for failure in (
+            RuntimeError("close failed after same-identity reuse"),
+            KeyboardInterrupt("close interrupted after same-identity reuse"),
+        ):
+            with self.subTest(failure=type(failure).__name__), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(strict=True)
+                assignment = self._assignment(
+                    "forward", 1, f"case-{type(failure).__name__.lower()}"
+                )
+                plan = self._plan(assignment)
+                bootstrap, paths, installed = self._install_case(
+                    root, plan, assignment
+                )
+                target = installed.descriptor
+                original_identity = os.fstat(target).st_dev, os.fstat(target).st_ino
+                real_close = os.close
+                replacement = None
+                close_calls = 0
+
+                def close_then_reuse(descriptor):
+                    nonlocal replacement, close_calls
+                    if descriptor == target:
+                        close_calls += 1
+                        if close_calls == 1:
+                            real_close(descriptor)
+                            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                            opened = os.open(paths.codex_home, flags)
+                            if opened != target:
+                                os.dup2(opened, target)
+                                real_close(opened)
+                            replacement = target
+                            self.assertEqual(target, replacement)
+                            identity = (
+                                os.fstat(replacement).st_dev,
+                                os.fstat(replacement).st_ino,
+                            )
+                            self.assertEqual(original_identity, identity)
+                            raise failure
+                    return real_close(descriptor)
+
+                try:
+                    with mock.patch.object(os, "close", side_effect=close_then_reuse):
+                        with self.assertRaises(type(failure)) as caught:
+                            worker.cleanup_case_auth(installed=installed, paths=paths)
+                    self.assertIs(failure, caught.exception)
+                    self.assertEqual(1, close_calls)
+                    self.assertEqual(-1, installed.descriptor)
+                    self.assertEqual("tombstoned", installed.state)
+                    self.assertEqual("indeterminate", installed.descriptor_close_state)
+                    self.assertIs(failure, installed.descriptor_close_error)
+                    os.fstat(replacement)
+
+                    first_bytes = (paths.cleanup / "tombstone.json").read_bytes()
+                    def reject_retired_close(descriptor):
+                        if descriptor == target:
+                            raise AssertionError("retired descriptor was retried")
+                        return real_close(descriptor)
+
+                    with mock.patch.object(
+                        os,
+                        "close",
+                        side_effect=reject_retired_close,
+                    ), mock.patch.object(
+                        worker,
+                        "_remove_tree_entry",
+                        side_effect=AssertionError("tombstoned retry re-scrubbed"),
+                    ):
+                        with self.assertRaises(type(failure)) as repeated:
+                            worker.cleanup_case_auth(
+                                installed=installed, paths=paths
+                            )
+                    self.assertIs(failure, repeated.exception)
+                    self.assertEqual(
+                        first_bytes,
+                        (paths.cleanup / "tombstone.json").read_bytes(),
+                    )
+                    os.fstat(replacement)
+                finally:
+                    if replacement is not None:
+                        try:
+                            real_close(replacement)
+                        except OSError:
+                            pass
+                    if installed.descriptor >= 0:
+                        try:
+                            real_close(installed.descriptor)
+                        except OSError:
+                            pass
+                        installed.descriptor = -1
+                    real_close(bootstrap.descriptor)
+                    bootstrap.descriptor = -1
+
+    def test_worker_close_failures_are_one_shot_even_when_original_may_remain_open(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        outcomes = (
+            (RuntimeError("pre-close runtime failure"), False),
+            (KeyboardInterrupt("pre-close interrupt"), False),
+            (OSError(errno.EBADF, "pre-close bad descriptor"), False),
+            (OSError(errno.EIO, "post-close I/O failure"), True),
+        )
+        for failure, close_before_raise in outcomes:
+            with self.subTest(failure=repr(failure)), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(strict=True)
+                assignment = self._assignment(
+                    "forward", 1, f"case-{failure.__class__.__name__.lower()}-{failure.errno if isinstance(failure, OSError) else 'base'}"
+                )
+                plan = self._plan(assignment)
+                bootstrap, paths, installed = self._install_case(
+                    root, plan, assignment
+                )
+                target = installed.descriptor
+                real_close = os.close
+                close_calls = 0
+                guard_descriptor = None
+
+                def fail_once(descriptor):
+                    nonlocal close_calls
+                    if descriptor == target:
+                        close_calls += 1
+                        if close_calls == 1:
+                            if close_before_raise:
+                                real_close(descriptor)
+                            raise failure
+                    return real_close(descriptor)
+
+                try:
+                    with mock.patch.object(os, "close", side_effect=fail_once):
+                        with self.assertRaises(type(failure)) as caught:
+                            worker.cleanup_case_auth(
+                                installed=installed, paths=paths
+                            )
+                    self.assertIs(failure, caught.exception)
+                    self.assertEqual(1, close_calls)
+                    self.assertEqual(-1, installed.descriptor)
+                    self.assertEqual("indeterminate", installed.descriptor_close_state)
+                    self.assertIs(failure, installed.descriptor_close_error)
+
+                    if close_before_raise:
+                        opened = os.open(os.devnull, os.O_RDONLY)
+                        if opened != target:
+                            os.dup2(opened, target)
+                            real_close(opened)
+                        guard_descriptor = target
+
+                    def reject_retired_close(descriptor):
+                        if descriptor == target:
+                            raise AssertionError("retired descriptor was retried")
+                        return real_close(descriptor)
+
+                    with mock.patch.object(
+                        os,
+                        "close",
+                        side_effect=reject_retired_close,
+                    ):
+                        with self.assertRaises(type(failure)) as repeated:
+                            worker.cleanup_case_auth(
+                                installed=installed, paths=paths
+                            )
+                    self.assertIs(failure, repeated.exception)
+                finally:
+                    if guard_descriptor is not None:
+                        try:
+                            real_close(guard_descriptor)
+                        except OSError:
+                            pass
+                    elif not close_before_raise:
+                        try:
+                            real_close(target)
+                        except OSError:
+                            pass
+                    real_close(bootstrap.descriptor)
+                    bootstrap.descriptor = -1
+
+    def test_worker_successful_retirement_is_closed_and_idempotent(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap, paths, installed = self._install_case(
+                root, plan, assignment
+            )
+            first = worker.cleanup_case_auth(installed=installed, paths=paths)
+            second = worker.cleanup_case_auth(installed=installed, paths=paths)
+            self.assertEqual(first, second)
+            self.assertEqual(-1, installed.descriptor)
+            self.assertEqual("closed", installed.descriptor_close_state)
+            self.assertIsNone(installed.descriptor_close_error)
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_factory_close_is_terminal_and_rereports_stored_error_without_retry(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap, paths, installed = self._install_case(
+                root, plan, assignment
+            )
+            target = installed.descriptor
+            real_close = os.close
+            failure = RuntimeError("one-shot final close failure")
+            close_calls = 0
+
+            def fail_once_while_open(descriptor):
+                nonlocal close_calls
+                if descriptor == target:
+                    close_calls += 1
+                    if close_calls == 1:
+                        raise failure
+                return real_close(descriptor)
+
+            with mock.patch.object(os, "close", side_effect=fail_once_while_open):
+                with self.assertRaises(RuntimeError) as caught:
+                    worker.cleanup_case_auth(installed=installed, paths=paths)
+            self.assertIs(failure, caught.exception)
+            self.assertEqual("tombstoned", installed.state)
+            self.assertEqual(-1, installed.descriptor)
+            self.assertEqual("indeterminate", installed.descriptor_close_state)
+            os.fstat(target)
+
+            snapshot = root / "captured-input/workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=self._transport_config(executable),
+                plan=plan,
+            )
+            factory._owned_cases[paths.root] = (paths, installed)
+
+            for _ in range(2):
+                with mock.patch.object(
+                    os,
+                    "close",
+                    side_effect=AssertionError("factory retried retired descriptor"),
+                ):
+                    with self.assertRaises(RuntimeError) as repeated:
+                        factory.close()
+                self.assertIs(failure, repeated.exception)
+            self.assertEqual(1, close_calls)
+            real_close(target)
+            real_close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_factory_close_orders_multiple_exact_errors_and_never_retries(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        first_assignment = self._assignment("forward", 1, "a-case")
+        second_assignment = self._assignment("forward", 2, "b-case")
+        epoch_id = "e" * 64
+        plan = sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind="diagnostic",
+            fingerprints=replace(
+                input_fingerprints("diagnostic"), epoch_id=epoch_id
+            ),
+            assignments=(first_assignment, second_assignment),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            installed_by_assignment = {}
+            for assignment in (first_assignment, second_assignment):
+                paths = sharding.paths_for_case(root / "run", assignment)
+                paths.root.mkdir(parents=True, mode=0o700)
+                paths.cleanup.mkdir(mode=0o700)
+                installed = sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+                installed_by_assignment[assignment] = (paths, installed)
+
+            snapshot = root / "captured-input/workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=self._transport_config(executable),
+                plan=plan,
+            )
+            for assignment in (second_assignment, first_assignment):
+                paths, installed = installed_by_assignment[assignment]
+                factory._owned_cases[paths.root] = (paths, installed)
+
+            first_installed = installed_by_assignment[first_assignment][1]
+            second_installed = installed_by_assignment[second_assignment][1]
+            first_descriptor = first_installed.descriptor
+            second_descriptor = second_installed.descriptor
+            first_failure = RuntimeError("a close failed")
+            second_failure = KeyboardInterrupt("b close failed")
+            failures = {
+                first_descriptor: first_failure,
+                second_descriptor: second_failure,
+            }
+            retired_descriptors = tuple(failures)
+            close_calls = []
+            real_close = os.close
+
+            def fail_owned_close(descriptor):
+                if descriptor in failures:
+                    close_calls.append(descriptor)
+                    raise failures[descriptor]
+                return real_close(descriptor)
+
+            try:
+                with mock.patch.object(os, "close", side_effect=fail_owned_close):
+                    with self.assertRaises(BaseExceptionGroup) as caught:
+                        factory.close()
+                expected = (first_failure, second_failure)
+                self.assertEqual(expected, self._exception_leaves(caught.exception))
+                self.assertEqual(list(retired_descriptors), close_calls)
+                self.assertEqual(-1, first_installed.descriptor)
+                self.assertEqual(-1, second_installed.descriptor)
+
+                with mock.patch.object(
+                    os,
+                    "close",
+                    side_effect=AssertionError("terminal factory retried close"),
+                ):
+                    with self.assertRaises(BaseExceptionGroup) as repeated:
+                        factory.close()
+                self.assertEqual(
+                    expected, self._exception_leaves(repeated.exception)
+                )
+            finally:
+                for descriptor in retired_descriptors:
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+                real_close(bootstrap.descriptor)
+                bootstrap.descriptor = -1
+
+    def test_factory_setup_indeterminate_close_poison_is_terminal_before_later_work(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        first_assignment = self._assignment("forward", 1, "owned-case")
+        second_assignment = self._assignment("forward", 2, "failing-case")
+        epoch_id = "e" * 64
+        plan = sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind="diagnostic",
+            fingerprints=replace(
+                input_fingerprints("diagnostic"), epoch_id=epoch_id
+            ),
+            assignments=(first_assignment, second_assignment),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            first_paths = sharding.paths_for_case(root / "run", first_assignment)
+            first_paths.root.mkdir(parents=True, mode=0o700)
+            first_paths.cleanup.mkdir(mode=0o700)
+            first_installed = sharding.install_case_auth(
+                bootstrap=bootstrap.path,
+                plan=plan,
+                assignment=first_assignment,
+                paths=first_paths,
+            )
+            owned_descriptor = first_installed.descriptor
+            second_paths = sharding.paths_for_case(root / "run", second_assignment)
+            snapshot = root / "captured-input/workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=self._transport_config(executable),
+                plan=plan,
+            )
+            factory._owned_cases[first_paths.root] = (
+                first_paths,
+                first_installed,
+            )
+
+            failure = RuntimeError("marked setup close failure")
+            marker_slot = sharding._DescriptorSlot(
+                os.open(os.devnull, os.O_RDONLY)
+            )
+            real_close = os.close
+
+            def close_marker_then_raise(descriptor):
+                real_close(descriptor)
+                raise failure
+
+            with mock.patch.object(
+                os, "close", side_effect=close_marker_then_raise
+            ):
+                self.assertIs(
+                    failure,
+                    sharding._retire_descriptor_capability(marker_slot),
+                )
+            self.assertTrue(
+                sharding.is_indeterminate_descriptor_close(failure)
+            )
+
+            owned_close_calls = 0
+
+            def trace_owned_close(descriptor):
+                nonlocal owned_close_calls
+                if descriptor == owned_descriptor:
+                    owned_close_calls += 1
+                return real_close(descriptor)
+
+            try:
+                with mock.patch.object(
+                    worker, "_prepare_case_directories", side_effect=failure
+                ), mock.patch.object(
+                    os, "close", side_effect=trace_owned_close
+                ):
+                    with self.assertRaises(RuntimeError) as caught:
+                        factory(
+                            assignment=second_assignment,
+                            manifest_case={"id": second_assignment.key.case_id},
+                            paths=second_paths,
+                            transport_config=self._transport_config(executable),
+                        )
+                self.assertIs(failure, caught.exception)
+                self.assertTrue(factory.poisoned)
+                self.assertEqual(1, owned_close_calls)
+                self.assertEqual(-1, first_installed.descriptor)
+
+                with mock.patch.object(
+                    worker,
+                    "_prepare_case_directories",
+                    side_effect=AssertionError("poisoned factory did work"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "poisoned"):
+                        factory(
+                            assignment=second_assignment,
+                            manifest_case={"id": second_assignment.key.case_id},
+                            paths=second_paths,
+                            transport_config=self._transport_config(executable),
+                        )
+                with mock.patch.object(
+                    os,
+                    "close",
+                    side_effect=AssertionError("poisoned close retried"),
+                ):
+                    with self.assertRaises(RuntimeError) as repeated:
+                        factory.close()
+                self.assertIs(failure, repeated.exception)
+            finally:
+                if first_installed.descriptor >= 0:
+                    try:
+                        real_close(first_installed.descriptor)
+                    except OSError:
+                        pass
+                    first_installed.descriptor = -1
+                real_close(bootstrap.descriptor)
+                bootstrap.descriptor = -1
+
+    def test_factory_cleanup_indeterminate_close_poison_retires_other_owner_once(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        first_assignment = self._assignment("forward", 1, "cleanup-case")
+        second_assignment = self._assignment("forward", 2, "other-case")
+        epoch_id = "e" * 64
+        plan = sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind="diagnostic",
+            fingerprints=replace(
+                input_fingerprints("diagnostic"), epoch_id=epoch_id
+            ),
+            assignments=(first_assignment, second_assignment),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            owned = []
+            for assignment in (first_assignment, second_assignment):
+                paths = sharding.paths_for_case(root / "run", assignment)
+                paths.root.mkdir(parents=True, mode=0o700)
+                paths.cleanup.mkdir(mode=0o700)
+                installed = sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+                owned.append((paths, installed))
+            target_paths, target = owned[0]
+            _, other = owned[1]
+            target_descriptor = target.descriptor
+            other_descriptor = other.descriptor
+
+            snapshot = root / "captured-input/workflow-observatory"
+            self._write_read_only_marketplace(snapshot)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=self._transport_config(executable),
+                plan=plan,
+            )
+            for paths, installed in reversed(owned):
+                factory._owned_cases[paths.root] = (paths, installed)
+
+            failure = KeyboardInterrupt("marked cleanup close failure")
+            close_calls = {target_descriptor: 0, other_descriptor: 0}
+            real_close = os.close
+
+            def fail_target_and_trace_other(descriptor):
+                if descriptor in close_calls:
+                    close_calls[descriptor] += 1
+                if descriptor == target_descriptor:
+                    real_close(descriptor)
+                    raise failure
+                return real_close(descriptor)
+
+            try:
+                with mock.patch.object(
+                    os, "close", side_effect=fail_target_and_trace_other
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        factory.cleanup_case(target_paths)
+                self.assertIs(failure, caught.exception)
+                self.assertTrue(
+                    sharding.is_indeterminate_descriptor_close(caught.exception)
+                )
+                self.assertTrue(factory.poisoned)
+                self.assertEqual(
+                    {target_descriptor: 1, other_descriptor: 1}, close_calls
+                )
+                self.assertEqual(-1, target.descriptor)
+                self.assertEqual(-1, other.descriptor)
+
+                with mock.patch.object(
+                    worker,
+                    "cleanup_case_auth",
+                    side_effect=AssertionError("poisoned factory cleaned"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "poisoned"):
+                        factory.cleanup_case(owned[1][0])
+                with mock.patch.object(
+                    worker,
+                    "_prepare_case_directories",
+                    side_effect=AssertionError("poisoned factory did work"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "poisoned"):
+                        factory(
+                            assignment=second_assignment,
+                            manifest_case={"id": second_assignment.key.case_id},
+                            paths=owned[1][0],
+                            transport_config=self._transport_config(executable),
+                        )
+                with mock.patch.object(
+                    os,
+                    "close",
+                    side_effect=AssertionError("poisoned close retried"),
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as repeated:
+                        factory.close()
+                self.assertIs(failure, repeated.exception)
+            finally:
+                for descriptor in (target_descriptor, other_descriptor):
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+                real_close(bootstrap.descriptor)
+                bootstrap.descriptor = -1
+
+    def test_bootstrap_close_finalization_attempts_every_owned_descriptor(self):
+        roles = ("cleanup", "coordinator", "source", "bootstrap")
+        for exception_type in (RuntimeError, KeyboardInterrupt):
+            for target_role in roles:
+                with self.subTest(
+                    exception=exception_type.__name__, target=target_role
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve(strict=True)
+                    assignment = self._assignment("forward", 1, "case")
+                    plan = self._plan(assignment)
+                    source_home = root / "source-home"
+                    source_home.mkdir(mode=0o700)
+                    auth = source_home / "auth.json"
+                    auth.write_text("BOOTSTRAP_SECRET", encoding="utf-8")
+                    auth.chmod(0o600)
+                    coordinator = root / "run/coordinator"
+                    coordinator.mkdir(parents=True, mode=0o700)
+                    baseline = self._fd_count()
+                    captured = {}
+                    close_events = []
+                    injected = False
+                    primary = RuntimeError("copy setup failed")
+                    failure = exception_type(f"{target_role} close failed")
+                    real_close = os.close
+                    real_open_directory = sharding._open_private_directory
+                    real_validate = sharding._validate_private_auth
+                    real_copy = sharding._copy_auth_descriptor_at
+                    replacement = None
+                    role_paths = {
+                        "cleanup": coordinator / "cleanup",
+                        "coordinator": coordinator,
+                        "source": auth,
+                        "bootstrap": coordinator / "auth-bootstrap",
+                    }
+
+                    def track_validate(path, label):
+                        descriptor = real_validate(path, label)
+                        captured["source"] = descriptor
+                        return descriptor
+
+                    def track_directory(path, label):
+                        descriptor, metadata = real_open_directory(path, label)
+                        role = {
+                            "coordinator root": "coordinator",
+                            "coordinator cleanup directory": "cleanup",
+                            "auth bootstrap": "bootstrap",
+                        }.get(label)
+                        if role is not None and role not in captured:
+                            captured[role] = descriptor
+                        return descriptor, metadata
+
+                    def close_with_one_failure(descriptor):
+                        nonlocal injected, replacement
+                        role = next(
+                            (
+                                name for name in roles
+                                if captured.get(name) == descriptor
+                            ),
+                            None,
+                        )
+                        if role is not None:
+                            close_events.append(role)
+                        if role == target_role and not injected:
+                            injected = True
+                            before = os.fstat(descriptor)
+                            real_close(descriptor)
+                            flags = os.O_RDONLY
+                            if target_role != "source":
+                                flags |= getattr(os, "O_DIRECTORY", 0)
+                            opened = os.open(role_paths[target_role], flags)
+                            if opened != descriptor:
+                                os.dup2(opened, descriptor)
+                                real_close(opened)
+                            replacement = descriptor
+                            after = os.fstat(replacement)
+                            self.assertEqual(
+                                (before.st_dev, before.st_ino),
+                                (after.st_dev, after.st_ino),
+                            )
+                            raise failure
+                        return real_close(descriptor)
+
+                    def copy_or_fail(*args, **kwargs):
+                        if target_role == "bootstrap":
+                            raise primary
+                        return real_copy(*args, **kwargs)
+
+                    observed = None
+                    with mock.patch.object(
+                        sharding,
+                        "_validate_private_auth",
+                        side_effect=track_validate,
+                    ), mock.patch.object(
+                        sharding,
+                        "_open_private_directory",
+                        side_effect=track_directory,
+                    ), mock.patch.object(
+                        sharding,
+                        "_copy_auth_descriptor_at",
+                        side_effect=copy_or_fail,
+                    ), mock.patch.object(
+                        os, "close", side_effect=close_with_one_failure
+                    ):
+                        try:
+                            sharding.prepare_auth_bootstrap(
+                                source_codex_home=source_home,
+                                coordinator_root=coordinator,
+                                plan=plan,
+                            )
+                        except BaseException as caught:
+                            observed = caught
+                        else:
+                            self.fail("close failure did not escape bootstrap setup")
+
+                    self.assertIsNotNone(observed)
+                    leaves = self._exception_leaves(observed)
+                    expected = (
+                        (primary, failure)
+                        if target_role == "bootstrap"
+                        else (failure,)
+                    )
+                    self.assertEqual(expected, leaves)
+                    self.assertEqual(
+                        roles,
+                        tuple(dict.fromkeys(close_events)),
+                        close_events,
+                    )
+                    self.assertTrue(injected)
+                    self.assertEqual(baseline + 1, self._fd_count())
+                    os.fstat(replacement)
+                    real_close(replacement)
+                    self.assertEqual(baseline, self._fd_count())
+                    self.assertNotIn("BOOTSTRAP_SECRET", str(observed))
+
+    def test_case_close_finalization_attempts_every_owned_descriptor(self):
+        roles = ("cleanup", "case-root", "source", "bootstrap", "case")
+        for exception_type in (RuntimeError, KeyboardInterrupt):
+            for target_role in roles:
+                with self.subTest(
+                    exception=exception_type.__name__, target=target_role
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve(strict=True)
+                    assignment = self._assignment("forward", 1, "case")
+                    plan = self._plan(assignment)
+                    bootstrap = self._prepare_bootstrap(root, plan)
+                    paths = sharding.paths_for_case(root / "run", assignment)
+                    paths.root.mkdir(parents=True, mode=0o700)
+                    paths.cleanup.mkdir(mode=0o700)
+                    baseline = self._fd_count()
+                    captured = {}
+                    close_events = []
+                    injected = False
+                    primary = RuntimeError("case copy setup failed")
+                    failure = exception_type(f"{target_role} close failed")
+                    real_close = os.close
+                    real_open = os.open
+                    real_open_directory = sharding._open_private_directory
+                    real_copy = sharding._copy_auth_descriptor_at
+                    replacement = None
+                    role_paths = {
+                        "cleanup": paths.cleanup,
+                        "case-root": paths.root,
+                        "source": bootstrap.path / "auth.json",
+                        "bootstrap": bootstrap.path,
+                        "case": paths.codex_home,
+                    }
+
+                    def track_directory(path, label):
+                        descriptor, metadata = real_open_directory(path, label)
+                        role = {
+                            "auth bootstrap": "bootstrap",
+                            "case root": "case-root",
+                            "case cleanup directory": "cleanup",
+                            "case Codex home": "case",
+                        }.get(label)
+                        if role is not None and role not in captured:
+                            captured[role] = descriptor
+                        return descriptor, metadata
+
+                    def track_open(path, flags, mode=0o777, *, dir_fd=None):
+                        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                        if path == "auth.json" and dir_fd == captured.get("bootstrap"):
+                            captured["source"] = descriptor
+                        return descriptor
+
+                    def close_with_one_failure(descriptor):
+                        nonlocal injected, replacement
+                        role = next(
+                            (
+                                name for name in roles
+                                if captured.get(name) == descriptor
+                            ),
+                            None,
+                        )
+                        if role is not None:
+                            close_events.append(role)
+                        if role == target_role and not injected:
+                            injected = True
+                            before = os.fstat(descriptor)
+                            real_close(descriptor)
+                            flags = os.O_RDONLY
+                            if target_role != "source":
+                                flags |= getattr(os, "O_DIRECTORY", 0)
+                            opened = real_open(role_paths[target_role], flags)
+                            if opened != descriptor:
+                                os.dup2(opened, descriptor)
+                                real_close(opened)
+                            replacement = descriptor
+                            after = os.fstat(replacement)
+                            self.assertEqual(
+                                (before.st_dev, before.st_ino),
+                                (after.st_dev, after.st_ino),
+                            )
+                            raise failure
+                        return real_close(descriptor)
+
+                    def copy_or_fail(*args, **kwargs):
+                        if target_role == "case":
+                            raise primary
+                        return real_copy(*args, **kwargs)
+
+                    observed = None
+                    with mock.patch.object(
+                        sharding,
+                        "_open_private_directory",
+                        side_effect=track_directory,
+                    ), mock.patch.object(
+                        os, "open", side_effect=track_open
+                    ), mock.patch.object(
+                        sharding,
+                        "_copy_auth_descriptor_at",
+                        side_effect=copy_or_fail,
+                    ), mock.patch.object(
+                        os, "close", side_effect=close_with_one_failure
+                    ):
+                        try:
+                            sharding.install_case_auth(
+                                bootstrap=bootstrap.path,
+                                plan=plan,
+                                assignment=assignment,
+                                paths=paths,
+                            )
+                        except BaseException as caught:
+                            observed = caught
+                        else:
+                            self.fail("close failure did not escape case auth setup")
+
+                    self.assertIsNotNone(observed)
+                    leaves = self._exception_leaves(observed)
+                    expected = (
+                        (primary, failure)
+                        if target_role == "case"
+                        else (failure,)
+                    )
+                    self.assertEqual(expected, leaves)
+                    self.assertEqual(
+                        roles,
+                        tuple(dict.fromkeys(close_events)),
+                        close_events,
+                    )
+                    self.assertTrue(injected)
+                    self.assertEqual(baseline + 1, self._fd_count())
+                    os.fstat(replacement)
+                    real_close(replacement)
+                    self.assertEqual(baseline, self._fd_count())
+                    self.assertNotIn("BOOTSTRAP_SECRET", str(observed))
+                    real_close(bootstrap.descriptor)
+                    bootstrap.descriptor = -1
+
+    def test_auth_close_finalization_groups_all_errors_in_descriptor_order(self):
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with self.subTest(owner="bootstrap"), \
+                tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            source_home = root / "source-home"
+            source_home.mkdir(mode=0o700)
+            auth = source_home / "auth.json"
+            auth.write_text("{}\n", encoding="utf-8")
+            auth.chmod(0o600)
+            coordinator = root / "run/coordinator"
+            coordinator.mkdir(parents=True, mode=0o700)
+            roles = ("cleanup", "coordinator", "source", "bootstrap")
+            failures = {
+                role: (
+                    KeyboardInterrupt(f"{role} close failed")
+                    if role == "bootstrap"
+                    else RuntimeError(f"{role} close failed")
+                )
+                for role in roles
+            }
+            primary = RuntimeError("bootstrap primary")
+            captured = {}
+            injected = set()
+            real_close = os.close
+            real_open_directory = sharding._open_private_directory
+            real_validate = sharding._validate_private_auth
+
+            def track_validate(path, label):
+                descriptor = real_validate(path, label)
+                captured["source"] = descriptor
+                return descriptor
+
+            def track_directory(path, label):
+                descriptor, metadata = real_open_directory(path, label)
+                role = {
+                    "coordinator root": "coordinator",
+                    "coordinator cleanup directory": "cleanup",
+                    "auth bootstrap": "bootstrap",
+                }.get(label)
+                if role is not None and role not in captured:
+                    captured[role] = descriptor
+                return descriptor, metadata
+
+            def close_with_failures(descriptor):
+                role = next(
+                    (name for name in roles if captured.get(name) == descriptor),
+                    None,
+                )
+                if role is not None and role not in injected:
+                    injected.add(role)
+                    real_close(descriptor)
+                    raise failures[role]
+                return real_close(descriptor)
+
+            baseline = self._fd_count()
+            observed = None
+            with mock.patch.object(
+                sharding, "_validate_private_auth", side_effect=track_validate
+            ), mock.patch.object(
+                sharding, "_open_private_directory", side_effect=track_directory
+            ), mock.patch.object(
+                sharding, "_copy_auth_descriptor_at", side_effect=primary
+            ), mock.patch.object(os, "close", side_effect=close_with_failures):
+                try:
+                    sharding.prepare_auth_bootstrap(
+                        source_codex_home=source_home,
+                        coordinator_root=coordinator,
+                        plan=plan,
+                    )
+                except BaseException as caught:
+                    observed = caught
+                else:
+                    self.fail("bootstrap primary and close failures did not escape")
+
+            self.assertIsInstance(observed, BaseExceptionGroup)
+            self.assertEqual(
+                (primary, *(failures[role] for role in roles)),
+                self._exception_leaves(observed),
+            )
+            self.assertEqual(set(roles), injected)
+            self.assertEqual(baseline, self._fd_count())
+
+        with self.subTest(owner="case"), \
+                tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            paths = sharding.paths_for_case(root / "run", assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            roles = ("cleanup", "case-root", "source", "bootstrap", "case")
+            failures = {
+                role: (
+                    KeyboardInterrupt(f"{role} close failed")
+                    if role == "case"
+                    else RuntimeError(f"{role} close failed")
+                )
+                for role in roles
+            }
+            primary = RuntimeError("case primary")
+            captured = {}
+            injected = set()
+            real_close = os.close
+            real_open = os.open
+            real_open_directory = sharding._open_private_directory
+
+            def track_directory(path, label):
+                descriptor, metadata = real_open_directory(path, label)
+                role = {
+                    "auth bootstrap": "bootstrap",
+                    "case root": "case-root",
+                    "case cleanup directory": "cleanup",
+                    "case Codex home": "case",
+                }.get(label)
+                if role is not None and role not in captured:
+                    captured[role] = descriptor
+                return descriptor, metadata
+
+            def track_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == "auth.json" and dir_fd == captured.get("bootstrap"):
+                    captured["source"] = descriptor
+                return descriptor
+
+            def close_with_failures(descriptor):
+                role = next(
+                    (name for name in roles if captured.get(name) == descriptor),
+                    None,
+                )
+                if role is not None and role not in injected:
+                    injected.add(role)
+                    real_close(descriptor)
+                    raise failures[role]
+                return real_close(descriptor)
+
+            baseline = self._fd_count()
+            observed = None
+            with mock.patch.object(
+                sharding, "_open_private_directory", side_effect=track_directory
+            ), mock.patch.object(
+                os, "open", side_effect=track_open
+            ), mock.patch.object(
+                sharding, "_copy_auth_descriptor_at", side_effect=primary
+            ), mock.patch.object(os, "close", side_effect=close_with_failures):
+                try:
+                    sharding.install_case_auth(
+                        bootstrap=bootstrap.path,
+                        plan=plan,
+                        assignment=assignment,
+                        paths=paths,
+                    )
+                except BaseException as caught:
+                    observed = caught
+                else:
+                    self.fail("case primary and close failures did not escape")
+
+            self.assertIsInstance(observed, BaseExceptionGroup)
+            self.assertEqual(
+                (primary, *(failures[role] for role in roles)),
+                self._exception_leaves(observed),
+            )
+            self.assertEqual(set(roles), injected)
+            self.assertEqual(baseline, self._fd_count())
+            real_close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_successful_auth_install_returns_live_owner_descriptors(self):
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            before_bootstrap = self._fd_count()
+            bootstrap = self._prepare_bootstrap(root, plan)
+            self.assertEqual(before_bootstrap + 1, self._fd_count())
+            os.fstat(bootstrap.descriptor)
+            self.assertEqual("owned", bootstrap.descriptor_close_state)
+            self.assertIsNone(bootstrap.descriptor_close_error)
+
+            paths = sharding.paths_for_case(root / "run", assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            before_case = self._fd_count()
+            installed = sharding.install_case_auth(
+                bootstrap=bootstrap.path,
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+            self.assertEqual(before_case + 1, self._fd_count())
+            os.fstat(installed.descriptor)
+            self.assertEqual("owned", installed.descriptor_close_state)
+            self.assertIsNone(installed.descriptor_close_error)
+
+            os.close(installed.descriptor)
+            installed.descriptor = -1
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+            self.assertEqual(before_bootstrap, self._fd_count())
+
+    def test_worker_scrub_retains_tombstone_and_idempotent_receipt(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap = self._prepare_bootstrap(root, plan)
+            self.addCleanup(
+                lambda: os.close(bootstrap.descriptor)
+                if bootstrap.descriptor >= 0
+                else None
+            )
+            paths = sharding.paths_for_case(root / "run", assignment)
+            paths.root.mkdir(parents=True, mode=0o700)
+            paths.cleanup.mkdir(mode=0o700)
+            real_copy = sharding._copy_auth_descriptor_at
+
+            def copy_after_case_ownership(source_descriptor, directory_descriptor, name):
+                ownership = worker.read_case_auth_ownership(
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+                self.assertEqual(assignment.key, ownership.case)
+                self.assertFalse((paths.codex_home / "auth.json").exists())
+                return real_copy(source_descriptor, directory_descriptor, name)
+
+            with mock.patch.object(
+                sharding,
+                "_copy_auth_descriptor_at",
+                side_effect=copy_after_case_ownership,
+            ):
+                installed = sharding.install_case_auth(
+                    bootstrap=bootstrap.path,
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+
+            ownership_bytes = (paths.cleanup / "ownership.json").read_bytes()
+            self.assertNotIn(b"SECRET", ownership_bytes)
+            before_names = {path.name for path in paths.root.iterdir()}
+            first = worker.cleanup_case_auth(installed=installed, paths=paths)
+            first_bytes = (paths.cleanup / "tombstone.json").read_bytes()
+            second = worker.cleanup_case_auth(installed=installed, paths=paths)
+
+            self.assertEqual(first, second)
+            self.assertEqual(first_bytes, (paths.cleanup / "tombstone.json").read_bytes())
+            self.assertEqual("expected", first.canonical_binding)
+            self.assertEqual("tombstoned", installed.state)
+            self.assertEqual(-1, installed.descriptor)
+            self.assertTrue(paths.codex_home.is_dir())
+            self.assertEqual([], list(paths.codex_home.iterdir()))
+            self.assertEqual(0o700, stat.S_IMODE(paths.codex_home.stat().st_mode))
+            self.assertEqual(before_names, {path.name for path in paths.root.iterdir()})
+            self.assertFalse(any(
+                path.name.startswith(".codex-home-cleanup-")
+                for path in paths.root.iterdir()
+            ))
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE((paths.cleanup / "ownership.json").stat().st_mode),
+            )
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE((paths.cleanup / "tombstone.json").stat().st_mode),
+            )
+
+    def test_worker_scrubs_moved_owned_inode_and_preserves_replacement(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap, paths, installed = self._install_case(
+                root, plan, assignment
+            )
+            displaced = root / "displaced-owned-codex-home"
+            paths.codex_home.rename(displaced)
+            paths.codex_home.mkdir(mode=0o700)
+            keep = paths.codex_home / "unrelated.txt"
+            keep.write_text("unrelated", encoding="utf-8")
+            keep.chmod(0o600)
+
+            receipt = worker.cleanup_case_auth(installed=installed, paths=paths)
+
+            self.assertEqual("replaced", receipt.canonical_binding)
+            self.assertEqual("unrelated", keep.read_text(encoding="utf-8"))
+            self.assertTrue(displaced.is_dir())
+            self.assertEqual([], list(displaced.iterdir()))
+            self.assertEqual("tombstoned", installed.state)
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_worker_scrub_failures_retain_descriptor_and_retry(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        for failure in ("child", "depth", "entry"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(strict=True)
+                assignment = self._assignment("forward", 1, f"case-{failure}")
+                plan = self._plan(assignment)
+                bootstrap, paths, installed = self._install_case(
+                    root, plan, assignment
+                )
+                nested = paths.codex_home / "nested"
+                nested.mkdir(mode=0o700)
+                (nested / "child").mkdir(mode=0o700)
+                for name in ("one", "two"):
+                    child = paths.codex_home / name
+                    child.write_text(name, encoding="utf-8")
+                    child.chmod(0o600)
+
+                if failure == "child":
+                    patcher = mock.patch.object(
+                        worker,
+                        "_remove_tree_entry",
+                        side_effect=OSError("child scrub failed"),
+                    )
+                elif failure == "depth":
+                    patcher = mock.patch.object(worker, "AUTH_CLEANUP_MAX_DEPTH", 0)
+                else:
+                    patcher = mock.patch.object(worker, "AUTH_CLEANUP_MAX_ENTRIES", 1)
+
+                with patcher:
+                    with self.assertRaisesRegex(OSError, "scrub|cleanup"):
+                        worker.cleanup_case_auth(installed=installed, paths=paths)
+                self.assertEqual("active", installed.state)
+                self.assertEqual("owned", installed.descriptor_close_state)
+                self.assertIsNone(installed.descriptor_close_error)
+                os.fstat(installed.descriptor)
+
+                receipt = worker.cleanup_case_auth(installed=installed, paths=paths)
+                self.assertTrue(receipt.scrubbed)
+                self.assertEqual([], list(paths.codex_home.iterdir()))
+                os.close(bootstrap.descriptor)
+                bootstrap.descriptor = -1
+
+    def test_tombstone_reader_rejects_stale_unsafe_or_hash_mismatched_records(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        assignment = self._assignment("forward", 1, "case")
+        plan = self._plan(assignment)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            bootstrap, paths, installed = self._install_case(
+                root, plan, assignment
+            )
+            worker.cleanup_case_auth(installed=installed, paths=paths)
+            tombstone = paths.cleanup / "tombstone.json"
+            ownership = paths.cleanup / "ownership.json"
+            good_tombstone = tombstone.read_bytes()
+            good_ownership = ownership.read_bytes()
+            decoded = json.loads(good_tombstone.decode("ascii"))
+
+            mutations = {
+                "stale epoch": {**decoded, "epoch_id": "f" * 64},
+                "wrong run": {**decoded, "run_kind": "formal"},
+                "wrong case": {
+                    **decoded,
+                    "case": {**decoded["case"], "case_id": "other"},
+                },
+                "unknown field": {**decoded, "extra": True},
+                "missing field": {
+                    key: value for key, value in decoded.items() if key != "empty"
+                },
+            }
+            for label, payload in mutations.items():
+                with self.subTest(label=label):
+                    tombstone.write_bytes(sharding.canonical_config_bytes(payload))
+                    tombstone.chmod(0o600)
+                    with self.assertRaises(ValueError):
+                        worker.read_tombstone_receipt(
+                            plan=plan,
+                            assignment=assignment,
+                            paths=paths,
+                        )
+                    tombstone.write_bytes(good_tombstone)
+                    tombstone.chmod(0o600)
+
+            tombstone.write_bytes(good_tombstone[: max(1, len(good_tombstone) // 2)])
+            with self.assertRaises(ValueError):
+                worker.read_tombstone_receipt(
+                    plan=plan, assignment=assignment, paths=paths
+                )
+            tombstone.write_bytes(good_tombstone)
+            tombstone.chmod(0o644)
+            with self.assertRaises(ValueError):
+                worker.read_tombstone_receipt(
+                    plan=plan, assignment=assignment, paths=paths
+                )
+            tombstone.unlink()
+            external = root / "external-tombstone.json"
+            external.write_bytes(good_tombstone)
+            external.chmod(0o600)
+            tombstone.symlink_to(external)
+            with self.assertRaises(ValueError):
+                worker.read_tombstone_receipt(
+                    plan=plan, assignment=assignment, paths=paths
+                )
+            tombstone.unlink()
+            tombstone.write_bytes(good_tombstone)
+            tombstone.chmod(0o600)
+
+            ownership_payload = json.loads(good_ownership.decode("ascii"))
+            ownership_payload["codex_home_inode"] += 1
+            ownership.write_bytes(sharding.canonical_config_bytes(ownership_payload))
+            ownership.chmod(0o600)
+            with self.assertRaises(ValueError):
+                worker.read_tombstone_receipt(
+                    plan=plan, assignment=assignment, paths=paths
+                )
+            os.close(bootstrap.descriptor)
+            bootstrap.descriptor = -1
+
+    def test_case_runtime_writable_roots_are_immutable_tuple(self):
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            runtime = task9_eval.CaseRuntime(
+                store_root=root / "store",
+                audit=mock.sentinel.audit,
+                environment={},
+                writable_roots=(root / "store",),
+                transport_config=self._transport_config(executable),
+            )
+            self.assertEqual(
+                tuple[Path, ...],
+                get_type_hints(task9_eval.CaseRuntime)["writable_roots"],
+            )
+            self.assertIsInstance(runtime.writable_roots, tuple)
+            with self.assertRaises(AttributeError):
+                runtime.writable_roots.append(root / "forged")
+
+
+class SealTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+        self.assignment = self.plan.assignments[0]
+        self.manifest_case = self.manifests["forward"][0]
+        self.run_root = self.root / "run"
+        self.run_root.mkdir(mode=0o700)
+        (self.run_root / "cases").mkdir(mode=0o700)
+        self.paths = sharding.paths_for_case(self.run_root, self.assignment)
+        self.paths.root.mkdir(mode=0o700)
+        self.paths.cleanup.mkdir(mode=0o700)
+        self.paths.codex_home.mkdir(mode=0o700)
+        self.usage = {
+            "input_tokens": 10,
+            "cached_input_tokens": 2,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 1,
+            "total_tokens": 15,
+        }
+        self.result = {
+            "id": self.assignment.key.case_id,
+            "decisions": [
+                {
+                    "after_turn": 1,
+                    "triggered": True,
+                    "task_type": "feature",
+                    "workflow_variant": "implementation-basic",
+                }
+            ],
+            "record_checkpoints": [
+                {
+                    "after_turn": 1,
+                    "records": [
+                        {
+                            "role": "run-1",
+                            "status": "success",
+                            "start_mode": "planned",
+                            "superseded_by_role": None,
+                        }
+                    ],
+                }
+            ],
+            "run_count": 1,
+            "draft_count": 0,
+            "final_statuses": ["success"],
+        }
+        self.evidence = {
+            "status": "success",
+            "classification": "success",
+            "model_started": True,
+            "elapsed_milliseconds": 25,
+            "usage": self.usage,
+            "failure": None,
+            "store_record_count": 1,
+            "store_invalidated_count": 0,
+            "audit_event_count": 3,
+            "payload_file_count": 0,
+            "output_file_count": 0,
+            "process_cleanup_passed": True,
+            "credential_cleanup_passed": True,
+        }
+        self._write_expected_tombstone()
+        self._write_attempt_one_success()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _write_expected_tombstone(self):
+        root_stat = self.paths.root.stat()
+        home_stat = self.paths.codex_home.stat()
+        ownership = sharding.CaseAuthOwnership(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            case=self.assignment.key,
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+        )
+        ownership_bytes = sharding._atomic_write_record(
+            self.paths.cleanup / "ownership.json", asdict(ownership)
+        )
+        receipt = sharding.TombstoneReceipt(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            case=self.assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="worker",
+        )
+        receipt_bytes = sharding._atomic_write_record(
+            self.paths.cleanup / "tombstone.json", asdict(receipt)
+        )
+        self.tombstone_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+
+    def _write_attempt_one_success(self):
+        attempt = sharding.paths_for_attempt(self.paths, 1)
+        self.paths.attempts.mkdir(mode=0o700)
+        attempt.root.mkdir(mode=0o700)
+        manifest_case_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(self.manifest_case)
+        ).hexdigest()
+        start = {
+            "schema_version": 1,
+            "epoch_id": self.plan.epoch_id,
+            "run_kind": self.plan.run_kind,
+            "case": asdict(self.assignment.key),
+            "lane": self.assignment.lane,
+            "route": self.assignment.route,
+            "attempt": 1,
+            "manifest_sha256": self.assignment.manifest_sha256,
+            "manifest_case_sha256": manifest_case_sha256,
+        }
+        start_bytes = sharding._atomic_write_record(attempt.start, start)
+        terminal = {
+            **start,
+            "start_sha256": hashlib.sha256(start_bytes).hexdigest(),
+            "status": "success",
+            "classification": "success",
+            "model_started": True,
+            "cleanup_passed": True,
+            "usage": self.usage,
+            "failure": None,
+            "tombstone_receipt_sha256": self.tombstone_sha256,
+        }
+        sharding._atomic_write_record(attempt.terminal, terminal)
+
+    def test_verified_tombstone_retains_one_cleanup_descriptor(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        self.assertIs(
+            worker.read_tombstone_receipt,
+            sharding.read_tombstone_receipt,
+        )
+        self.assertIs(
+            worker._receipt_from_payload,
+            sharding._tombstone_receipt_from_payload,
+        )
+        real_open_private_directory = sharding._open_private_directory
+        cleanup_opens = []
+
+        def track_cleanup_open(path, label):
+            if Path(path) == self.paths.cleanup:
+                cleanup_opens.append(label)
+            return real_open_private_directory(path, label)
+
+        with mock.patch.object(
+            sharding,
+            "_open_private_directory",
+            side_effect=track_cleanup_open,
+        ):
+            verified = sharding.read_verified_tombstone_receipt(
+                plan=self.plan,
+                assignment=self.assignment,
+                paths=self.paths,
+            )
+
+        self.assertEqual(self.tombstone_sha256, verified.sha256)
+        self.assertEqual(
+            ["case auth cleanup directory"],
+            cleanup_opens,
+        )
+
+    def _new_seal_scenario(self, name, *, canonical_binding=None):
+        run_root = self.root / name / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        paths = sharding.paths_for_case(run_root, self.assignment)
+        paths.root.mkdir(mode=0o700)
+        paths.cleanup.mkdir(mode=0o700)
+        paths.codex_home.mkdir(mode=0o700)
+        tombstone_sha256 = None
+        if canonical_binding is not None:
+            root_stat = paths.root.stat()
+            home_stat = paths.codex_home.stat()
+            ownership = sharding.CaseAuthOwnership(
+                schema_version=1,
+                epoch_id=self.plan.epoch_id,
+                run_kind=self.plan.run_kind,
+                case=self.assignment.key,
+                case_root_device=root_stat.st_dev,
+                case_root_inode=root_stat.st_ino,
+                codex_home_device=home_stat.st_dev,
+                codex_home_inode=home_stat.st_ino,
+            )
+            ownership_bytes = sharding._atomic_write_record(
+                paths.cleanup / "ownership.json", asdict(ownership)
+            )
+            receipt = sharding.TombstoneReceipt(
+                schema_version=1,
+                epoch_id=self.plan.epoch_id,
+                run_kind=self.plan.run_kind,
+                case=self.assignment.key,
+                ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+                case_root_device=root_stat.st_dev,
+                case_root_inode=root_stat.st_ino,
+                codex_home_device=home_stat.st_dev,
+                codex_home_inode=home_stat.st_ino,
+                scrubbed=True,
+                empty=True,
+                canonical_binding=canonical_binding,
+                producer="worker",
+            )
+            receipt_bytes = sharding._atomic_write_record(
+                paths.cleanup / "tombstone.json", asdict(receipt)
+            )
+            tombstone_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+        return paths, tombstone_sha256
+
+    def _write_scenario_attempt(
+        self,
+        paths,
+        *,
+        status,
+        classification,
+        cleanup_passed,
+        failure,
+    ):
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+            status=status,
+            classification=classification,
+            model_started=True,
+            cleanup_passed=cleanup_passed,
+            usage=self.usage,
+            failure=failure,
+        )
+
+    def _manifest_for_assignment(self, assignment):
+        return self.manifests[assignment.key.mode][assignment.key.ordinal - 1]
+
+    def _result_for_assignment(self, assignment):
+        if assignment.key.mode == "forward":
+            return {**self.result, "id": assignment.key.case_id}
+        return {
+            "id": assignment.key.case_id,
+            "record_checkpoints": [],
+            "run_count": 0,
+            "draft_count": 0,
+            "final_statuses": [],
+            "failure_disclosed": False,
+            "selected_command": None,
+        }
+
+    def _prepare_lane_terminal(
+        self,
+        run_root,
+        assignment,
+        *,
+        status="success",
+        cleanup_passed=True,
+        canonical_binding="expected",
+        seal_case_record=True,
+    ):
+        paths = sharding.paths_for_case(run_root, assignment)
+        paths.root.mkdir(mode=0o700)
+        paths.cleanup.mkdir(mode=0o700)
+        paths.codex_home.mkdir(mode=0o700)
+        if canonical_binding is not None:
+            root_stat = paths.root.stat()
+            home_stat = paths.codex_home.stat()
+            ownership = sharding.CaseAuthOwnership(
+                schema_version=1,
+                epoch_id=self.plan.epoch_id,
+                run_kind=self.plan.run_kind,
+                case=assignment.key,
+                case_root_device=root_stat.st_dev,
+                case_root_inode=root_stat.st_ino,
+                codex_home_device=home_stat.st_dev,
+                codex_home_inode=home_stat.st_ino,
+            )
+            ownership_bytes = sharding._atomic_write_record(
+                paths.cleanup / "ownership.json", asdict(ownership)
+            )
+            receipt = sharding.TombstoneReceipt(
+                schema_version=1,
+                epoch_id=self.plan.epoch_id,
+                run_kind=self.plan.run_kind,
+                case=assignment.key,
+                ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+                case_root_device=root_stat.st_dev,
+                case_root_inode=root_stat.st_ino,
+                codex_home_device=home_stat.st_dev,
+                codex_home_inode=home_stat.st_ino,
+                scrubbed=True,
+                empty=True,
+                canonical_binding=canonical_binding,
+                producer="worker",
+            )
+            sharding._atomic_write_record(
+                paths.cleanup / "tombstone.json", asdict(receipt)
+            )
+        manifest_case = self._manifest_for_assignment(assignment)
+        failure = None
+        classification = "success"
+        if status == "failed":
+            failure_text = f"failed {assignment.key.case_id}"
+            classification = "semantic"
+            failure = {
+                "classification": classification,
+                "type": "SemanticFailure",
+                "chars": len(failure_text),
+                "sha256": hashlib.sha256(failure_text.encode()).hexdigest(),
+            }
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=1,
+            manifest_case=manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=1,
+            manifest_case=manifest_case,
+            status=status,
+            classification=classification,
+            model_started=True,
+            cleanup_passed=cleanup_passed,
+            usage=self.usage,
+            failure=failure,
+        )
+        attempt_seal = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=1,
+            manifest_case=manifest_case,
+        )
+        case_seal = None
+        if seal_case_record:
+            evidence = {
+                **self.evidence,
+                "status": status,
+                "classification": classification,
+                "failure": failure,
+                "process_cleanup_passed": cleanup_passed,
+                "credential_cleanup_passed": cleanup_passed,
+            }
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                result=self._result_for_assignment(assignment),
+                evidence=evidence,
+                manifest_case=manifest_case,
+            )
+            case_seal = sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+        return paths, sharding.ShardTerminal(
+            key=assignment.key,
+            run_kind=self.plan.run_kind,
+            status=status,
+            classification=classification,
+            attempt_terminal_sha256=attempt_seal.terminal_sha256,
+            case_commit_sha256=(case_seal.commit_sha256 if case_seal else None),
+            tombstone_receipt_sha256=(
+                case_seal.tombstone_receipt_sha256 if case_seal else None
+            ),
+            failure=(sharding.FailureSummary(**failure) if failure else None),
+        )
+
+    def test_fault_after_evidence_never_exposes_case_commit(self):
+        arguments = {
+            "plan": self.plan,
+            "paths": self.paths,
+            "assignment": self.assignment,
+            "attempt": 1,
+            "result": self.result,
+            "evidence": self.evidence,
+            "manifest_case": self.manifest_case,
+        }
+        with self.assertRaises(TypeError):
+            sharding.seal_case(**arguments, crash_at="after-evidence-replace")
+
+        observed = []
+
+        def inject(point):
+            observed.append(point)
+            if point == "after-evidence-replace":
+                raise RuntimeError("AFTER_EVIDENCE")
+
+        with self.assertRaisesRegex(RuntimeError, "AFTER_EVIDENCE"):
+            sharding.seal_case(**arguments, fault_injector=inject)
+
+        self.assertEqual(
+            ["after-result-replace", "after-evidence-replace"], observed
+        )
+        self.assertTrue((self.paths.sealed / "case-result.json").is_file())
+        self.assertTrue((self.paths.sealed / "case-evidence.json").is_file())
+        self.assertFalse((self.paths.sealed / "case-commit.json").exists())
+        with self.assertRaises(ValueError):
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            )
+
+    def test_attempt_records_have_exact_canonical_schema_and_caps(self):
+        shutil.rmtree(self.paths.attempts)
+        expected_start_fields = {
+            "schema_version",
+            "epoch_id",
+            "run_kind",
+            "case",
+            "lane",
+            "route",
+            "attempt",
+            "manifest_sha256",
+            "manifest_case_sha256",
+        }
+        expected_terminal_fields = expected_start_fields | {
+            "start_sha256",
+            "status",
+            "classification",
+            "model_started",
+            "cleanup_passed",
+            "usage",
+            "failure",
+            "tombstone_receipt_sha256",
+        }
+        self.assertEqual(4 * 1024, sharding.MAX_ATTEMPT_START_BYTES)
+        self.assertEqual(8 * 1024, sharding.MAX_ATTEMPT_TERMINAL_BYTES)
+
+        start_path = sharding.write_attempt_start(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        start_bytes = start_path.read_bytes()
+        self.assertEqual(0o600, stat.S_IMODE(start_path.stat().st_mode))
+        self.assertFalse(start_bytes.endswith(b"\n"))
+        self.assertEqual(start_bytes.decode("ascii").encode("ascii"), start_bytes)
+        self.assertEqual(expected_start_fields, set(json.loads(start_bytes)))
+        self.assertEqual(
+            start_path,
+            sharding.write_attempt_start(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                attempt=1,
+                manifest_case=self.manifest_case,
+            ),
+        )
+
+        terminal_path = sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+            status="success",
+            classification="success",
+            model_started=True,
+            cleanup_passed=True,
+            usage=self.usage,
+            failure=None,
+        )
+        terminal_bytes = terminal_path.read_bytes()
+        self.assertEqual(0o600, stat.S_IMODE(terminal_path.stat().st_mode))
+        self.assertFalse(terminal_bytes.endswith(b"\n"))
+        self.assertEqual(expected_terminal_fields, set(json.loads(terminal_bytes)))
+        seal = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        self.assertEqual(
+            hashlib.sha256(start_bytes).hexdigest(), seal.start_sha256
+        )
+        self.assertEqual(
+            hashlib.sha256(terminal_bytes).hexdigest(), seal.terminal_sha256
+        )
+        self.assertEqual(
+            terminal_path,
+            sharding.write_attempt_terminal(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                attempt=1,
+                manifest_case=self.manifest_case,
+                status="success",
+                classification="success",
+                model_started=True,
+                cleanup_passed=True,
+                usage=self.usage,
+                failure=None,
+            ),
+        )
+
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=2,
+            manifest_case=self.manifest_case,
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_attempt_terminal(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                attempt=2,
+                manifest_case=self.manifest_case,
+                status="success",
+                classification="success",
+                model_started=True,
+                cleanup_passed=True,
+                usage=None,
+                failure=None,
+            )
+        failure_text = "transport unavailable"
+        failure = {
+            "classification": "pre-model-infrastructure",
+            "type": "TransportUnavailable",
+            "chars": len(failure_text),
+            "sha256": hashlib.sha256(failure_text.encode()).hexdigest(),
+        }
+        (self.paths.cleanup / "tombstone.json").unlink()
+        failed_terminal = sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=2,
+            manifest_case=self.manifest_case,
+            status="failed",
+            classification="pre-model-infrastructure",
+            model_started=False,
+            cleanup_passed=False,
+            usage=None,
+            failure=failure,
+        )
+        self.assertIsNone(json.loads(failed_terminal.read_bytes())["usage"])
+        self.assertIsNone(
+            json.loads(failed_terminal.read_bytes())["tombstone_receipt_sha256"]
+        )
+
+        start_path.write_bytes(b"{" + b'"x":"' + b"x" * 4096 + b'"}')
+        start_path.chmod(0o600)
+        with self.assertRaises(ValueError):
+            sharding.read_attempt_start(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                attempt=1,
+                manifest_case=self.manifest_case,
+            )
+
+    def test_seal_schema_constants_match_frozen_result_contract(self):
+        from tests import run_observing_workflows_eval as frozen
+
+        self.assertEqual(
+            frozen.DECISION_MANIFEST_FIELDS,
+            set(sharding.DECISION_MANIFEST_FIELDS),
+        )
+        self.assertEqual(
+            frozen.LIFECYCLE_MANIFEST_FIELDS,
+            set(sharding.LIFECYCLE_MANIFEST_FIELDS),
+        )
+        self.assertEqual(
+            frozen.RESULT_SCHEMAS["forward"],
+            set(sharding.RESULT_SCHEMAS["forward"]),
+        )
+        self.assertEqual(
+            frozen.RESULT_SCHEMAS["lifecycle"],
+            set(sharding.RESULT_SCHEMAS["lifecycle"]),
+        )
+        self.assertEqual(
+            frozen.OBSERVED_DECISION_FIELDS,
+            set(sharding.OBSERVED_DECISION_FIELDS),
+        )
+        self.assertEqual(
+            frozen.CHECKPOINT_FIELDS,
+            set(sharding.CHECKPOINT_FIELDS),
+        )
+        self.assertEqual(
+            frozen.NORMALIZED_RECORD_FIELDS,
+            set(sharding.NORMALIZED_RECORD_FIELDS),
+        )
+
+    def test_shard_terminal_schema_constant_and_wire_mapping_are_exact(self):
+        expected = {
+            "case",
+            "status",
+            "classification",
+            "attempt_terminal_sha256",
+            "case_commit_sha256",
+            "tombstone_receipt_sha256",
+            "failure",
+        }
+        self.assertEqual(expected, set(sharding.SHARD_TERMINAL_FIELDS))
+        terminal = sharding.ShardTerminal(
+            key=self.assignment.key,
+            run_kind=self.plan.run_kind,
+            status="success",
+            classification="success",
+            attempt_terminal_sha256="a" * 64,
+            case_commit_sha256="b" * 64,
+            tombstone_receipt_sha256="c" * 64,
+            failure=None,
+        )
+        encoded = sharding._encode_shard_terminal(terminal)
+        self.assertEqual(expected, set(encoded))
+        self.assertNotIn("key", encoded)
+        self.assertNotIn("run_kind", encoded)
+        self.assertEqual(
+            {
+                "mode": self.assignment.key.mode,
+                "ordinal": self.assignment.key.ordinal,
+                "case_id": self.assignment.key.case_id,
+            },
+            encoded["case"],
+        )
+        self.assertEqual(
+            terminal,
+            sharding._decode_shard_terminal(
+                encoded, run_kind=self.plan.run_kind
+            ),
+        )
+        for mutation in (
+            {**encoded, "key": encoded["case"]},
+            {key: value for key, value in encoded.items() if key != "case"},
+            {**encoded, "status": "failed"},
+        ):
+            with self.subTest(mutation=set(mutation)):
+                with self.assertRaises(ValueError):
+                    sharding._decode_shard_terminal(
+                        mutation, run_kind=self.plan.run_kind
+                    )
+
+    def test_seal_evidence_has_closed_privacy_schema(self):
+        attempt_seal = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        result_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(self.result)
+        ).hexdigest()
+        for mutation in (
+            {**self.evidence, "prompt": "secret prompt"},
+            {
+                **self.evidence,
+                "usage": {**self.usage, "raw_output": "secret output"},
+            },
+            {
+                **self.evidence,
+                "status": type("StringSubclass", (str,), {})("success"),
+            },
+        ):
+            with self.subTest(fields=set(mutation)):
+                with self.assertRaises((TypeError, ValueError)):
+                    sharding._validate_evidence_input(
+                        mutation,
+                        attempt_seal=attempt_seal,
+                        result_sha256=result_sha256,
+                    )
+        failure = {
+            "classification": "model",
+            "type": "ModelFailure",
+            "chars": 12,
+            "sha256": "f" * 64,
+            "message": "/private/secret",
+        }
+        with self.assertRaises(ValueError):
+            sharding._validate_failure(
+                failure, classification="model", nullable=False
+            )
+
+    def test_case_seal_binds_fingerprints_attempt_result_and_expected_tombstone(self):
+        invalid_manifest = json.loads(
+            sharding.canonical_config_bytes(self.manifest_case)
+        )
+        invalid_manifest["expected_decisions"][0]["after_turn"] = True
+        with self.assertRaises(ValueError):
+            sharding._validate_seal_context(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                manifest_case=invalid_manifest,
+            )
+
+        commit_path = sharding.seal_case(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            result=self.result,
+            evidence=self.evidence,
+            manifest_case=self.manifest_case,
+        )
+        self.assertEqual(self.paths.sealed / "case-commit.json", commit_path)
+        self.assertEqual(
+            ["case-commit.json", "case-evidence.json", "case-result.json"],
+            sorted(path.name for path in self.paths.sealed.iterdir()),
+        )
+        for path in self.paths.sealed.iterdir():
+            content = path.read_bytes()
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+            self.assertFalse(content.endswith(b"\n"))
+            self.assertEqual(content.decode("ascii").encode("ascii"), content)
+
+        seal = sharding.read_case_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            manifest_case=self.manifest_case,
+        )
+        attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        expected_manifest_case_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(self.manifest_case)
+        ).hexdigest()
+        expected_result_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(self.result)
+        ).hexdigest()
+        self.assertEqual(self.assignment.manifest_sha256, seal.commit["manifest_sha256"])
+        self.assertEqual(
+            expected_manifest_case_sha256, seal.commit["manifest_case_sha256"]
+        )
+        self.assertEqual(expected_result_sha256, seal.result_sha256)
+        self.assertEqual(attempt.start_sha256, seal.commit["attempt_start_sha256"])
+        self.assertEqual(
+            attempt.terminal_sha256, seal.commit["attempt_terminal_sha256"]
+        )
+        self.assertEqual(self.tombstone_sha256, seal.tombstone_receipt_sha256)
+        self.assertEqual(
+            self.plan.fingerprints.archive_sha256,
+            seal.evidence["archive_sha256"],
+        )
+        self.assertEqual(
+            self.plan.fingerprints.marketplace_sha256,
+            seal.evidence["marketplace_sha256"],
+        )
+        self.assertEqual(
+            self.plan.fingerprints.evaluator_sha256,
+            seal.evidence["evaluator_sha256"],
+        )
+        self.assertEqual(
+            self.plan.fingerprints.transport_config_sha256,
+            seal.evidence["transport_config_sha256"],
+        )
+
+        attempt_seal = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        for field, invalid in (
+            ("elapsed_milliseconds", sharding.MAX_SEAL_ELAPSED_MILLISECONDS + 1),
+            ("audit_event_count", sharding.MAX_SEAL_COUNTER + 1),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    sharding._validate_evidence_input(
+                        {**self.evidence, field: invalid},
+                        attempt_seal=attempt_seal,
+                        result_sha256=expected_result_sha256,
+                    )
+
+    def test_failed_case_nullable_artifacts_require_failed_cleanup(self):
+        failure_text = "semantic evaluation mismatch"
+        failure = {
+            "classification": "semantic",
+            "type": "SemanticFailure",
+            "chars": len(failure_text),
+            "sha256": hashlib.sha256(failure_text.encode()).hexdigest(),
+        }
+        failed_evidence = {
+            **self.evidence,
+            "status": "failed",
+            "classification": "semantic",
+            "failure": failure,
+            "process_cleanup_passed": False,
+            "credential_cleanup_passed": False,
+        }
+
+        paths, _ = self._new_seal_scenario("failed-no-artifacts")
+        self._write_scenario_attempt(
+            paths,
+            status="failed",
+            classification="semantic",
+            cleanup_passed=False,
+            failure=failure,
+        )
+        sharding.seal_case(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            result=None,
+            evidence=failed_evidence,
+            manifest_case=self.manifest_case,
+        )
+        seal = sharding.read_case_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            manifest_case=self.manifest_case,
+        )
+        self.assertIsNone(seal.result)
+        self.assertIsNone(seal.tombstone_receipt_sha256)
+
+        paths, _ = self._new_seal_scenario(
+            "failed-clean-result", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="failed",
+            classification="semantic",
+            cleanup_passed=True,
+            failure=failure,
+        )
+        clean_failed_evidence = {
+            **failed_evidence,
+            "process_cleanup_passed": True,
+            "credential_cleanup_passed": True,
+        }
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result=None,
+                evidence=clean_failed_evidence,
+                manifest_case=self.manifest_case,
+            )
+
+        paths, receipt_sha256 = self._new_seal_scenario(
+            "failed-nonexpected-binding", canonical_binding="missing"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="failed",
+            classification="semantic",
+            cleanup_passed=True,
+            failure=failure,
+        )
+        sharding.seal_case(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            result={**self.result},
+            evidence=clean_failed_evidence,
+            manifest_case=self.manifest_case,
+        )
+        self.assertEqual(
+            receipt_sha256,
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            ).tombstone_receipt_sha256,
+        )
+
+        for binding in ("missing", "replaced"):
+            paths, _ = self._new_seal_scenario(
+                f"success-{binding}-binding", canonical_binding=binding
+            )
+            self._write_scenario_attempt(
+                paths,
+                status="success",
+                classification="success",
+                cleanup_passed=True,
+                failure=None,
+            )
+            with self.subTest(binding=binding):
+                with self.assertRaises(ValueError):
+                    sharding.seal_case(
+                        plan=self.plan,
+                        paths=paths,
+                        assignment=self.assignment,
+                        attempt=1,
+                        result={**self.result},
+                        evidence={**self.evidence},
+                        manifest_case=self.manifest_case,
+                    )
+
+    def test_shard_seal_accepts_only_full_success_or_unique_failed_prefix(self):
+        lane = "APP"
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == lane
+        )
+
+        success_root = self.root / "full-success" / "run"
+        success_root.mkdir(parents=True, mode=0o700)
+        success_root.chmod(0o700)
+        (success_root / "cases").mkdir(mode=0o700)
+        success_worker = success_root / "app-server"
+        success_worker.mkdir(mode=0o700)
+        success_terminals = []
+        success_paths = {}
+        for assignment in assignments:
+            paths, terminal = self._prepare_lane_terminal(
+                success_root, assignment
+            )
+            success_paths[assignment.key] = paths
+            success_terminals.append(terminal)
+
+        shard_path = sharding.seal_shard(
+            worker_root=success_worker,
+            plan=self.plan,
+            lane=lane,
+            terminals=success_terminals,
+            manifests=self.manifests,
+            case_paths=success_paths,
+        )
+        self.assertEqual(
+            success_worker / "sealed" / "shard-commit.json", shard_path
+        )
+        success_seal = sharding.read_shard_seal(
+            worker_root=success_worker,
+            plan=self.plan,
+            lane=lane,
+            manifests=self.manifests,
+            case_paths=success_paths,
+        )
+        self.assertEqual("success", success_seal.status)
+        self.assertEqual(tuple(success_terminals), success_seal.terminals)
+        self.assertTrue(all(
+            terminal.case_commit_sha256 is not None
+            and terminal.tombstone_receipt_sha256 is not None
+            for terminal in success_seal.terminals
+        ))
+
+        for invalid in (
+            (),
+            tuple(success_terminals[:-1]),
+            tuple(reversed(success_terminals)),
+            tuple(success_terminals[:1] + success_terminals),
+            (
+                sharding.ShardTerminal(
+                    **{
+                        **asdict(success_terminals[0]),
+                        "attempt_terminal_sha256": "d" * 64,
+                    }
+                ),
+                *success_terminals[1:],
+            ),
+        ):
+            with self.subTest(invalid_length=len(invalid)):
+                with self.assertRaises((TypeError, ValueError)):
+                    sharding.seal_shard(
+                        worker_root=success_worker,
+                        plan=self.plan,
+                        lane=lane,
+                        terminals=invalid,
+                        manifests=self.manifests,
+                        case_paths=success_paths,
+                    )
+
+        failed_root = self.root / "failed-prefix" / "run"
+        failed_root.mkdir(parents=True, mode=0o700)
+        failed_root.chmod(0o700)
+        (failed_root / "cases").mkdir(mode=0o700)
+        failed_worker = failed_root / "app-server"
+        failed_worker.mkdir(mode=0o700)
+        failed_paths = {
+            assignment.key: sharding.paths_for_case(failed_root, assignment)
+            for assignment in assignments
+        }
+        first_paths, first_terminal = self._prepare_lane_terminal(
+            failed_root, assignments[0]
+        )
+        second_paths, failed_terminal = self._prepare_lane_terminal(
+            failed_root,
+            assignments[1],
+            status="failed",
+            cleanup_passed=False,
+            canonical_binding=None,
+            seal_case_record=False,
+        )
+        failed_paths[assignments[0].key] = first_paths
+        failed_paths[assignments[1].key] = second_paths
+        failed_prefix = (first_terminal, failed_terminal)
+        sharding.seal_shard(
+            worker_root=failed_worker,
+            plan=self.plan,
+            lane=lane,
+            terminals=failed_prefix,
+            manifests=self.manifests,
+            case_paths=failed_paths,
+        )
+        failed_seal = sharding.read_shard_seal(
+            worker_root=failed_worker,
+            plan=self.plan,
+            lane=lane,
+            manifests=self.manifests,
+            case_paths=failed_paths,
+        )
+        self.assertEqual("failed", failed_seal.status)
+        self.assertEqual(failed_prefix, failed_seal.terminals)
+        self.assertIsNone(failed_seal.terminals[-1].case_commit_sha256)
+        self.assertIsNone(failed_seal.terminals[-1].tombstone_receipt_sha256)
+        with self.assertRaises(ValueError):
+            sharding.seal_shard(
+                worker_root=failed_worker,
+                plan=self.plan,
+                lane=lane,
+                terminals=(*failed_prefix, success_terminals[2]),
+                manifests=self.manifests,
+                case_paths=failed_paths,
+            )
+
+    def test_seal_readers_reject_partial_extra_stale_and_unsafe_inputs(self):
+        counter = 0
+
+        def build_valid_case():
+            nonlocal counter
+            counter += 1
+            paths, _ = self._new_seal_scenario(
+                f"unsafe-case-{counter}", canonical_binding="expected"
+            )
+            self._write_scenario_attempt(
+                paths,
+                status="success",
+                classification="success",
+                cleanup_passed=True,
+                failure=None,
+            )
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result={**self.result},
+                evidence={**self.evidence},
+                manifest_case=self.manifest_case,
+            )
+            return paths
+
+        short_run = self.root / "t"
+        short_run.mkdir(mode=0o700)
+        (short_run / "cases").mkdir(mode=0o700)
+        paths, _ = self._prepare_lane_terminal(short_run, self.assignment)
+        evidence_path = paths.sealed / "case-evidence.json"
+        commit_path = paths.sealed / "case-commit.json"
+        evidence = json.loads(evidence_path.read_bytes())
+        evidence["archive_sha256"] = "e" * 64
+        evidence_bytes = sharding._atomic_write_record(evidence_path, evidence)
+        commit = json.loads(commit_path.read_bytes())
+        commit["evidence_sha256"] = hashlib.sha256(evidence_bytes).hexdigest()
+        sharding._atomic_write_record(commit_path, commit)
+        with self.assertRaises(ValueError):
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            )
+
+        unsafe_mutations = []
+
+        paths = build_valid_case()
+        (paths.sealed / "case-commit.json").unlink()
+        unsafe_mutations.append(("partial", paths))
+
+        paths = build_valid_case()
+        (paths.sealed / "extra.json").write_bytes(b"{}")
+        (paths.sealed / "extra.json").chmod(0o600)
+        unsafe_mutations.append(("extra", paths))
+
+        paths = build_valid_case()
+        (paths.sealed / "case-commit.json").chmod(0o644)
+        unsafe_mutations.append(("wrong-mode", paths))
+
+        paths = build_valid_case()
+        commit_path = paths.sealed / "case-commit.json"
+        commit_path.write_text("{\n}\n", encoding="ascii")
+        commit_path.chmod(0o600)
+        unsafe_mutations.append(("noncanonical", paths))
+
+        paths = build_valid_case()
+        commit_path = paths.sealed / "case-commit.json"
+        commit_path.write_bytes(commit_path.read_bytes()[:17])
+        commit_path.chmod(0o600)
+        unsafe_mutations.append(("truncated", paths))
+
+        paths = build_valid_case()
+        commit_path = paths.sealed / "case-commit.json"
+        commit_path.write_bytes(b" " * (sharding.MAX_CASE_COMMIT_BYTES + 1))
+        commit_path.chmod(0o600)
+        unsafe_mutations.append(("oversize", paths))
+
+        for label, unsafe_paths in unsafe_mutations:
+            with self.subTest(mutation=label):
+                with self.assertRaises(ValueError):
+                    sharding.read_case_seal(
+                        plan=self.plan,
+                        paths=unsafe_paths,
+                        assignment=self.assignment,
+                        manifest_case=self.manifest_case,
+                    )
+
+        stale_values = {
+            "epoch_id": "0" * 64,
+            "run_kind": "formal",
+            "case": {
+                "mode": "forward",
+                "ordinal": 1,
+                "case_id": "wrong-case",
+            },
+            "lane": "E2",
+            "route": "app-server",
+            "manifest_sha256": "0" * 64,
+            "manifest_case_sha256": "1" * 64,
+        }
+        for field, value in stale_values.items():
+            paths = build_valid_case()
+            commit_path = paths.sealed / "case-commit.json"
+            commit = json.loads(commit_path.read_bytes())
+            commit[field] = value
+            sharding._atomic_write_record(commit_path, commit)
+            with self.subTest(stale_field=field):
+                with self.assertRaises(ValueError):
+                    sharding.read_case_seal(
+                        plan=self.plan,
+                        paths=paths,
+                        assignment=self.assignment,
+                        manifest_case=self.manifest_case,
+                    )
+
+        paths = build_valid_case()
+        result_path = paths.sealed / "case-result.json"
+        replacement = paths.sealed / "replacement.json"
+        replacement.write_bytes(result_path.read_bytes())
+        replacement.chmod(0o600)
+        result_path.unlink()
+        result_path.symlink_to(replacement.name)
+        with self.assertRaises(ValueError):
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            )
+
+        short_run = self.root / "s"
+        short_run.mkdir(mode=0o700)
+        (short_run / "cases").mkdir(mode=0o700)
+        paths, _ = self._prepare_lane_terminal(short_run, self.assignment)
+        evidence_path = paths.sealed / "case-evidence.json"
+        evidence_path.unlink()
+        os.mkfifo(evidence_path, 0o600)
+        with self.assertRaises(ValueError):
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            )
+
+        socket_run = self.root / "u"
+        socket_run.mkdir(mode=0o700)
+        (socket_run / "cases").mkdir(mode=0o700)
+        paths, _ = self._prepare_lane_terminal(socket_run, self.assignment)
+        evidence_path = paths.sealed / "case-evidence.json"
+        evidence_path.unlink()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(evidence_path))
+            with self.assertRaises(ValueError):
+                sharding.read_case_seal(
+                    plan=self.plan,
+                    paths=paths,
+                    assignment=self.assignment,
+                    manifest_case=self.manifest_case,
+                )
+        finally:
+            listener.close()
+
+        paths = build_valid_case()
+        attempt_terminal = sharding.paths_for_attempt(paths, 1).terminal
+        terminal = json.loads(attempt_terminal.read_bytes())
+        terminal["classification"] = "model"
+        sharding._atomic_write_record(attempt_terminal, terminal)
+        with self.assertRaises(ValueError):
+            sharding.read_case_seal(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
+            )
+
+        command_assignment = next(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.key.mode == "lifecycle"
+            and self._manifest_for_assignment(assignment)["mode"]
+            == "command-selection-only"
+        )
+        command_result = {
+            "id": command_assignment.key.case_id,
+            "record_checkpoints": None,
+            "run_count": None,
+            "draft_count": None,
+            "final_statuses": None,
+            "failure_disclosed": None,
+            "selected_command": "python3 wiki_cli.py observe",
+        }
+        self.assertEqual(
+            command_result,
+            sharding._validate_result_record(
+                command_result, assignment=command_assignment
+            ),
+        )
+
+    def test_immutable_seal_publication_never_overwrites_collision(self):
+        arguments = {
+            "plan": self.plan,
+            "paths": self.paths,
+            "assignment": self.assignment,
+            "attempt": 1,
+            "result": self.result,
+            "evidence": self.evidence,
+            "manifest_case": self.manifest_case,
+        }
+        commit_path = sharding.seal_case(**arguments)
+        before = {
+            path.name: path.read_bytes() for path in self.paths.sealed.iterdir()
+        }
+        observed = []
+        self.assertEqual(
+            commit_path,
+            sharding.seal_case(
+                **arguments, fault_injector=lambda point: observed.append(point)
+            ),
+        )
+        self.assertEqual([], observed)
+        self.assertEqual(
+            before,
+            {path.name: path.read_bytes() for path in self.paths.sealed.iterdir()},
+        )
+
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                **{
+                    **arguments,
+                    "evidence": {**self.evidence, "elapsed_milliseconds": 26},
+                }
+            )
+        self.assertEqual(
+            before,
+            {path.name: path.read_bytes() for path in self.paths.sealed.iterdir()},
+        )
+
+        paths, _ = self._new_seal_scenario(
+            "partial-no-heal", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+
+        def stop_after_evidence(point):
+            if point == "after-evidence-replace":
+                raise RuntimeError("STOP")
+
+        partial_arguments = {
+            **arguments,
+            "paths": paths,
+        }
+        with self.assertRaisesRegex(RuntimeError, "STOP"):
+            sharding.seal_case(
+                **partial_arguments, fault_injector=stop_after_evidence
+            )
+        partial_before = {
+            path.name: path.read_bytes() for path in paths.sealed.iterdir()
+        }
+        with self.assertRaises(ValueError):
+            sharding.seal_case(**partial_arguments)
+        self.assertEqual(
+            partial_before,
+            {path.name: path.read_bytes() for path in paths.sealed.iterdir()},
+        )
+
+        paths, _ = self._new_seal_scenario(
+            "attempt-collision", canonical_binding="expected"
+        )
+        real_open = os.open
+        collision_bytes = b"collision-survives"
+
+        def collide(_source, destination, *, src_dir_fd, dst_dir_fd, **_kwargs):
+            descriptor = real_open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(descriptor, collision_bytes)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            raise FileExistsError(destination)
+
+        with mock.patch.object(sharding.os, "link", side_effect=collide):
+            with self.assertRaises(ValueError):
+                sharding.write_attempt_start(
+                    plan=self.plan,
+                    paths=paths,
+                    assignment=self.assignment,
+                    attempt=1,
+                    manifest_case=self.manifest_case,
+                )
+        collision_path = sharding.paths_for_attempt(paths, 1).start
+        self.assertEqual(collision_bytes, collision_path.read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(collision_path.stat().st_mode))
+
+        collision_path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            sharding.write_attempt_start(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                manifest_case=self.manifest_case,
+            )
+        self.assertEqual(0o644, stat.S_IMODE(collision_path.stat().st_mode))
+
+    def test_all_seal_fault_points_have_exact_durable_visibility(self):
+        for target in (
+            "after-result-replace",
+            "after-evidence-replace",
+            "before-case-commit",
+            "after-case-commit",
+        ):
+            paths, _ = self._new_seal_scenario(
+                f"fault-{target}", canonical_binding="expected"
+            )
+            self._write_scenario_attempt(
+                paths,
+                status="success",
+                classification="success",
+                cleanup_passed=True,
+                failure=None,
+            )
+            observed = []
+
+            def inject(point, *, expected=target):
+                observed.append(point)
+                if point == expected:
+                    raise RuntimeError(expected)
+
+            with self.subTest(point=target):
+                with self.assertRaisesRegex(RuntimeError, target):
+                    sharding.seal_case(
+                        plan=self.plan,
+                        paths=paths,
+                        assignment=self.assignment,
+                        attempt=1,
+                        result={**self.result},
+                        evidence={**self.evidence},
+                        manifest_case=self.manifest_case,
+                        fault_injector=inject,
+                    )
+                commit_exists = (paths.sealed / "case-commit.json").exists()
+                self.assertEqual(target == "after-case-commit", commit_exists)
+                if target == "after-case-commit":
+                    sharding.read_case_seal(
+                        plan=self.plan,
+                        paths=paths,
+                        assignment=self.assignment,
+                        manifest_case=self.manifest_case,
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        sharding.read_case_seal(
+                            plan=self.plan,
+                            paths=paths,
+                            assignment=self.assignment,
+                            manifest_case=self.manifest_case,
+                        )
+
+        paths, _ = self._new_seal_scenario(
+            "fault-rehash", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+
+        def mutate_after_evidence(point):
+            if point == "after-evidence-replace":
+                result_path = paths.sealed / "case-result.json"
+                result_path.write_bytes(result_path.read_bytes() + b" ")
+                result_path.chmod(0o600)
+
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result={**self.result},
+                evidence={**self.evidence},
+                manifest_case=self.manifest_case,
+                fault_injector=mutate_after_evidence,
+            )
+        self.assertFalse((paths.sealed / "case-commit.json").exists())
+
+        failure_text = "cleanup failed"
+        failure = {
+            "classification": "cleanup",
+            "type": "CleanupFailure",
+            "chars": len(failure_text),
+            "sha256": hashlib.sha256(failure_text.encode()).hexdigest(),
+        }
+        paths, _ = self._new_seal_scenario("fault-null-result")
+        self._write_scenario_attempt(
+            paths,
+            status="failed",
+            classification="cleanup",
+            cleanup_passed=False,
+            failure=failure,
+        )
+        observed = []
+
+        def null_result_fault(point):
+            observed.append(point)
+            if point == "after-evidence-replace":
+                raise RuntimeError("NULL_RESULT")
+
+        with self.assertRaisesRegex(RuntimeError, "NULL_RESULT"):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result=None,
+                evidence={
+                    **self.evidence,
+                    "status": "failed",
+                    "classification": "cleanup",
+                    "failure": failure,
+                    "process_cleanup_passed": False,
+                    "credential_cleanup_passed": False,
+                },
+                manifest_case=self.manifest_case,
+                fault_injector=null_result_fault,
+            )
+        self.assertNotIn("after-result-replace", observed)
+
+        lane = "APP"
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == lane
+        )
+        for target in ("before-shard-commit", "after-shard-commit"):
+            run_root = self.root / f"fault-{target}" / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            (run_root / "cases").mkdir(mode=0o700)
+            worker_root = run_root / "app-server"
+            worker_root.mkdir(mode=0o700)
+            terminals = []
+            case_paths = {}
+            for assignment in assignments:
+                case_path, terminal = self._prepare_lane_terminal(
+                    run_root, assignment
+                )
+                case_paths[assignment.key] = case_path
+                terminals.append(terminal)
+
+            def shard_fault(point, *, expected=target):
+                if point == expected:
+                    raise RuntimeError(expected)
+
+            with self.subTest(point=target):
+                with self.assertRaisesRegex(RuntimeError, target):
+                    sharding.seal_shard(
+                        worker_root=worker_root,
+                        plan=self.plan,
+                        lane=lane,
+                        terminals=terminals,
+                        manifests=self.manifests,
+                        case_paths=case_paths,
+                        fault_injector=shard_fault,
+                    )
+                if target == "after-shard-commit":
+                    sharding.read_shard_seal(
+                        worker_root=worker_root,
+                        plan=self.plan,
+                        lane=lane,
+                        manifests=self.manifests,
+                        case_paths=case_paths,
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        sharding.read_shard_seal(
+                            worker_root=worker_root,
+                            plan=self.plan,
+                            lane=lane,
+                            manifests=self.manifests,
+                            case_paths=case_paths,
+                        )
+
+    def test_seal_descriptor_failures_retire_once_and_poison_process(self):
+        program = r'''
+from pathlib import Path
+import os
+import sys
+
+from scripts import workflow_eval_sharding as sharding
+
+root = Path(sys.argv[1]).resolve(strict=True)
+role = sys.argv[2]
+records = root / "records"
+records.mkdir(mode=0o700)
+source = records / "source.json"
+source.write_bytes(b"{}")
+source.chmod(0o600)
+
+real_open = sharding.os.open
+real_close = sharding.os.close
+real_unlink = sharding.os.unlink
+real_link = sharding.os.link
+real_slot = sharding._DescriptorSlot
+target = None
+target_path = None
+target_is_directory = False
+target_close_calls = 0
+slotted = []
+close_calls = []
+
+def tracking_slot(descriptor, *args, **kwargs):
+    slotted.append(descriptor)
+    return real_slot(descriptor, *args, **kwargs)
+
+def tracking_open(path, flags, *args, **kwargs):
+    global target, target_path, target_is_directory
+    descriptor = real_open(path, flags, *args, **kwargs)
+    dir_fd = kwargs.get("dir_fd")
+    if target is None:
+        if role == "read-file" and (
+            path == source or (path == source.name and dir_fd is not None)
+        ):
+            target, target_path = descriptor, source
+        elif role == "read-parent" and path == records:
+            target, target_path, target_is_directory = descriptor, records, True
+        elif role == "publish-temp" and isinstance(path, str) and path.startswith(
+            ".published.json.tmp-"
+        ):
+            target, target_path = descriptor, records / path
+        elif role == "publish-parent" and path == records:
+            target, target_path, target_is_directory = descriptor, records, True
+    return descriptor
+
+def close_then_reuse(descriptor):
+    global target_close_calls
+    close_calls.append(descriptor)
+    if descriptor != target:
+        return real_close(descriptor)
+    if descriptor not in slotted:
+        raise SystemExit(10)
+    target_close_calls += 1
+    real_close(descriptor)
+    flags = os.O_RDONLY
+    if target_is_directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    replacement = real_open(target_path, flags)
+    if replacement != descriptor:
+        os.dup2(replacement, descriptor)
+        real_close(replacement)
+    raise OSError(f"indeterminate {role} close")
+
+sharding._DescriptorSlot = tracking_slot
+sharding.os.open = tracking_open
+sharding.os.close = close_then_reuse
+try:
+    try:
+        if role.startswith("read-"):
+            sharding._read_canonical_record(
+                source, "source", byte_cap=sharding.MAX_CASE_COMMIT_BYTES
+            )
+        else:
+            sharding._publish_immutable_json(
+                records / "published.json",
+                {"schema_version": 1},
+                byte_cap=sharding.MAX_CASE_COMMIT_BYTES,
+            )
+    except BaseException as error:
+        if not sharding.is_indeterminate_descriptor_close(error):
+            raise SystemExit(2)
+    else:
+        raise SystemExit(3)
+    if target is None or target_close_calls != 1:
+        raise SystemExit(4)
+    os.fstat(target)
+    before = tuple(close_calls)
+    sharding.os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("poisoned seal opened a file")
+    )
+    sharding.os.unlink = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("poisoned seal unlinked a file")
+    )
+    sharding.os.link = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("poisoned seal published a file")
+    )
+    try:
+        sharding._publish_immutable_json(
+            records / "later.json", {"schema_version": 1}, byte_cap=128
+        )
+    except RuntimeError as error:
+        if "poisoned" not in str(error):
+            raise SystemExit(5)
+    else:
+        raise SystemExit(6)
+    if tuple(close_calls) != before:
+        raise SystemExit(7)
+finally:
+    sharding._DescriptorSlot = real_slot
+    sharding.os.open = real_open
+    sharding.os.close = real_close
+    sharding.os.unlink = real_unlink
+    sharding.os.link = real_link
+    if target is not None:
+        real_close(target)
+'''
+        for role in (
+            "read-file",
+            "read-parent",
+            "publish-temp",
+            "publish-parent",
+        ):
+            with self.subTest(role=role), tempfile.TemporaryDirectory(
+                dir="/private/tmp"
+            ) as temporary:
+                completed = subprocess.run(
+                    [sys.executable, "-c", program, temporary, role],
+                    cwd=Path(__file__).parents[1],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    0,
+                    completed.returncode,
+                    f"{role}: stdout={completed.stdout!r} stderr={completed.stderr!r}",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

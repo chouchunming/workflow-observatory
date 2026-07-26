@@ -59,6 +59,30 @@ RESULT_PATHS = {
 DIAGNOSTIC_CASE_ID = "reviewed-refactor"
 
 
+def exact_git_repository_root(start: Path) -> Path:
+    completed = subprocess.run(
+        ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    rendered = completed.stdout.rstrip("\n")
+    if completed.returncode != 0 or not rendered or "\n" in rendered:
+        raise RuntimeError(
+            "formal marketplace evaluation requires a supported Git worktree"
+        )
+    repository_root = Path(rendered)
+    if (
+        not repository_root.is_absolute()
+        or repository_root.resolve(strict=True) != repository_root
+    ):
+        raise RuntimeError(
+            "formal marketplace evaluation requires the exact canonical Git root"
+        )
+    return repository_root
+
+
 def validate_marketplace_manifest_hashes() -> None:
     for mode, path in MANIFEST_PATHS.items():
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -130,7 +154,7 @@ def _build_marketplace_runtime(
         store_root=home / "store",
         audit=audit,
         environment=environment,
-        writable_roots=[home, audit.root],
+        writable_roots=(home, audit.root),
         selected_command="workflow_observer_cli.py",
         disabled_skill_paths=inventory_external_skill_paths(
             fixture_skill_paths=fixture_skill_paths
@@ -320,9 +344,11 @@ def main() -> int:
         return 0
     run_suite(
         REPOSITORY_ROOT,
+        repository_root=exact_git_repository_root(REPOSITORY_ROOT),
         manifest_paths=MANIFEST_PATHS,
         result_destinations=RESULT_PATHS,
         runtime_factory=MarketplaceRuntimeFactory(),
+        coordinator_role="serial-coordinator",
     )
     print(
         "Revision 6 frozen evaluations passed and paired results were committed "

@@ -26,6 +26,7 @@ class MarketplaceEvalRunnerHygieneTests(unittest.TestCase):
         relative_sources = (
             Path("scripts/__init__.py"),
             Path("scripts/run_observing_workflows_task9_eval.py"),
+            Path("scripts/workflow_eval_sharding.py"),
             Path("tests/observing_workflows_eval_harness.py"),
             Path("tests/run_observing_workflows_eval.py"),
         )
