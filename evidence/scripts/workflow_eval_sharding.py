@@ -70,6 +70,8 @@ MAX_TOKEN_COUNT = 2**63 - 1
 MAX_PROTOCOL_RECORDS = 19
 MAX_PROTOCOL_CRASH_TEMPS = 19
 MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
+PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 0.2
+PROTOCOL_WORKER_LOCK_POLL_SECONDS = 0.01
 MAX_SEAL_COUNTER = 1_000_000
 MAX_SEAL_ELAPSED_MILLISECONDS = 3_600_000
 MAX_SEAL_FAILURE_CHARS = 2**63 - 1
@@ -6545,22 +6547,63 @@ def _seal_worker_protocol_identity_retained(
     _read_worker_protocol_identity_retained(worker, message)
 
 
-def _lock_protocol_worker(worker: _RecordDirectoryCapability) -> None:
+def _bounded_protocol_lock_deadline(
+    operation_deadline: float | None,
+) -> float:
+    now = time.monotonic()
+    default_deadline = now + PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS
+    if operation_deadline is None:
+        return default_deadline
+    if (
+        type(operation_deadline) not in (int, float)
+        or not math.isfinite(operation_deadline)
+    ):
+        raise ValueError("protocol operation deadline is invalid")
+    return min(default_deadline, float(operation_deadline))
+
+
+def _lock_protocol_worker(
+    worker: _RecordDirectoryCapability,
+    *,
+    deadline: float,
+) -> None:
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise ValueError("protocol worker lock deadline is invalid")
     worker._validate_live()
-    fcntl.flock(
-        worker._retained[-1].slot.descriptor,
-        fcntl.LOCK_EX,
-    )
+    descriptor = worker._retained[-1].slot.descriptor
+    while True:
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            break
+        except (BlockingIOError, InterruptedError):
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out acquiring protocol worker lock"
+                ) from None
+            time.sleep(min(PROTOCOL_WORKER_LOCK_POLL_SECONDS, remaining))
     worker._validate_live()
 
 
-def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
+def _write_progress_with_deadline(
+    worker_root: Path,
+    message: ProgressMessage,
+    *,
+    operation_deadline: float | None,
+) -> tuple[Path, str]:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
     worker = _open_protocol_worker_directory(bound_worker, message.lane)
     path = bound_worker / "progress" / f"{message.seq:06d}.json"
+    message_sha256: str | None = None
     with worker:
-        _lock_protocol_worker(worker)
+        _lock_protocol_worker(
+            worker,
+            deadline=_bounded_protocol_lock_deadline(operation_deadline),
+        )
         _validate_progress_durable(bound_worker, message)
         worker._validate_live()
         progress = _open_protocol_record_directory(
@@ -6576,14 +6619,26 @@ def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
                 publishing_seq=message.seq,
             )
             _seal_worker_protocol_identity_retained(worker, message)
-            _write_protocol_record_retained(
+            content = _write_protocol_record_retained(
                 progress,
                 path.name,
                 _encode_progress_message(message),
                 byte_cap=MAX_PROGRESS_BYTES,
             )
             progress._validate_live()
+            message_sha256 = hashlib.sha256(content).hexdigest()
         worker._validate_live()
+    if message_sha256 is None:
+        raise AssertionError("progress publication omitted its durable digest")
+    return path, message_sha256
+
+
+def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
+    path, _ = _write_progress_with_deadline(
+        worker_root,
+        message,
+        operation_deadline=None,
+    )
     return path
 
 
@@ -7082,7 +7137,10 @@ def write_ack(
     path = bound_worker / "acks" / f"{message.seq:06d}.json"
     worker = _open_protocol_worker_directory(bound_worker, message.lane)
     with worker:
-        _lock_protocol_worker(worker)
+        _lock_protocol_worker(
+            worker,
+            deadline=_bounded_protocol_lock_deadline(None),
+        )
         _read_worker_protocol_identity_retained(worker, message)
         message_sha256 = _durable_progress_hash(bound_worker, message)
         worker._validate_live()
@@ -7242,6 +7300,7 @@ class ProgressAckLedger:
         self._epoch_id: str | None = None
         self._run_kind: RunKind | None = None
         self._state_lock = threading.RLock()
+        self._transition_owner: int | None = None
         self._aborted = False
         self._stop_launches = max_total_tokens == 0
         self._exited: set[LaneName] = set()
@@ -7267,9 +7326,28 @@ class ProgressAckLedger:
             return self._aborted
 
     def accept_progress(self, message: ProgressMessage) -> AckDecision:
-        payload = _encode_progress_message(message)
         with self._state_lock:
-            return self._accept_progress_locked(message, payload)
+            self._begin_transition_locked()
+            try:
+                payload = _encode_progress_message(message)
+                return self._accept_progress_locked(message, payload)
+            finally:
+                self._end_transition_locked()
+
+    def _begin_transition_locked(self) -> None:
+        owner = threading.get_ident()
+        if self._transition_owner is not None:
+            if self._transition_owner != owner:
+                raise AssertionError(
+                    "ledger transition lock admitted a competing owner"
+                )
+            raise RuntimeError("ledger transition is already active")
+        self._transition_owner = owner
+
+    def _end_transition_locked(self) -> None:
+        if self._transition_owner != threading.get_ident():
+            raise AssertionError("ledger transition owner changed")
+        self._transition_owner = None
 
     def _accept_progress_locked(
         self,
@@ -7371,10 +7449,14 @@ class ProgressAckLedger:
         if type(lane) is not str or lane not in ("E1", "E2", "E3", "APP"):
             raise ValueError("worker exit lane is invalid")
         with self._state_lock:
-            self._exited.add(lane)
-            self._active_cases[lane] = None
-            self._aborted = True
-            return "abort"
+            self._begin_transition_locked()
+            try:
+                self._exited.add(lane)
+                self._active_cases[lane] = None
+                self._aborted = True
+                return "abort"
+            finally:
+                self._end_transition_locked()
 
 
 def canonical_config_bytes(config: Mapping[str, Any]) -> bytes:

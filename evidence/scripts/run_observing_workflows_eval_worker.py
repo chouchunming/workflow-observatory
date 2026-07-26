@@ -11,6 +11,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import time
 from types import ModuleType
 from typing import Callable, Protocol
 
@@ -33,7 +34,6 @@ from scripts.workflow_eval_sharding import (
     CasePaths,
     EpochPlan,
     InstalledCaseAuth,
-    MAX_PROGRESS_BYTES,
     ProgressMessage,
     ResolvedTransportConfig,
     TombstoneReceipt,
@@ -44,6 +44,8 @@ from scripts.workflow_eval_sharding import (
     _require_exact_fields,
     _retire_descriptor_capability,
     _tombstone_receipt_from_payload as _receipt_from_payload,
+    _validate_wait_timeout,
+    _write_progress_with_deadline,
     canonical_run_root,
     install_case_auth,
     is_indeterminate_descriptor_close,
@@ -52,7 +54,6 @@ from scripts.workflow_eval_sharding import (
     read_tombstone_receipt,
     stage_marketplace_for_case,
     wait_for_ack,
-    write_progress,
 )
 
 
@@ -128,14 +129,17 @@ def publish_progress_and_wait_for_ack(
 
     if wakeup_sink is not None and not callable(wakeup_sink):
         raise TypeError("wakeup_sink must be callable or None")
-    path = write_progress(worker_root, message)
-    _, content = _read_canonical_record(
-        path, "worker progress", byte_cap=MAX_PROGRESS_BYTES
+    timeout_value = _validate_wait_timeout(timeout)
+    operation_deadline = time.monotonic() + timeout_value
+    _, message_sha256 = _write_progress_with_deadline(
+        worker_root,
+        message,
+        operation_deadline=operation_deadline,
     )
     wakeup = {
         "lane": message.lane,
         "seq": message.seq,
-        "sha256": hashlib.sha256(content).hexdigest(),
+        "sha256": message_sha256,
     }
     if wakeup_sink is None:
         sys.stdout.write(
@@ -150,7 +154,8 @@ def publish_progress_and_wait_for_ack(
         sys.stdout.flush()
     else:
         wakeup_sink(wakeup)
-    return wait_for_ack(worker_root, message, timeout)
+    remaining = max(0.0, operation_deadline - time.monotonic())
+    return wait_for_ack(worker_root, message, remaining)
 
 
 def _load_captured_evaluator(snapshot_root: Path) -> ModuleType:

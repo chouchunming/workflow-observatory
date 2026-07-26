@@ -8727,6 +8727,336 @@ class ProgressProtocolTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_progress_ack_ledger_rejects_same_thread_transition_reentry(self):
+        formal = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("formal"),
+        )
+        outer = self._lane_message(
+            seq=1,
+            progress_type="lane-ready",
+            lane="E1",
+        )
+        nested = replace(
+            outer,
+            epoch_id=formal.epoch_id,
+            run_kind=formal.run_kind,
+            lane="E2",
+        )
+
+        for boundary in ("encode", "canonical"):
+            with self.subTest(boundary=boundary):
+                ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+                nested_results = []
+                nested_errors = []
+                outer_results = []
+                outer_errors = []
+                invoked = False
+
+                def reenter():
+                    nonlocal invoked
+                    if invoked:
+                        return
+                    invoked = True
+                    try:
+                        nested_results.append(ledger.accept_progress(nested))
+                    except BaseException as error:
+                        nested_errors.append(error)
+
+                if boundary == "encode":
+                    real_encode = sharding._encode_progress_message
+
+                    def callback(message):
+                        if message == outer:
+                            reenter()
+                        return real_encode(message)
+
+                    patcher = mock.patch.object(
+                        sharding,
+                        "_encode_progress_message",
+                        side_effect=callback,
+                    )
+                else:
+                    real_canonical = sharding.canonical_config_bytes
+
+                    def callback(config):
+                        if (
+                            isinstance(config, dict)
+                            and config.get("lane") == outer.lane
+                            and config.get("seq") == outer.seq
+                            and set(config) == sharding.PROGRESS_FIELDS
+                        ):
+                            reenter()
+                        return real_canonical(config)
+
+                    patcher = mock.patch.object(
+                        sharding,
+                        "canonical_config_bytes",
+                        side_effect=callback,
+                    )
+
+                with patcher:
+                    try:
+                        outer_results.append(ledger.accept_progress(outer))
+                    except BaseException as error:
+                        outer_errors.append(error)
+
+                self.assertEqual(["continue"], outer_results)
+                self.assertEqual([], outer_errors)
+                self.assertEqual([], nested_results)
+                self.assertEqual(1, len(nested_errors))
+                self.assertIsInstance(nested_errors[0], RuntimeError)
+                self.assertRegex(str(nested_errors[0]), "transition.*active")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "protocol identity",
+                ):
+                    ledger.accept_progress(nested)
+                self.assertEqual(
+                    "continue",
+                    ledger.accept_progress(
+                        replace(
+                            nested,
+                            epoch_id=outer.epoch_id,
+                            run_kind=outer.run_kind,
+                        )
+                    ),
+                )
+                self.assertEqual(0, ledger.total_tokens)
+
+        cleanup_ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        with mock.patch.object(
+            sharding,
+            "canonical_config_bytes",
+            side_effect=ValueError("serialization callback failed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "serialization callback"):
+                cleanup_ledger.accept_progress(outer)
+        self.assertEqual("continue", cleanup_ledger.accept_progress(outer))
+
+    def test_protocol_writer_lock_wait_is_bounded_and_retires_capabilities(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        scenarios = []
+
+        progress_run = self.root / "lock-timeout-progress" / "run"
+        progress_run.mkdir(parents=True, mode=0o700)
+        progress_run.chmod(0o700)
+        progress_worker = self._worker_root(progress_run)
+        scenarios.append(
+            (
+                "progress",
+                progress_worker,
+                lambda: sharding.write_progress(progress_worker, ready),
+                progress_worker / "progress" / "000001.json",
+                0.4,
+            )
+        )
+
+        ack_run = self.root / "lock-timeout-ack" / "run"
+        ack_run.mkdir(parents=True, mode=0o700)
+        ack_run.chmod(0o700)
+        ack_worker = self._worker_root(ack_run)
+        sharding.write_progress(ack_worker, ready)
+        scenarios.append(
+            (
+                "ACK",
+                ack_worker,
+                lambda: sharding.write_ack(ack_worker, ready, "continue"),
+                ack_worker / "acks" / "000001.json",
+                0.4,
+            )
+        )
+
+        helper_run = self.root / "lock-timeout-helper" / "run"
+        helper_run.mkdir(parents=True, mode=0o700)
+        helper_run.chmod(0o700)
+        helper_worker = self._worker_root(helper_run)
+        scenarios.append(
+            (
+                "worker helper",
+                helper_worker,
+                lambda: worker.publish_progress_and_wait_for_ack(
+                    worker_root=helper_worker,
+                    message=ready,
+                    timeout=0.05,
+                    wakeup_sink=lambda _wakeup: None,
+                ),
+                helper_worker / "progress" / "000001.json",
+                0.15,
+            )
+        )
+
+        observed = {}
+        for label, worker_root, call, final_path, wait_seconds in scenarios:
+            holder = os.open(
+                worker_root,
+                os.O_RDONLY
+                | sharding._required_os_flag("O_DIRECTORY")
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            sharding.fcntl.flock(
+                holder,
+                sharding.fcntl.LOCK_EX | sharding.fcntl.LOCK_NB,
+            )
+            captured = []
+            results = []
+            errors = []
+            finished = threading.Event()
+            real_open_worker = sharding._open_protocol_worker_directory
+
+            def capture_worker(*args, **kwargs):
+                capability = real_open_worker(*args, **kwargs)
+                captured.append(capability)
+                return capability
+
+            def invoke():
+                try:
+                    results.append(call())
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    finished.set()
+
+            try:
+                with mock.patch.object(
+                    sharding,
+                    "_open_protocol_worker_directory",
+                    side_effect=capture_worker,
+                ):
+                    thread = threading.Thread(target=invoke)
+                    thread.start()
+                    completed_in_bound = finished.wait(wait_seconds)
+                    sharding.fcntl.flock(holder, sharding.fcntl.LOCK_UN)
+                    thread.join(2.0)
+                    self.assertFalse(thread.is_alive())
+            finally:
+                os.close(holder)
+            observed[label] = (
+                completed_in_bound,
+                results,
+                errors,
+                captured,
+                final_path,
+            )
+
+        for label, (
+            completed_in_bound,
+            results,
+            errors,
+            captured,
+            final_path,
+        ) in observed.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    completed_in_bound,
+                    f"{label} remained blocked past its lock deadline",
+                )
+                self.assertEqual([], results)
+                self.assertEqual(1, len(errors))
+                self.assertIsInstance(errors[0], TimeoutError)
+                self.assertEqual(
+                    "timed out acquiring protocol worker lock",
+                    str(errors[0]),
+                )
+                self.assertFalse(final_path.exists())
+                self.assertTrue(captured)
+                for capability in captured:
+                    self.assertTrue(capability._closed)
+                    slots = (
+                        capability._anchor_slot,
+                        *(
+                            entry.slot
+                            for entry in capability._retained
+                        ),
+                    )
+                    self.assertTrue(
+                        all(
+                            slot.descriptor_close_state == "closed"
+                            for slot in slots
+                        )
+                    )
+
+    def test_worker_wakeup_digest_survives_hierarchy_replacement_after_publish(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        run_root = self.root / "wakeup-replacement" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        message = self._lane_message(seq=1, progress_type="lane-ready")
+        forged = self._lane_message(seq=1, progress_type="worker-stopped")
+        expected_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(asdict(message))
+        ).hexdigest()
+        forged_sha256 = hashlib.sha256(
+            sharding.canonical_config_bytes(asdict(forged))
+        ).hexdigest()
+        self.assertNotEqual(expected_sha256, forged_sha256)
+
+        real_close = sharding._RecordDirectoryCapability.close
+        replaced = False
+
+        def close_then_replace(capability, primary=None):
+            nonlocal replaced
+            result = real_close(capability, primary)
+            if not replaced and capability.path == worker_root:
+                replaced = True
+                workers = run_root / "workers"
+                workers.rename(run_root / "workers-old")
+                progress = workers / "E1" / "progress"
+                progress.mkdir(parents=True, mode=0o700)
+                workers.chmod(0o700)
+                (workers / "E1").chmod(0o700)
+                progress.chmod(0o700)
+                sharding._atomic_write_record(
+                    progress / "000001.json",
+                    asdict(forged),
+                )
+            return result
+
+        class WakeupCaptured(RuntimeError):
+            pass
+
+        wakeups = []
+
+        def capture_wakeup(wakeup):
+            wakeups.append(wakeup)
+            raise WakeupCaptured("stop after wake-up")
+
+        with mock.patch.object(
+            sharding._RecordDirectoryCapability,
+            "close",
+            new=close_then_replace,
+        ):
+            with self.assertRaisesRegex(WakeupCaptured, "stop after wake-up"):
+                worker.publish_progress_and_wait_for_ack(
+                    worker_root=worker_root,
+                    message=message,
+                    timeout=1.0,
+                    wakeup_sink=capture_wakeup,
+                )
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            [
+                {
+                    "lane": message.lane,
+                    "seq": message.seq,
+                    "sha256": expected_sha256,
+                }
+            ],
+            wakeups,
+        )
+        self.assertEqual(
+            forged_sha256,
+            hashlib.sha256(
+                (worker_root / "progress" / "000001.json").read_bytes()
+            ).hexdigest(),
+        )
+
     def test_acked_usage_is_bounded_idempotent_and_stops_future_launches(self):
         self.assertTrue(
             hasattr(sharding, "ProgressAckLedger"),
