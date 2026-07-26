@@ -6462,7 +6462,14 @@ def _install_protocol_pending_marker_retained(
             name,
             label=label,
         ):
-            return
+            os.fsync(parent_slot.descriptor)
+            directory._validate_live()
+            if _protocol_pending_marker_exists_retained(
+                directory,
+                name,
+                label=label,
+            ):
+                return
         raise ValueError(f"{label} publication is pending") from None
 
     marker_slot = _DescriptorSlot(marker_descriptor)
@@ -7023,6 +7030,46 @@ def _read_progress_with_worker_lock_retained(
     expected_lane: LaneName,
     expected_seq: int,
 ) -> ProgressMessage:
+    sequences = _protocol_sequence_inventory_retained(
+        progress,
+        label="progress",
+        deadline=None,
+    )
+    _require_protocol_complete_prefix(sequences, label="progress")
+    if expected_seq not in sequences:
+        raise ValueError("progress records are gapped or reordered")
+    message: ProgressMessage | None = None
+    for sequence in sequences:
+        durable = _read_single_progress_with_worker_lock_retained(
+            worker,
+            progress,
+            expected_lane=expected_lane,
+            expected_seq=sequence,
+        )
+        if sequence == expected_seq:
+            message = durable
+            break
+    if message is None:
+        raise AssertionError("progress prefix omitted its expected sequence")
+    if (
+        _protocol_sequence_inventory_retained(
+            progress,
+            label="progress",
+            deadline=None,
+        )
+        != sequences
+    ):
+        raise RuntimeError("progress inventory changed while reading")
+    return message
+
+
+def _read_single_progress_with_worker_lock_retained(
+    worker: _RecordDirectoryCapability,
+    progress: _RecordChildDirectoryCapability,
+    *,
+    expected_lane: LaneName,
+    expected_seq: int,
+) -> ProgressMessage:
     expected_name = f"{expected_seq:06d}.json"
     _require_protocol_record_committed_retained(
         progress,
@@ -7164,11 +7211,8 @@ def _protocol_sequence_inventory_retained(
         raise TimeoutError(f"timed out while scanning {label} records")
     if len(set(sequences) | pending_sequences) > MAX_PROTOCOL_RECORDS:
         raise ValueError(f"{label} pending marker inventory exceeds its cap")
-    if publishing_seq is not None and pending_sequences:
+    if pending_sequences:
         raise ValueError(f"{label} publication is pending")
-    sequences = [
-        sequence for sequence in sequences if sequence not in pending_sequences
-    ]
     sequences.sort()
     if (
         publishing_seq is not None
@@ -7328,11 +7372,8 @@ def _protocol_sequence_inventory(
     )
     if len(set(sequences) | pending_sequences) > MAX_PROTOCOL_RECORDS:
         raise ValueError(f"{label} pending marker inventory exceeds its cap")
-    if publishing_seq is not None and pending_sequences:
+    if pending_sequences:
         raise ValueError(f"{label} publication is pending")
-    sequences = [
-        sequence for sequence in sequences if sequence not in pending_sequences
-    ]
     sequences.sort()
     if (
         publishing_seq is not None
@@ -7341,6 +7382,14 @@ def _protocol_sequence_inventory(
     ):
         raise ValueError(f"{label} record inventory exceeds its cap")
     return tuple(sequences)
+
+
+def _require_protocol_complete_prefix(
+    sequences: tuple[int, ...], *, label: str
+) -> None:
+    for expected_sequence, sequence in enumerate(sequences, start=1):
+        if sequence != expected_sequence:
+            raise ValueError(f"{label} records are gapped or reordered")
 
 
 def _require_protocol_sequence_prefix(

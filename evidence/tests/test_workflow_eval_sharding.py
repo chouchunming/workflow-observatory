@@ -8403,6 +8403,147 @@ class ProgressProtocolTests(unittest.TestCase):
                             publish()
                         self.assertEqual(before, final.read_bytes())
 
+    def test_double_restoration_fsync_failures_require_durable_poison_or_committed_success(
+        self,
+    ):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        for protocol in ("progress", "ACK"):
+            for failed_boundaries, reports_committed in (
+                (frozenset((4, 5)), False),
+                (frozenset((4, 5, 6)), True),
+            ):
+                with self.subTest(
+                    protocol=protocol,
+                    failed_boundaries=tuple(sorted(failed_boundaries)),
+                ):
+                    run_root = (
+                        self.root
+                        / (
+                            "double-restoration-fsync-"
+                            f"{protocol.lower()}-"
+                            f"{len(failed_boundaries)}"
+                        )
+                        / "run"
+                    )
+                    run_root.mkdir(parents=True, mode=0o700)
+                    run_root.chmod(0o700)
+                    worker_root = self._worker_root(run_root)
+                    if protocol == "progress":
+                        directory = worker_root / "progress"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_progress(
+                            worker_root,
+                            ready,
+                        )
+                        read = lambda: sharding.read_progress(
+                            directory / "000001.json",
+                            "E1",
+                            1,
+                        )
+                        process_script = """
+import sys
+from pathlib import Path
+from scripts import workflow_eval_sharding as sharding
+worker_root = Path(sys.argv[1])
+sharding.read_progress(
+    worker_root / "progress" / "000001.json", "E1", 1
+)
+"""
+                    else:
+                        sharding.write_progress(worker_root, ready)
+                        directory = worker_root / "acks"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_ack(
+                            worker_root,
+                            ready,
+                            "continue",
+                        )
+                        read = lambda: sharding.wait_for_ack(
+                            worker_root,
+                            ready,
+                            0.01,
+                        )
+                        process_script = """
+import sys
+from pathlib import Path
+from scripts import workflow_eval_sharding as sharding
+worker_root = Path(sys.argv[1])
+message = sharding.read_progress(
+    worker_root / "progress" / "000001.json", "E1", 1
+)
+sharding.wait_for_ack(worker_root, message, 0.01)
+"""
+
+                    directory_identity = (
+                        directory.stat().st_dev,
+                        directory.stat().st_ino,
+                    )
+                    real_fsync = sharding.os.fsync
+                    directory_fsyncs = 0
+
+                    def fail_selected_directory_fsync(descriptor):
+                        nonlocal directory_fsyncs
+                        metadata = os.fstat(descriptor)
+                        if (
+                            stat.S_ISDIR(metadata.st_mode)
+                            and (metadata.st_dev, metadata.st_ino)
+                            == directory_identity
+                        ):
+                            directory_fsyncs += 1
+                            if directory_fsyncs in failed_boundaries:
+                                raise OSError(
+                                    "injected restoration directory fsync failure"
+                                )
+                        return real_fsync(descriptor)
+
+                    published = None
+                    writer_error = None
+                    with mock.patch.object(
+                        sharding.os,
+                        "fsync",
+                        side_effect=fail_selected_directory_fsync,
+                    ):
+                        try:
+                            published = publish()
+                        except BaseException as error:
+                            writer_error = error
+
+                    self.assertEqual(6, directory_fsyncs)
+                    final = directory / "000001.json"
+                    pending = directory / ".000001.json.pending"
+                    self.assertTrue(final.is_file())
+                    self.assertTrue(pending.is_file())
+                    if reports_committed:
+                        self.assertEqual(final, published)
+                        self.assertIsNone(writer_error)
+                    else:
+                        self.assertIsNone(published)
+                        self.assertIsNotNone(writer_error)
+
+                    with self.assertRaises((TimeoutError, ValueError)):
+                        read()
+                    process = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            process_script,
+                            str(worker_root),
+                        ],
+                        cwd=Path(__file__).resolve().parents[1],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(0, process.returncode)
+                    self.assertRegex(
+                        process.stderr,
+                        "pending|timed out|TimeoutError|ValueError",
+                    )
+                    with self.assertRaisesRegex(ValueError, "pending"):
+                        publish()
+
     def test_progress_and_ack_cleanup_failures_remain_pending(self):
         ready = self._lane_message(seq=1, progress_type="lane-ready")
 
@@ -10063,6 +10204,224 @@ sharding.wait_for_ack(worker_root, message, 0.05)
         with self.assertRaises(ValueError):
             sharding.wait_for_ack(worker_root, second, 0.1)
         self.assertTrue(first_path.exists())
+
+    def test_exact_progress_read_rejects_lane_gap_and_unknown_future_final(
+        self,
+    ):
+        def protocol_root(name):
+            run_root = self.root / name / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            return self._worker_root(run_root)
+
+        missing_prefix_root = protocol_root("exact-read-missing-prefix")
+        missing_prefix = sharding.write_progress(
+            missing_prefix_root,
+            self._lane_message(seq=2, progress_type="lane-ready"),
+        )
+        with self.assertRaisesRegex(ValueError, "gapped|reordered"):
+            sharding.read_progress(missing_prefix, "E1", 2)
+
+        future_gap_root = protocol_root("exact-read-future-gap")
+        first = self._lane_message(seq=1, progress_type="lane-ready")
+        first_path = sharding.write_progress(future_gap_root, first)
+        sharding.write_progress(
+            future_gap_root,
+            self._lane_message(seq=3, progress_type="worker-stopped"),
+        )
+        with self.assertRaisesRegex(ValueError, "gapped|reordered"):
+            sharding.read_progress(first_path, "E1", 1)
+
+        unknown_root = protocol_root("exact-read-unknown-future-final")
+        first_path = sharding.write_progress(unknown_root, first)
+        unknown = unknown_root / "progress" / "unexpected.json"
+        unknown.write_bytes(b"{}")
+        unknown.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "unsafe record"):
+            sharding.read_progress(first_path, "E1", 1)
+
+        for authority in ("read_progress", "write_ack"):
+            with self.subTest(
+                invalid_prior_record=True,
+                authority=authority,
+            ):
+                invalid_prefix_root = protocol_root(
+                    f"exact-read-invalid-prefix-{authority}"
+                )
+                first_path = sharding.write_progress(
+                    invalid_prefix_root,
+                    first,
+                )
+                sharding.write_ack(
+                    invalid_prefix_root,
+                    first,
+                    "continue",
+                )
+                second = sharding.ProgressMessage(
+                    **{
+                        **asdict(
+                            self._lane_message(
+                                seq=2,
+                                progress_type="case-started",
+                            )
+                        ),
+                        "case": self.assignment.key,
+                        "attempt": 1,
+                    }
+                )
+                second_path = sharding.write_progress(
+                    invalid_prefix_root,
+                    second,
+                )
+                first_payload = json.loads(
+                    first_path.read_text(encoding="ascii")
+                )
+                first_payload["prompt"] = "invalid durable prefix"
+                sharding._atomic_write_record(first_path, first_payload)
+                operations = {
+                    "read_progress": lambda: sharding.read_progress(
+                        second_path,
+                        "E1",
+                        2,
+                    ),
+                    "write_ack": lambda: sharding.write_ack(
+                        invalid_prefix_root,
+                        second,
+                        "continue",
+                    ),
+                }
+                with self.assertRaises(ValueError):
+                    operations[authority]()
+
+    def test_future_pending_marker_poisons_progress_and_ack_lane(self):
+        def started():
+            return sharding.ProgressMessage(
+                **{
+                    **asdict(
+                        self._lane_message(
+                            seq=1,
+                            progress_type="case-started",
+                        )
+                    ),
+                    "case": self.assignment.key,
+                    "attempt": 1,
+                }
+            )
+
+        def protocol_root(name):
+            run_root = self.root / name / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            return self._worker_root(run_root)
+
+        for authority in ("read_progress", "wait_for_progress", "write_ack"):
+            with self.subTest(protocol="progress", authority=authority):
+                worker_root = protocol_root(
+                    f"future-progress-pending-{authority}"
+                )
+                first = started()
+                first_path = sharding.write_progress(worker_root, first)
+                sharding.write_progress(
+                    worker_root,
+                    self._lane_message(seq=2, progress_type="lane-ready"),
+                )
+                pending = (
+                    worker_root / "progress" / ".000002.json.pending"
+                )
+                pending.write_bytes(b"")
+                pending.chmod(0o600)
+                operations = {
+                    "read_progress": lambda: sharding.read_progress(
+                        first_path,
+                        "E1",
+                        1,
+                    ),
+                    "wait_for_progress": lambda: sharding.wait_for_progress(
+                        worker_root=worker_root,
+                        expected_lane="E1",
+                        expected_seq=1,
+                        timeout=0.1,
+                    ),
+                    "write_ack": lambda: sharding.write_ack(
+                        worker_root,
+                        first,
+                        "continue",
+                    ),
+                }
+                with self.assertRaisesRegex(ValueError, "pending"):
+                    operations[authority]()
+
+        for authority in ("wait_for_ack", "write_ack"):
+            with self.subTest(protocol="ACK", authority=authority):
+                worker_root = protocol_root(f"future-ack-pending-{authority}")
+                first = started()
+                second = self._lane_message(
+                    seq=2,
+                    progress_type="lane-ready",
+                )
+                sharding.write_progress(worker_root, first)
+                sharding.write_ack(worker_root, first, "continue")
+                sharding.write_progress(worker_root, second)
+                sharding.write_ack(worker_root, second, "continue")
+                pending = worker_root / "acks" / ".000002.json.pending"
+                pending.write_bytes(b"")
+                pending.chmod(0o600)
+                operations = {
+                    "wait_for_ack": lambda: sharding.wait_for_ack(
+                        worker_root,
+                        first,
+                        0.1,
+                    ),
+                    "write_ack": lambda: sharding.write_ack(
+                        worker_root,
+                        first,
+                        "continue",
+                    ),
+                }
+                with self.assertRaisesRegex(ValueError, "pending"):
+                    operations[authority]()
+
+    def test_protocol_lane_accepts_legitimate_prefix_and_same_seq_retry(self):
+        run_root = self.root / "legitimate-protocol-prefix" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        first = self._lane_message(seq=1, progress_type="lane-ready")
+        second = self._lane_message(seq=2, progress_type="worker-stopped")
+
+        first_path = sharding.write_progress(worker_root, first)
+        first_ack = sharding.write_ack(worker_root, first, "continue")
+        second_path = sharding.write_progress(worker_root, second)
+        second_ack = sharding.write_ack(worker_root, second, "abort")
+        second_progress_bytes = second_path.read_bytes()
+        second_ack_bytes = second_ack.read_bytes()
+
+        self.assertEqual(first, sharding.read_progress(first_path, "E1", 1))
+        self.assertEqual(second, sharding.read_progress(second_path, "E1", 2))
+        self.assertEqual(
+            second,
+            sharding.wait_for_progress(
+                worker_root=worker_root,
+                expected_lane="E1",
+                expected_seq=2,
+                timeout=0.1,
+            ),
+        )
+        self.assertEqual(
+            "abort",
+            sharding.wait_for_ack(worker_root, second, 0.1).decision,
+        )
+        self.assertEqual(
+            second_path,
+            sharding.write_progress(worker_root, second),
+        )
+        self.assertEqual(
+            second_ack,
+            sharding.write_ack(worker_root, second, "abort"),
+        )
+        self.assertEqual(second_progress_bytes, second_path.read_bytes())
+        self.assertEqual(second_ack_bytes, second_ack.read_bytes())
+        self.assertTrue(first_ack.is_file())
 
     def test_duplicate_gap_reorder_truncation_oversize_and_prompt_are_rejected(self):
         worker_root = self._worker_root()
