@@ -5442,6 +5442,201 @@ class SealTests(unittest.TestCase):
                 failure, classification="model", nullable=False
             )
 
+    def test_forward_and_executable_lifecycle_require_checkpoint_lists(self):
+        forward_result = {**self.result, "record_checkpoints": None}
+        with self.assertRaises(ValueError):
+            sharding._validate_result_record(
+                forward_result, assignment=self.assignment
+            )
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=self.paths,
+                assignment=self.assignment,
+                attempt=1,
+                result=forward_result,
+                evidence=self.evidence,
+                manifest_case=self.manifest_case,
+            )
+
+        lifecycle_assignment = next(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.key.mode == "lifecycle"
+            and self._manifest_for_assignment(assignment)["mode"] == "executable"
+        )
+        lifecycle_result = {
+            **self._result_for_assignment(lifecycle_assignment),
+            "record_checkpoints": None,
+        }
+        with self.assertRaises(ValueError):
+            sharding._validate_result_record(
+                lifecycle_result, assignment=lifecycle_assignment
+            )
+
+        run_root = self.root / "lifecycle-checkpoints" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        lifecycle_paths, _ = self._prepare_lane_terminal(
+            run_root, lifecycle_assignment, seal_case_record=False
+        )
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=lifecycle_paths,
+                assignment=lifecycle_assignment,
+                attempt=1,
+                result=lifecycle_result,
+                evidence=self.evidence,
+                manifest_case=self._manifest_for_assignment(
+                    lifecycle_assignment
+                ),
+            )
+
+    def test_attempt_writer_rejects_replaced_case_root_before_any_write(self):
+        paths, _ = self._new_seal_scenario("replaced-case-root")
+        moved_root = paths.root.with_name(f"{paths.root.name}-moved")
+        paths.root.rename(moved_root)
+        paths.root.symlink_to(moved_root, target_is_directory=True)
+
+        with self.assertRaises(ValueError):
+            sharding.write_attempt_start(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                manifest_case=self.manifest_case,
+            )
+        self.assertFalse(
+            (moved_root / "attempts" / "01" / "start.json").exists()
+        )
+
+    def test_case_seal_stops_after_retained_case_root_is_replaced(self):
+        paths, _ = self._new_seal_scenario(
+            "replace-case-during-seal", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+        moved_root = paths.root.with_name(f"{paths.root.name}-moved")
+
+        def replace_after_result(point):
+            if point == "after-result-replace":
+                paths.root.rename(moved_root)
+                paths.root.symlink_to(moved_root, target_is_directory=True)
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result={**self.result},
+                evidence={**self.evidence},
+                manifest_case=self.manifest_case,
+                fault_injector=replace_after_result,
+            )
+        self.assertTrue((moved_root / "sealed" / "case-result.json").is_file())
+        self.assertFalse((moved_root / "sealed" / "case-evidence.json").exists())
+        self.assertFalse((moved_root / "sealed" / "case-commit.json").exists())
+
+    def test_case_reader_rejects_seal_directory_replacement_mid_read(self):
+        paths, _ = self._new_seal_scenario(
+            "replace-case-sealed-during-read", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+        sharding.seal_case(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            result={**self.result},
+            evidence={**self.evidence},
+            manifest_case=self.manifest_case,
+        )
+        moved_sealed = paths.sealed.with_name("sealed-moved")
+        real_read = sharding._read_canonical_record_at
+        replaced = False
+
+        def replace_after_commit(**kwargs):
+            nonlocal replaced
+            result = real_read(**kwargs)
+            if kwargs["label"] == "case commit" and not replaced:
+                replaced = True
+                paths.sealed.rename(moved_sealed)
+                paths.sealed.mkdir(mode=0o700)
+                for source in moved_sealed.iterdir():
+                    destination = paths.sealed / source.name
+                    destination.write_bytes(source.read_bytes())
+                    destination.chmod(0o600)
+            return result
+
+        with mock.patch.object(
+            sharding,
+            "_read_canonical_record_at",
+            side_effect=replace_after_commit,
+        ):
+            with self.assertRaises((RuntimeError, ValueError)):
+                sharding.read_case_seal(
+                    plan=self.plan,
+                    paths=paths,
+                    assignment=self.assignment,
+                    manifest_case=self.manifest_case,
+                )
+
+    def test_shard_seal_stops_after_retained_worker_root_is_replaced(self):
+        lane = "APP"
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == lane
+        )
+        run_root = self.root / "replace-worker-during-seal" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        worker_root = run_root / "app-server"
+        worker_root.mkdir(mode=0o700)
+        terminals = []
+        case_paths = {}
+        for assignment in assignments:
+            case_path, terminal = self._prepare_lane_terminal(
+                run_root, assignment
+            )
+            case_paths[assignment.key] = case_path
+            terminals.append(terminal)
+        moved_worker = worker_root.with_name("app-server-moved")
+
+        def replace_before_commit(point):
+            if point == "before-shard-commit":
+                worker_root.rename(moved_worker)
+                worker_root.symlink_to(moved_worker, target_is_directory=True)
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            sharding.seal_shard(
+                worker_root=worker_root,
+                plan=self.plan,
+                lane=lane,
+                terminals=terminals,
+                manifests=self.manifests,
+                case_paths=case_paths,
+                fault_injector=replace_before_commit,
+            )
+        self.assertFalse(
+            (moved_worker / "sealed" / "shard-commit.json").exists()
+        )
+
     def test_case_seal_binds_fingerprints_attempt_result_and_expected_tombstone(self):
         invalid_manifest = json.loads(
             sharding.canonical_config_bytes(self.manifest_case)

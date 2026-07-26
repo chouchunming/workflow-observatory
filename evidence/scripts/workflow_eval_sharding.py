@@ -483,7 +483,12 @@ def _reconcile_named_descriptor_at(
 
 
 def _open_relative_directory_chain_at(
-    anchor_fd: int, components: Sequence[str], *, label: str, create: bool
+    anchor_fd: int,
+    components: Sequence[str],
+    *,
+    label: str,
+    create: bool,
+    required_mode: int | None = None,
 ) -> tuple[_RetainedDirectory, ...]:
     nofollow = _required_os_flag("O_NOFOLLOW")
     directory = _required_os_flag("O_DIRECTORY")
@@ -506,7 +511,7 @@ def _open_relative_directory_chain_at(
                 expected,
                 label=label,
                 kind="directory",
-                mode=0o700 if created else None,
+                mode=0o700 if created else required_mode,
             )
             child_fd = os.open(
                 name,
@@ -532,7 +537,7 @@ def _open_relative_directory_chain_at(
                     opened,
                     label=label,
                     kind="directory",
-                    mode=0o700 if created else None,
+                    mode=0o700 if created else required_mode,
                 )
             except BaseException as primary:
                 close_error = _retire_descriptor_capability(child_slot)
@@ -612,6 +617,181 @@ class _ResultParentCapability:
             primary=primary,
             label="result parent operation or close failed",
         )
+
+
+class _RecordDirectoryCapability:
+    """Retained record directory rooted at one canonical run descriptor."""
+
+    def __init__(
+        self,
+        *,
+        anchor_path: Path,
+        anchor_slot: _DescriptorSlot,
+        anchor_identity: tuple[int, int],
+        retained: tuple[_RetainedDirectory, ...],
+        path: Path,
+        label: str,
+    ) -> None:
+        if not retained:
+            raise ValueError("record directory requires a retained path")
+        self._anchor_path = anchor_path
+        self._anchor_slot = anchor_slot
+        self._anchor_identity = anchor_identity
+        self._retained = retained
+        self.path = path
+        self.label = label
+        self._owner_pid = os.getpid()
+        self._closed = False
+
+    def _validate_live(self) -> None:
+        _require_lease_process_healthy()
+        if self._closed:
+            raise RuntimeError(f"{self.label} capability is closed")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError(f"{self.label} capability belongs to another process")
+        try:
+            anchor_current = self._anchor_path.lstat()
+        except OSError:
+            raise ValueError(f"{self.label} anchor is unavailable") from None
+        if _stat_identity(anchor_current) != self._anchor_identity:
+            raise RuntimeError(f"{self.label} anchor name changed")
+        _validate_owned_entry(
+            anchor_current,
+            label=f"{self.label} anchor",
+            kind="directory",
+            mode=0o700,
+        )
+        _reconcile_descriptor(
+            self._anchor_slot.descriptor,
+            self._anchor_identity,
+            label=f"{self.label} anchor",
+            kind="directory",
+            mode=0o700,
+        )
+        parent_fd = self._anchor_slot.descriptor
+        for entry in self._retained:
+            _reconcile_named_descriptor_at(
+                parent_fd,
+                entry.name,
+                entry.slot.descriptor,
+                entry.identity,
+                label=self.label,
+                kind="directory",
+                mode=0o700,
+            )
+            parent_fd = entry.slot.descriptor
+
+    def inventory(self) -> tuple[str, ...]:
+        self._validate_live()
+        before = os.fstat(self._retained[-1].slot.descriptor)
+        try:
+            names = tuple(sorted(os.listdir(self._retained[-1].slot.descriptor)))
+        except OSError:
+            raise ValueError(f"{self.label} is unavailable") from None
+        after = os.fstat(self._retained[-1].slot.descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"{self.label} changed while listing")
+        self._validate_live()
+        return names
+
+    def close(self, primary: BaseException | None = None) -> None:
+        if self._closed:
+            if primary is not None:
+                raise primary
+            raise RuntimeError(f"{self.label} capability is closed")
+        self._closed = True
+        slots = tuple(
+            entry.slot for entry in reversed(self._retained)
+        ) + (self._anchor_slot,)
+        _retire_task_descriptors(
+            slots,
+            primary=primary,
+            label=f"{self.label} operation or close failed",
+        )
+
+    def __enter__(self) -> "_RecordDirectoryCapability":
+        self._validate_live()
+        return self
+
+    def __exit__(
+        self,
+        _error_type: type[BaseException] | None,
+        error: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        self.close(error)
+        return False
+
+
+def _open_anchored_record_directory(
+    *,
+    anchor_path: Path,
+    base_components: Sequence[str],
+    record_components: Sequence[str],
+    create: bool,
+    label: str,
+) -> _RecordDirectoryCapability:
+    _require_lease_process_healthy()
+    anchor_slot, anchor_identity = _open_absolute_directory_anchor(
+        anchor_path, f"{label} run root"
+    )
+    base: tuple[_RetainedDirectory, ...] = ()
+    record: tuple[_RetainedDirectory, ...] = ()
+    try:
+        _validate_owned_entry(
+            os.fstat(anchor_slot.descriptor),
+            label=f"{label} run root",
+            kind="directory",
+            mode=0o700,
+        )
+        base = _open_relative_directory_chain_at(
+            anchor_slot.descriptor,
+            base_components,
+            label=f"{label} base",
+            create=False,
+            required_mode=0o700,
+        )
+        base_fd = base[-1].slot.descriptor if base else anchor_slot.descriptor
+        record = _open_relative_directory_chain_at(
+            base_fd,
+            record_components,
+            label=label,
+            create=create,
+            required_mode=0o700,
+        )
+        retained = base + record
+        capability = _RecordDirectoryCapability(
+            anchor_path=anchor_path,
+            anchor_slot=anchor_slot,
+            anchor_identity=anchor_identity,
+            retained=retained,
+            path=anchor_path.joinpath(*base_components, *record_components),
+            label=label,
+        )
+        capability._validate_live()
+        return capability
+    except BaseException as primary:
+        slots = tuple(entry.slot for entry in reversed(base + record)) + (
+            anchor_slot,
+        )
+        _retire_task_descriptors(
+            slots,
+            primary=primary,
+            label=f"{label} acquisition or close failed",
+        )
+        raise AssertionError("record-directory acquisition produced no error")
 
 
 class RunCoordinatorLease:
@@ -3295,6 +3475,29 @@ def _validate_seal_context(
     return hashlib.sha256(canonical_config_bytes(manifest_case)).hexdigest()
 
 
+def _open_case_record_directory(
+    *,
+    paths: CasePaths,
+    components: Sequence[str],
+    create: bool,
+    label: str,
+) -> _RecordDirectoryCapability:
+    run_root = paths.root.parent.parent
+    try:
+        base_components = paths.root.relative_to(run_root).parts
+    except ValueError:
+        raise ValueError("case root escapes the run root") from None
+    if not base_components:
+        raise ValueError("case root does not name a case")
+    return _open_anchored_record_directory(
+        anchor_path=run_root,
+        base_components=base_components,
+        record_components=components,
+        create=create,
+        label=label,
+    )
+
+
 def _validate_usage(value: object, *, nullable: bool) -> dict[str, int] | None:
     if value is None:
         if nullable:
@@ -3380,28 +3583,132 @@ def _validate_attempt_identity(
         raise ValueError(f"{label} is stale or invalid")
 
 
-def _validate_attempt_directory(
+def _open_attempt_directory(
     paths: CasePaths, attempt: Literal[1, 2], *, create: bool
-) -> AttemptPaths:
+) -> tuple[AttemptPaths, _RecordDirectoryCapability]:
     attempt_paths = paths_for_attempt(paths, attempt)
-    if create:
-        _ensure_private_record_directory(paths.attempts)
-        _ensure_private_record_directory(attempt_paths.root)
-    for directory, label in (
-        (paths.attempts, "attempt root"),
-        (attempt_paths.root, "attempt directory"),
-    ):
-        try:
-            metadata = directory.lstat()
-        except OSError:
-            raise ValueError(f"{label} is unavailable") from None
-        _validate_owned_entry(
-            metadata, label=label, kind="directory", mode=0o700
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=("attempts", f"{attempt:02d}"),
+        create=create,
+        label="attempt directory",
+    )
+    inventory = directory.inventory()
+    if inventory not in ((), ("start.json",), ("start.json", "terminal.json")):
+        directory.close(
+            ValueError("attempt inventory is partial or contains extras")
         )
-    names = _directory_inventory(attempt_paths.root, "attempt directory")
-    if names not in ((), ("start.json",), ("start.json", "terminal.json")):
-        raise ValueError("attempt inventory is partial or contains extras")
-    return attempt_paths
+        raise AssertionError("attempt inventory validation produced no error")
+    return attempt_paths, directory
+
+
+def _read_attempt_start_retained(
+    *,
+    directory: _RecordDirectoryCapability,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    attempt: Literal[1, 2],
+    manifest_case_sha256: str,
+) -> tuple[dict[str, object], str]:
+    inventory = directory.inventory()
+    if inventory not in (("start.json",), ("start.json", "terminal.json")):
+        raise ValueError("attempt start inventory is invalid")
+    payload, content = _read_canonical_record_retained(
+        directory,
+        "start.json",
+        "attempt start",
+        byte_cap=MAX_ATTEMPT_START_BYTES,
+    )
+    _require_exact_field_names(payload, _ATTEMPT_START_FIELDS, "attempt start")
+    _validate_attempt_identity(
+        payload,
+        plan=plan,
+        assignment=assignment,
+        attempt=attempt,
+        manifest_case_sha256=manifest_case_sha256,
+        label="attempt start",
+    )
+    if directory.inventory() != inventory:
+        raise RuntimeError("attempt inventory changed while reading start")
+    return payload, hashlib.sha256(content).hexdigest()
+
+
+def _read_attempt_seal_retained(
+    *,
+    directory: _RecordDirectoryCapability,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    attempt: Literal[1, 2],
+    manifest_case_sha256: str,
+) -> AttemptSeal:
+    inventory = directory.inventory()
+    if inventory != ("start.json", "terminal.json"):
+        raise ValueError("attempt seal inventory is incomplete")
+    start, start_sha256 = _read_attempt_start_retained(
+        directory=directory,
+        plan=plan,
+        assignment=assignment,
+        attempt=attempt,
+        manifest_case_sha256=manifest_case_sha256,
+    )
+    terminal, terminal_content = _read_canonical_record_retained(
+        directory,
+        "terminal.json",
+        "attempt terminal",
+        byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
+    )
+    _require_exact_field_names(
+        terminal, _ATTEMPT_TERMINAL_FIELDS, "attempt terminal"
+    )
+    _validate_attempt_identity(
+        terminal,
+        plan=plan,
+        assignment=assignment,
+        attempt=attempt,
+        manifest_case_sha256=manifest_case_sha256,
+        label="attempt terminal",
+    )
+    status = terminal.get("status")
+    classification = terminal.get("classification")
+    if status not in ("success", "failed") or classification not in _OUTCOME_CLASSES:
+        raise ValueError("attempt terminal status is invalid")
+    if type(terminal.get("model_started")) is not bool or type(
+        terminal.get("cleanup_passed")
+    ) is not bool:
+        raise ValueError("attempt terminal booleans are invalid")
+    if terminal.get("start_sha256") != start_sha256:
+        raise ValueError("attempt terminal start hash differs")
+    usage = _validate_usage(terminal.get("usage"), nullable=status == "failed")
+    failure = _validate_failure(
+        terminal.get("failure"),
+        classification=classification,
+        nullable=status == "success",
+    )
+    tombstone_sha256 = terminal.get("tombstone_receipt_sha256")
+    if tombstone_sha256 is not None and not _is_sha256(tombstone_sha256):
+        raise ValueError("attempt terminal tombstone hash is invalid")
+    if status == "success":
+        if (
+            classification != "success"
+            or terminal.get("model_started") is not True
+            or terminal.get("cleanup_passed") is not True
+            or usage is None
+            or failure is not None
+            or tombstone_sha256 is None
+        ):
+            raise ValueError("successful attempt terminal is invalid")
+    elif classification == "success" or failure is None:
+        raise ValueError("failed attempt terminal is invalid")
+    if terminal.get("cleanup_passed") is True and tombstone_sha256 is None:
+        raise ValueError("clean attempt terminal requires a tombstone hash")
+    if directory.inventory() != inventory:
+        raise RuntimeError("attempt inventory changed while reading seal")
+    return AttemptSeal(
+        start=start,
+        terminal=terminal,
+        start_sha256=start_sha256,
+        terminal_sha256=hashlib.sha256(terminal_content).hexdigest(),
+    )
 
 
 def write_attempt_start(
@@ -3420,7 +3727,6 @@ def write_attempt_start(
         assignment=assignment,
         manifest_case=manifest_case,
     )
-    attempt_paths = _validate_attempt_directory(paths, attempt, create=True)
     payload = {
         "schema_version": 1,
         "epoch_id": plan.epoch_id,
@@ -3432,23 +3738,31 @@ def write_attempt_start(
         "manifest_sha256": assignment.manifest_sha256,
         "manifest_case_sha256": manifest_case_sha256,
     }
-    if attempt_paths.start.exists() or attempt_paths.start.is_symlink():
-        existing, _ = read_attempt_start(
-            plan=plan,
-            paths=paths,
-            assignment=assignment,
-            attempt=attempt,
-            manifest_case=manifest_case,
-        )
-        if existing != payload:
-            raise ValueError("attempt start already differs")
-        return attempt_paths.start
-    if _directory_inventory(attempt_paths.root, "attempt directory"):
-        raise ValueError("attempt start cannot heal a partial inventory")
-    _publish_immutable_json(
-        attempt_paths.start, payload, byte_cap=MAX_ATTEMPT_START_BYTES
+    attempt_paths, directory = _open_attempt_directory(
+        paths, attempt, create=True
     )
-    return attempt_paths.start
+    with directory:
+        inventory = directory.inventory()
+        if "start.json" in inventory:
+            existing, _ = _read_attempt_start_retained(
+                directory=directory,
+                plan=plan,
+                assignment=assignment,
+                attempt=attempt,
+                manifest_case_sha256=manifest_case_sha256,
+            )
+            if existing != payload:
+                raise ValueError("attempt start already differs")
+            return attempt_paths.start
+        if inventory:
+            raise ValueError("attempt start cannot heal a partial inventory")
+        _publish_immutable_json_retained(
+            directory,
+            "start.json",
+            payload,
+            byte_cap=MAX_ATTEMPT_START_BYTES,
+        )
+        return attempt_paths.start
 
 
 def read_attempt_start(
@@ -3467,27 +3781,15 @@ def read_attempt_start(
         assignment=assignment,
         manifest_case=manifest_case,
     )
-    attempt_paths = _validate_attempt_directory(paths, attempt, create=False)
-    inventory = _directory_inventory(attempt_paths.root, "attempt directory")
-    if inventory not in (("start.json",), ("start.json", "terminal.json")):
-        raise ValueError("attempt start inventory is invalid")
-    payload, content = _read_canonical_record(
-        attempt_paths.start,
-        "attempt start",
-        byte_cap=MAX_ATTEMPT_START_BYTES,
-    )
-    if len(content) > MAX_ATTEMPT_START_BYTES:
-        raise ValueError("attempt start exceeds its byte cap")
-    _require_exact_field_names(payload, _ATTEMPT_START_FIELDS, "attempt start")
-    _validate_attempt_identity(
-        payload,
-        plan=plan,
-        assignment=assignment,
-        attempt=attempt,
-        manifest_case_sha256=manifest_case_sha256,
-        label="attempt start",
-    )
-    return payload, hashlib.sha256(content).hexdigest()
+    _, directory = _open_attempt_directory(paths, attempt, create=False)
+    with directory:
+        return _read_attempt_start_retained(
+            directory=directory,
+            plan=plan,
+            assignment=assignment,
+            attempt=attempt,
+            manifest_case_sha256=manifest_case_sha256,
+        )
 
 
 def write_attempt_terminal(
@@ -3527,59 +3829,68 @@ def write_attempt_terminal(
             raise ValueError("successful attempt terminal is invalid")
     elif classification == "success" or validated_failure is None:
         raise ValueError("failed attempt terminal is invalid")
-    start, start_sha256 = read_attempt_start(
+    manifest_case_sha256 = _validate_seal_context(
         plan=plan,
         paths=paths,
         assignment=assignment,
-        attempt=attempt,
         manifest_case=manifest_case,
     )
-    attempt_paths = _validate_attempt_directory(paths, attempt, create=False)
-    tombstone_path = paths.cleanup / "tombstone.json"
-    if cleanup_passed or tombstone_path.exists() or tombstone_path.is_symlink():
-        verified_receipt = read_verified_tombstone_receipt(
-            plan=plan, assignment=assignment, paths=paths
-        )
-        tombstone_sha256: str | None = verified_receipt.sha256
-    else:
-        tombstone_sha256 = None
-    if cleanup_passed and tombstone_sha256 is None:
-        raise ValueError("clean attempt terminal requires a tombstone receipt")
-    payload = {
-        **start,
-        "start_sha256": start_sha256,
-        "status": status,
-        "classification": classification,
-        "model_started": model_started,
-        "cleanup_passed": cleanup_passed,
-        "usage": validated_usage,
-        "failure": validated_failure,
-        "tombstone_receipt_sha256": tombstone_sha256,
-    }
-    content = canonical_config_bytes(payload)
-    if len(content) > MAX_ATTEMPT_TERMINAL_BYTES:
-        raise ValueError("attempt terminal exceeds its byte cap")
-    if attempt_paths.terminal.exists() or attempt_paths.terminal.is_symlink():
-        seal = read_attempt_seal(
+    attempt_paths, directory = _open_attempt_directory(
+        paths, attempt, create=False
+    )
+    with directory:
+        start, start_sha256 = _read_attempt_start_retained(
+            directory=directory,
             plan=plan,
-            paths=paths,
             assignment=assignment,
             attempt=attempt,
-            manifest_case=manifest_case,
+            manifest_case_sha256=manifest_case_sha256,
         )
-        if seal.terminal != payload:
-            raise ValueError("attempt terminal already differs")
+        verified_receipt = _read_verified_tombstone_receipt(
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+            required=cleanup_passed,
+        )
+        tombstone_sha256 = (
+            verified_receipt.sha256 if verified_receipt is not None else None
+        )
+        if cleanup_passed and tombstone_sha256 is None:
+            raise ValueError("clean attempt terminal requires a tombstone receipt")
+        payload = {
+            **start,
+            "start_sha256": start_sha256,
+            "status": status,
+            "classification": classification,
+            "model_started": model_started,
+            "cleanup_passed": cleanup_passed,
+            "usage": validated_usage,
+            "failure": validated_failure,
+            "tombstone_receipt_sha256": tombstone_sha256,
+        }
+        if len(canonical_config_bytes(payload)) > MAX_ATTEMPT_TERMINAL_BYTES:
+            raise ValueError("attempt terminal exceeds its byte cap")
+        inventory = directory.inventory()
+        if "terminal.json" in inventory:
+            seal = _read_attempt_seal_retained(
+                directory=directory,
+                plan=plan,
+                assignment=assignment,
+                attempt=attempt,
+                manifest_case_sha256=manifest_case_sha256,
+            )
+            if seal.terminal != payload:
+                raise ValueError("attempt terminal already differs")
+            return attempt_paths.terminal
+        if inventory != ("start.json",):
+            raise ValueError("attempt terminal cannot heal a partial inventory")
+        _publish_immutable_json_retained(
+            directory,
+            "terminal.json",
+            payload,
+            byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
+        )
         return attempt_paths.terminal
-    if _directory_inventory(attempt_paths.root, "attempt directory") != (
-        "start.json",
-    ):
-        raise ValueError("attempt terminal cannot heal a partial inventory")
-    _publish_immutable_json(
-        attempt_paths.terminal,
-        payload,
-        byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
-    )
-    return attempt_paths.terminal
 
 
 def read_attempt_seal(
@@ -3590,81 +3901,23 @@ def read_attempt_seal(
     attempt: Literal[1, 2],
     manifest_case: dict[str, object],
 ) -> AttemptSeal:
-    start, start_sha256 = read_attempt_start(
+    if type(attempt) is not int or attempt not in (1, 2):
+        raise ValueError("attempt must be exactly 1 or 2")
+    manifest_case_sha256 = _validate_seal_context(
         plan=plan,
         paths=paths,
         assignment=assignment,
-        attempt=attempt,
         manifest_case=manifest_case,
     )
-    attempt_paths = _validate_attempt_directory(paths, attempt, create=False)
-    if _directory_inventory(attempt_paths.root, "attempt directory") != (
-        "start.json",
-        "terminal.json",
-    ):
-        raise ValueError("attempt seal inventory is incomplete")
-    manifest_case_sha256 = hashlib.sha256(
-        canonical_config_bytes(manifest_case)
-    ).hexdigest()
-    terminal, terminal_content = _read_canonical_record(
-        attempt_paths.terminal,
-        "attempt terminal",
-        byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
-    )
-    if len(terminal_content) > MAX_ATTEMPT_TERMINAL_BYTES:
-        raise ValueError("attempt terminal exceeds its byte cap")
-    _require_exact_field_names(
-        terminal, _ATTEMPT_TERMINAL_FIELDS, "attempt terminal"
-    )
-    _validate_attempt_identity(
-        terminal,
-        plan=plan,
-        assignment=assignment,
-        attempt=attempt,
-        manifest_case_sha256=manifest_case_sha256,
-        label="attempt terminal",
-    )
-    status = terminal.get("status")
-    classification = terminal.get("classification")
-    if status not in ("success", "failed") or classification not in _OUTCOME_CLASSES:
-        raise ValueError("attempt terminal status is invalid")
-    if type(terminal.get("model_started")) is not bool or type(
-        terminal.get("cleanup_passed")
-    ) is not bool:
-        raise ValueError("attempt terminal booleans are invalid")
-    if terminal.get("start_sha256") != start_sha256:
-        raise ValueError("attempt terminal start hash differs")
-    usage = _validate_usage(
-        terminal.get("usage"), nullable=status == "failed"
-    )
-    failure = _validate_failure(
-        terminal.get("failure"),
-        classification=classification,
-        nullable=status == "success",
-    )
-    tombstone_sha256 = terminal.get("tombstone_receipt_sha256")
-    if tombstone_sha256 is not None and not _is_sha256(tombstone_sha256):
-        raise ValueError("attempt terminal tombstone hash is invalid")
-    if status == "success":
-        if (
-            classification != "success"
-            or terminal.get("model_started") is not True
-            or terminal.get("cleanup_passed") is not True
-            or usage is None
-            or failure is not None
-            or tombstone_sha256 is None
-        ):
-            raise ValueError("successful attempt terminal is invalid")
-    elif classification == "success" or failure is None:
-        raise ValueError("failed attempt terminal is invalid")
-    if terminal.get("cleanup_passed") is True and tombstone_sha256 is None:
-        raise ValueError("clean attempt terminal requires a tombstone hash")
-    return AttemptSeal(
-        start=start,
-        terminal=terminal,
-        start_sha256=start_sha256,
-        terminal_sha256=hashlib.sha256(terminal_content).hexdigest(),
-    )
+    _, directory = _open_attempt_directory(paths, attempt, create=False)
+    with directory:
+        return _read_attempt_seal_retained(
+            directory=directory,
+            plan=plan,
+            assignment=assignment,
+            attempt=attempt,
+            manifest_case_sha256=manifest_case_sha256,
+        )
 
 
 def _validate_result_record(
@@ -3706,41 +3959,40 @@ def _validate_result_record(
     ):
         raise ValueError("case result final statuses are invalid")
     checkpoints = result.get("record_checkpoints")
-    if checkpoints is not None:
-        if type(checkpoints) is not list:
-            raise ValueError("case result checkpoints are invalid")
-        for checkpoint in checkpoints:
+    if type(checkpoints) is not list:
+        raise ValueError("case result checkpoints are invalid")
+    for checkpoint in checkpoints:
+        _require_exact_field_names(
+            checkpoint, CHECKPOINT_FIELDS, "result checkpoint"
+        )
+        if type(checkpoint.get("after_turn")) is not int:
+            raise ValueError("result checkpoint turn is invalid")
+        records = checkpoint.get("records")
+        if type(records) is not list:
+            raise ValueError("result checkpoint records are invalid")
+        for record in records:
             _require_exact_field_names(
-                checkpoint, CHECKPOINT_FIELDS, "result checkpoint"
+                record, NORMALIZED_RECORD_FIELDS, "normalized record"
             )
-            if type(checkpoint.get("after_turn")) is not int:
-                raise ValueError("result checkpoint turn is invalid")
-            records = checkpoint.get("records")
-            if type(records) is not list:
-                raise ValueError("result checkpoint records are invalid")
-            for record in records:
-                _require_exact_field_names(
-                    record, NORMALIZED_RECORD_FIELDS, "normalized record"
-                )
-                if (
-                    type(record.get("role")) is not str
-                    or _RECORD_ROLE_PATTERN.fullmatch(record["role"]) is None
-                    or type(record.get("status")) is not str
-                    or not record["status"].strip()
-                    or type(record.get("start_mode")) is not str
-                    or not record["start_mode"].strip()
-                    or (
-                        record.get("superseded_by_role") is not None
-                        and (
-                            type(record["superseded_by_role"]) is not str
-                            or _RECORD_ROLE_PATTERN.fullmatch(
-                                record["superseded_by_role"]
-                            )
-                            is None
+            if (
+                type(record.get("role")) is not str
+                or _RECORD_ROLE_PATTERN.fullmatch(record["role"]) is None
+                or type(record.get("status")) is not str
+                or not record["status"].strip()
+                or type(record.get("start_mode")) is not str
+                or not record["start_mode"].strip()
+                or (
+                    record.get("superseded_by_role") is not None
+                    and (
+                        type(record["superseded_by_role"]) is not str
+                        or _RECORD_ROLE_PATTERN.fullmatch(
+                            record["superseded_by_role"]
                         )
+                        is None
                     )
-                ):
-                    raise ValueError("normalized record is invalid")
+                )
+            ):
+                raise ValueError("normalized record is invalid")
     if assignment.key.mode == "forward":
         decisions = result.get("decisions")
         if type(decisions) is not list:
@@ -3961,6 +4213,110 @@ def _decode_shard_terminal(
     )
 
 
+def _read_canonical_record_retained(
+    directory: _RecordDirectoryCapability,
+    name: str,
+    label: str,
+    *,
+    byte_cap: int,
+) -> tuple[dict[str, object], bytes]:
+    directory._validate_live()
+    parent_slot = directory._retained[-1].slot
+    parent_before = os.fstat(parent_slot.descriptor)
+    result = _read_canonical_record_at(
+        parent_slot=parent_slot,
+        parent_path=directory.path,
+        parent_before=parent_before,
+        name=name,
+        label=label,
+        byte_cap=byte_cap,
+    )
+    directory._validate_live()
+    return result
+
+
+def _publish_immutable_json_retained(
+    directory: _RecordDirectoryCapability,
+    name: str,
+    payload: Mapping[str, Any],
+    *,
+    byte_cap: int,
+) -> bytes:
+    _require_lease_process_healthy()
+    if type(name) is not str or not name or "/" in name or name in {".", ".."}:
+        raise ValueError("record name is invalid")
+    content = canonical_config_bytes(payload)
+    if len(content) > byte_cap:
+        raise ValueError(f"{name} exceeds its byte cap")
+    directory._validate_live()
+    parent_slot = directory._retained[-1].slot
+    temporary_name = f".{name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
+    temporary_slot: _DescriptorSlot | None = None
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= _required_os_flag("O_NOFOLLOW") | getattr(os, "O_CLOEXEC", 0)
+        temporary_descriptor = os.open(
+            temporary_name, flags, 0o600, dir_fd=parent_slot.descriptor
+        )
+        temporary_slot = _DescriptorSlot(temporary_descriptor)
+        os.fchmod(temporary_slot.descriptor, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(temporary_slot.descriptor, view)
+            if written <= 0:
+                raise OSError("record write made no progress")
+            view = view[written:]
+        os.fsync(temporary_slot.descriptor)
+    except BaseException as error:
+        primary = error
+
+    close_error = None
+    if temporary_slot is not None:
+        close_error = _retire_descriptor_capability(temporary_slot)
+    if close_error is not None:
+        _raise_task_failures(
+            primary=primary,
+            close_errors=[close_error],
+            label="record temp write or close failed",
+        )
+    if primary is None:
+        try:
+            directory._validate_live()
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent_slot.descriptor,
+                dst_dir_fd=parent_slot.descriptor,
+                follow_symlinks=False,
+            )
+            os.fsync(parent_slot.descriptor)
+            os.unlink(temporary_name, dir_fd=parent_slot.descriptor)
+            os.fsync(parent_slot.descriptor)
+            directory._validate_live()
+        except FileExistsError:
+            primary = ValueError(f"{name} already exists")
+        except BaseException as error:
+            primary = error
+    if primary is not None and not is_indeterminate_descriptor_close(primary):
+        try:
+            os.unlink(temporary_name, dir_fd=parent_slot.descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            cleanup_errors.append(error)
+    _raise_ordered_failures(
+        "record publication or cleanup failed", primary, cleanup_errors
+    )
+    durable, durable_content = _read_canonical_record_retained(
+        directory, name, name, byte_cap=byte_cap
+    )
+    if durable != payload or durable_content != content:
+        raise ValueError(f"{name} durable readback differs")
+    return durable_content
+
+
 def _ensure_private_record_directory(path: Path) -> None:
     try:
         path.mkdir(mode=0o700)
@@ -4171,133 +4527,145 @@ def seal_case(
     }
     if len(canonical_config_bytes(commit)) > MAX_CASE_COMMIT_BYTES:
         raise ValueError("case commit exceeds its byte cap")
-    _ensure_private_record_directory(paths.sealed)
-    inventory = _directory_inventory(paths.sealed, "case seal directory")
-    if inventory:
-        expected_inventory = (
-            (
-                "case-commit.json",
-                "case-evidence.json",
-                "case-result.json",
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=("sealed",),
+        create=True,
+        label="case seal directory",
+    )
+    with directory:
+        inventory = directory.inventory()
+        if inventory:
+            expected_inventory = (
+                (
+                    "case-commit.json",
+                    "case-evidence.json",
+                    "case-result.json",
+                )
+                if result_payload is not None
+                else ("case-commit.json", "case-evidence.json")
             )
-            if result_payload is not None
-            else ("case-commit.json", "case-evidence.json")
+            if inventory != expected_inventory:
+                raise ValueError("case seal inventory is partial or contains extras")
+            existing = _read_case_seal_retained(
+                directory=directory,
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+                manifest_case_sha256=manifest_case_sha256,
+            )
+            if (
+                existing.result != result_payload
+                or existing.evidence != stored_evidence
+                or existing.commit != commit
+            ):
+                raise ValueError("case seal already differs")
+            return paths.sealed / "case-commit.json"
+        if result_payload is not None:
+            _publish_immutable_json_retained(
+                directory,
+                "case-result.json",
+                result_payload,
+                byte_cap=MAX_CASE_RESULT_BYTES,
+            )
+            _invoke_fault(fault_injector, "after-result-replace")
+        _publish_immutable_json_retained(
+            directory,
+            "case-evidence.json",
+            stored_evidence,
+            byte_cap=MAX_CASE_EVIDENCE_BYTES,
         )
-        if inventory != expected_inventory:
-            raise ValueError("case seal inventory is partial or contains extras")
-        existing = read_case_seal(
+        _invoke_fault(fault_injector, "after-evidence-replace")
+        if result_payload is not None:
+            durable_result, durable_result_content = (
+                _read_canonical_record_retained(
+                    directory,
+                    "case-result.json",
+                    "case result",
+                    byte_cap=MAX_CASE_RESULT_BYTES,
+                )
+            )
+            if (
+                durable_result != result_payload
+                or durable_result_content != result_content
+            ):
+                raise ValueError("case result changed before commit")
+        durable_evidence, durable_evidence_content = (
+            _read_canonical_record_retained(
+                directory,
+                "case-evidence.json",
+                "case evidence",
+                byte_cap=MAX_CASE_EVIDENCE_BYTES,
+            )
+        )
+        if (
+            durable_evidence != stored_evidence
+            or durable_evidence_content != evidence_content
+        ):
+            raise ValueError("case evidence changed before commit")
+        durable_attempt = read_attempt_seal(
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=attempt,
+            manifest_case=manifest_case,
+        )
+        if (
+            durable_attempt.start_sha256 != attempt_seal.start_sha256
+            or durable_attempt.terminal_sha256 != attempt_seal.terminal_sha256
+        ):
+            raise ValueError("attempt changed before case commit")
+        durable_receipt = _read_optional_verified_tombstone_receipt(
+            plan=plan, assignment=assignment, paths=paths
+        )
+        durable_receipt_sha256 = (
+            durable_receipt.sha256 if durable_receipt is not None else None
+        )
+        if durable_receipt_sha256 != verified_receipt_sha256:
+            raise ValueError("tombstone changed before case commit")
+        directory._validate_live()
+        _invoke_fault(fault_injector, "before-case-commit")
+        _publish_immutable_json_retained(
+            directory,
+            "case-commit.json",
+            commit,
+            byte_cap=MAX_CASE_COMMIT_BYTES,
+        )
+        sealed = _read_case_seal_retained(
+            directory=directory,
             plan=plan,
             paths=paths,
             assignment=assignment,
             manifest_case=manifest_case,
+            manifest_case_sha256=manifest_case_sha256,
         )
-        if (
-            existing.result != result_payload
-            or existing.evidence != stored_evidence
-            or existing.commit != commit
-        ):
-            raise ValueError("case seal already differs")
+        if sealed.commit != commit:
+            raise ValueError("case seal durable readback differs")
+        _invoke_fault(fault_injector, "after-case-commit")
+        directory._validate_live()
         return paths.sealed / "case-commit.json"
-    if result_payload is not None:
-        _publish_immutable_json(
-            paths.sealed / "case-result.json",
-            result_payload,
-            byte_cap=MAX_CASE_RESULT_BYTES,
-        )
-        _invoke_fault(fault_injector, "after-result-replace")
-    _publish_immutable_json(
-        paths.sealed / "case-evidence.json",
-        stored_evidence,
-        byte_cap=MAX_CASE_EVIDENCE_BYTES,
-    )
-    _invoke_fault(fault_injector, "after-evidence-replace")
-    if result_payload is not None:
-        durable_result, durable_result_content = _read_canonical_record(
-            paths.sealed / "case-result.json",
-            "case result",
-            byte_cap=MAX_CASE_RESULT_BYTES,
-        )
-        if (
-            durable_result != result_payload
-            or durable_result_content != result_content
-        ):
-            raise ValueError("case result changed before commit")
-    durable_evidence, durable_evidence_content = _read_canonical_record(
-        paths.sealed / "case-evidence.json",
-        "case evidence",
-        byte_cap=MAX_CASE_EVIDENCE_BYTES,
-    )
-    if (
-        durable_evidence != stored_evidence
-        or durable_evidence_content != evidence_content
-    ):
-        raise ValueError("case evidence changed before commit")
-    durable_attempt = read_attempt_seal(
-        plan=plan,
-        paths=paths,
-        assignment=assignment,
-        attempt=attempt,
-        manifest_case=manifest_case,
-    )
-    if (
-        durable_attempt.start_sha256 != attempt_seal.start_sha256
-        or durable_attempt.terminal_sha256 != attempt_seal.terminal_sha256
-    ):
-        raise ValueError("attempt changed before case commit")
-    durable_receipt = _read_optional_verified_tombstone_receipt(
-        plan=plan, assignment=assignment, paths=paths
-    )
-    durable_receipt_sha256 = (
-        durable_receipt.sha256 if durable_receipt is not None else None
-    )
-    if durable_receipt_sha256 != verified_receipt_sha256:
-        raise ValueError("tombstone changed before case commit")
-    _invoke_fault(fault_injector, "before-case-commit")
-    _publish_immutable_json(
-        paths.sealed / "case-commit.json",
-        commit,
-        byte_cap=MAX_CASE_COMMIT_BYTES,
-    )
-    sealed = read_case_seal(
-        plan=plan,
-        paths=paths,
-        assignment=assignment,
-        manifest_case=manifest_case,
-    )
-    if sealed.commit != commit:
-        raise ValueError("case seal durable readback differs")
-    _invoke_fault(fault_injector, "after-case-commit")
-    return paths.sealed / "case-commit.json"
 
 
-def read_case_seal(
+def _read_case_seal_retained(
     *,
+    directory: _RecordDirectoryCapability,
     plan: EpochPlan,
     paths: CasePaths,
     assignment: CaseAssignment,
     manifest_case: dict[str, object],
+    manifest_case_sha256: str,
 ) -> CaseSeal:
-    manifest_case_sha256 = _validate_seal_context(
-        plan=plan,
-        paths=paths,
-        assignment=assignment,
-        manifest_case=manifest_case,
-    )
-    try:
-        metadata = paths.sealed.lstat()
-    except OSError:
-        raise ValueError("case seal directory is unavailable") from None
-    _validate_owned_entry(
-        metadata, label="case seal directory", kind="directory", mode=0o700
-    )
-    names = set(_directory_inventory(paths.sealed, "case seal directory"))
+    inventory = directory.inventory()
+    names = set(inventory)
     if names not in (
         {"case-evidence.json", "case-commit.json"},
         {"case-result.json", "case-evidence.json", "case-commit.json"},
     ):
         raise ValueError("case seal inventory is partial or contains extras")
-    commit, commit_content = _read_canonical_record(
-        paths.sealed / "case-commit.json",
+    commit, commit_content = _read_canonical_record_retained(
+        directory,
+        "case-commit.json",
         "case commit",
         byte_cap=MAX_CASE_COMMIT_BYTES,
     )
@@ -4335,8 +4703,9 @@ def read_case_seal(
         or commit.get("status") != attempt_seal.terminal.get("status")
     ):
         raise ValueError("case commit attempt binding differs")
-    evidence, evidence_content = _read_canonical_record(
-        paths.sealed / "case-evidence.json",
+    evidence, evidence_content = _read_canonical_record_retained(
+        directory,
+        "case-evidence.json",
         "case evidence",
         byte_cap=MAX_CASE_EVIDENCE_BYTES,
     )
@@ -4357,8 +4726,9 @@ def read_case_seal(
     elif result_file == "case-result.json" and _is_sha256(result_sha256):
         if "case-result.json" not in names:
             raise ValueError("case result is missing")
-        result, result_content = _read_canonical_record(
-            paths.sealed / "case-result.json",
+        result, result_content = _read_canonical_record_retained(
+            directory,
+            "case-result.json",
             "case result",
             byte_cap=MAX_CASE_RESULT_BYTES,
         )
@@ -4399,6 +4769,8 @@ def read_case_seal(
         and (result is None or verified_receipt is None)
     ):
         raise ValueError("clean case seal is incomplete")
+    if directory.inventory() != inventory:
+        raise RuntimeError("case seal inventory changed while reading")
     return CaseSeal(
         result=result,
         evidence=evidence,
@@ -4408,6 +4780,36 @@ def read_case_seal(
         commit_sha256=hashlib.sha256(commit_content).hexdigest(),
         tombstone_receipt_sha256=verified_receipt_sha256,
     )
+
+
+def read_case_seal(
+    *,
+    plan: EpochPlan,
+    paths: CasePaths,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
+) -> CaseSeal:
+    manifest_case_sha256 = _validate_seal_context(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=("sealed",),
+        create=False,
+        label="case seal directory",
+    )
+    with directory:
+        return _read_case_seal_retained(
+            directory=directory,
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            manifest_case=manifest_case,
+            manifest_case_sha256=manifest_case_sha256,
+        )
 
 
 _SHARD_COMMIT_FIELDS = frozenset(
@@ -4610,6 +5012,85 @@ def _validate_shard_terminals(
     return status, frozen
 
 
+def _open_shard_record_directory(
+    *,
+    worker_root: Path,
+    run_root: Path,
+    create: bool,
+) -> _RecordDirectoryCapability:
+    try:
+        worker_components = worker_root.relative_to(run_root).parts
+    except ValueError:
+        raise ValueError("worker root escapes the run root") from None
+    if not worker_components:
+        raise ValueError("worker root does not name a worker")
+    return _open_anchored_record_directory(
+        anchor_path=run_root,
+        base_components=worker_components,
+        record_components=("sealed",),
+        create=create,
+        label="shard seal directory",
+    )
+
+
+def _read_shard_seal_retained(
+    *,
+    directory: _RecordDirectoryCapability,
+    plan: EpochPlan,
+    lane: LaneName,
+    assignments: tuple[CaseAssignment, ...],
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    case_paths: dict[CaseKey, CasePaths],
+) -> tuple[ShardSeal, dict[str, object]]:
+    inventory = directory.inventory()
+    if inventory != ("shard-commit.json",):
+        raise ValueError("shard seal inventory is incomplete")
+    payload, content = _read_canonical_record_retained(
+        directory,
+        "shard-commit.json",
+        "shard commit",
+        byte_cap=MAX_SHARD_COMMIT_BYTES,
+    )
+    _require_exact_field_names(payload, _SHARD_COMMIT_FIELDS, "shard commit")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or type(payload.get("epoch_id")) is not str
+        or payload.get("epoch_id") != plan.epoch_id
+        or type(payload.get("run_kind")) is not str
+        or payload.get("run_kind") != plan.run_kind
+        or type(payload.get("lane")) is not str
+        or payload.get("lane") != lane
+        or type(payload.get("status")) is not str
+        or payload.get("status") not in ("success", "failed")
+        or type(payload.get("terminals")) is not list
+    ):
+        raise ValueError("shard commit identity is invalid")
+    terminals = tuple(
+        _decode_shard_terminal(terminal, run_kind=plan.run_kind)
+        for terminal in payload["terminals"]
+    )
+    status, validated = _validate_shard_terminals(
+        plan=plan,
+        assignments=assignments,
+        terminals=terminals,
+        manifests=manifests,
+        case_paths=case_paths,
+    )
+    if status != payload["status"]:
+        raise ValueError("shard commit status differs from terminals")
+    if directory.inventory() != inventory:
+        raise RuntimeError("shard seal inventory changed while reading")
+    return (
+        ShardSeal(
+            status=status,
+            terminals=validated,
+            commit_sha256=hashlib.sha256(content).hexdigest(),
+        ),
+        payload,
+    )
+
+
 def seal_shard(
     *,
     worker_root: Path,
@@ -4648,41 +5129,53 @@ def seal_shard(
     }
     if len(canonical_config_bytes(payload)) > MAX_SHARD_COMMIT_BYTES:
         raise ValueError("shard commit exceeds its byte cap")
+    run_root = next(iter(frozen_paths.values())).root.parent.parent
     sealed_root = worker_root / "sealed"
-    _ensure_private_record_directory(sealed_root)
-    inventory = _directory_inventory(sealed_root, "shard seal directory")
     commit_path = sealed_root / "shard-commit.json"
-    if inventory:
-        if inventory != ("shard-commit.json",):
-            raise ValueError("shard seal inventory is partial or contains extras")
-        existing = read_shard_seal(
-            worker_root=worker_root,
+    directory = _open_shard_record_directory(
+        worker_root=worker_root, run_root=run_root, create=True
+    )
+    with directory:
+        inventory = directory.inventory()
+        if inventory:
+            if inventory != ("shard-commit.json",):
+                raise ValueError(
+                    "shard seal inventory is partial or contains extras"
+                )
+            existing, existing_payload = _read_shard_seal_retained(
+                directory=directory,
+                plan=plan,
+                lane=lane,
+                assignments=assignments,
+                manifests=manifests,
+                case_paths=frozen_paths,
+            )
+            if (
+                existing_payload != payload
+                or existing.terminals != frozen_terminals
+            ):
+                raise ValueError("shard commit already differs")
+            return commit_path
+        _invoke_fault(fault_injector, "before-shard-commit")
+        _publish_immutable_json_retained(
+            directory,
+            "shard-commit.json",
+            payload,
+            byte_cap=MAX_SHARD_COMMIT_BYTES,
+        )
+        readback, _ = _read_shard_seal_retained(
+            directory=directory,
             plan=plan,
             lane=lane,
+            assignments=assignments,
             manifests=manifests,
             case_paths=frozen_paths,
         )
-        existing_payload, _ = _read_canonical_record(
-            commit_path, "shard commit", byte_cap=MAX_SHARD_COMMIT_BYTES
-        )
-        if existing_payload != payload or existing.terminals != frozen_terminals:
-            raise ValueError("shard commit already differs")
+        if readback.terminals != frozen_terminals or readback.status != status:
+            raise ValueError("shard seal durable readback differs")
+        _invoke_fault(fault_injector, "after-shard-commit")
+        directory._validate_live()
         return commit_path
-    _invoke_fault(fault_injector, "before-shard-commit")
-    _publish_immutable_json(
-        commit_path, payload, byte_cap=MAX_SHARD_COMMIT_BYTES
-    )
-    readback = read_shard_seal(
-        worker_root=worker_root,
-        plan=plan,
-        lane=lane,
-        manifests=manifests,
-        case_paths=frozen_paths,
-    )
-    if readback.terminals != frozen_terminals or readback.status != status:
-        raise ValueError("shard seal durable readback differs")
-    _invoke_fault(fault_injector, "after-shard-commit")
-    return commit_path
 
 
 def read_shard_seal(
@@ -4700,58 +5193,20 @@ def read_shard_seal(
         manifests=manifests,
         case_paths=case_paths,
     )
-    sealed_root = worker_root / "sealed"
-    try:
-        metadata = sealed_root.lstat()
-    except OSError:
-        raise ValueError("shard seal directory is unavailable") from None
-    _validate_owned_entry(
-        metadata, label="shard seal directory", kind="directory", mode=0o700
+    run_root = next(iter(frozen_paths.values())).root.parent.parent
+    directory = _open_shard_record_directory(
+        worker_root=worker_root, run_root=run_root, create=False
     )
-    if _directory_inventory(sealed_root, "shard seal directory") != (
-        "shard-commit.json",
-    ):
-        raise ValueError("shard seal inventory is incomplete")
-    payload, content = _read_canonical_record(
-        sealed_root / "shard-commit.json",
-        "shard commit",
-        byte_cap=MAX_SHARD_COMMIT_BYTES,
-    )
-    if len(content) > MAX_SHARD_COMMIT_BYTES:
-        raise ValueError("shard commit exceeds its byte cap")
-    _require_exact_field_names(payload, _SHARD_COMMIT_FIELDS, "shard commit")
-    if (
-        type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 1
-        or type(payload.get("epoch_id")) is not str
-        or payload.get("epoch_id") != plan.epoch_id
-        or type(payload.get("run_kind")) is not str
-        or payload.get("run_kind") != plan.run_kind
-        or type(payload.get("lane")) is not str
-        or payload.get("lane") != lane
-        or type(payload.get("status")) is not str
-        or payload.get("status") not in ("success", "failed")
-        or type(payload.get("terminals")) is not list
-    ):
-        raise ValueError("shard commit identity is invalid")
-    terminals = tuple(
-        _decode_shard_terminal(terminal, run_kind=plan.run_kind)
-        for terminal in payload["terminals"]
-    )
-    status, validated = _validate_shard_terminals(
-        plan=plan,
-        assignments=assignments,
-        terminals=terminals,
-        manifests=manifests,
-        case_paths=frozen_paths,
-    )
-    if status != payload["status"]:
-        raise ValueError("shard commit status differs from terminals")
-    return ShardSeal(
-        status=status,
-        terminals=validated,
-        commit_sha256=hashlib.sha256(content).hexdigest(),
-    )
+    with directory:
+        seal, _ = _read_shard_seal_retained(
+            directory=directory,
+            plan=plan,
+            lane=lane,
+            assignments=assignments,
+            manifests=manifests,
+            case_paths=frozen_paths,
+        )
+        return seal
 
 
 FROZEN_LANE_CASES: tuple[tuple[LaneName, tuple[CaseKey, ...]], ...] = (
