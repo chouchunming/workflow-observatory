@@ -2920,6 +2920,39 @@ def _tombstone_receipt_from_payload(
     return receipt
 
 
+def _verified_tombstone_receipt_from_records(
+    *,
+    ownership: CaseAuthOwnership,
+    ownership_bytes: bytes,
+    payload: dict[str, object],
+    content: bytes,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+) -> VerifiedTombstoneReceipt:
+    receipt = _tombstone_receipt_from_payload(payload)
+    expected_hash = hashlib.sha256(ownership_bytes).hexdigest()
+    if (
+        receipt.schema_version != 1
+        or receipt.epoch_id != plan.epoch_id
+        or receipt.run_kind != plan.run_kind
+        or receipt.case != assignment.key
+        or receipt.ownership_sha256 != expected_hash
+        or receipt.case_root_device != ownership.case_root_device
+        or receipt.case_root_inode != ownership.case_root_inode
+        or receipt.codex_home_device != ownership.codex_home_device
+        or receipt.codex_home_inode != ownership.codex_home_inode
+        or receipt.scrubbed is not True
+        or receipt.empty is not True
+        or receipt.canonical_binding not in ("expected", "missing", "replaced")
+        or receipt.producer not in ("worker", "coordinator-recovery")
+    ):
+        raise ValueError("case auth tombstone is stale or invalid")
+    return VerifiedTombstoneReceipt(
+        receipt=receipt,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
 def _read_verified_tombstone_receipt(
     *,
     plan: EpochPlan,
@@ -2976,28 +3009,13 @@ def _read_verified_tombstone_receipt(
                 label="case auth tombstone",
                 byte_cap=1024 * 1024,
             )
-            receipt = _tombstone_receipt_from_payload(payload)
-            expected_hash = hashlib.sha256(ownership_bytes).hexdigest()
-            if (
-                receipt.schema_version != 1
-                or receipt.epoch_id != plan.epoch_id
-                or receipt.run_kind != plan.run_kind
-                or receipt.case != assignment.key
-                or receipt.ownership_sha256 != expected_hash
-                or receipt.case_root_device != ownership.case_root_device
-                or receipt.case_root_inode != ownership.case_root_inode
-                or receipt.codex_home_device != ownership.codex_home_device
-                or receipt.codex_home_inode != ownership.codex_home_inode
-                or receipt.scrubbed is not True
-                or receipt.empty is not True
-                or receipt.canonical_binding
-                not in ("expected", "missing", "replaced")
-                or receipt.producer not in ("worker", "coordinator-recovery")
-            ):
-                raise ValueError("case auth tombstone is stale or invalid")
-            result = VerifiedTombstoneReceipt(
-                receipt=receipt,
-                sha256=hashlib.sha256(content).hexdigest(),
+            result = _verified_tombstone_receipt_from_records(
+                ownership=ownership,
+                ownership_bytes=ownership_bytes,
+                payload=payload,
+                content=content,
+                plan=plan,
+                assignment=assignment,
             )
     except BaseException as error:
         primary = error
@@ -3008,6 +3026,46 @@ def _read_verified_tombstone_receipt(
     )
     if required and result is None:
         raise AssertionError("verified tombstone read produced no result")
+    return result
+
+
+def _read_verified_tombstone_receipt_retained(
+    *,
+    directory: _RecordChildDirectoryCapability,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+) -> VerifiedTombstoneReceipt:
+    inventory = directory.inventory()
+    if inventory != ("ownership.json", "tombstone.json"):
+        raise ValueError("case auth cleanup inventory is invalid")
+    ownership_payload, ownership_bytes = _read_canonical_record_retained(
+        directory,
+        "ownership.json",
+        "case auth ownership",
+        byte_cap=1024 * 1024,
+    )
+    ownership, ownership_bytes = _decode_case_auth_ownership(
+        payload=ownership_payload,
+        content=ownership_bytes,
+        plan=plan,
+        assignment=assignment,
+    )
+    payload, content = _read_canonical_record_retained(
+        directory,
+        "tombstone.json",
+        "case auth tombstone",
+        byte_cap=1024 * 1024,
+    )
+    result = _verified_tombstone_receipt_from_records(
+        ownership=ownership,
+        ownership_bytes=ownership_bytes,
+        payload=payload,
+        content=content,
+        plan=plan,
+        assignment=assignment,
+    )
+    if directory.inventory() != inventory:
+        raise RuntimeError("case auth cleanup inventory changed while reading")
     return result
 
 
@@ -5349,22 +5407,320 @@ def _resume_run_root_has_cases(run_root: Path) -> bool:
     return True
 
 
-def _case_has_resume_records(paths: CasePaths) -> tuple[bool, bool]:
+def _append_resume_disposition(
+    *,
+    disposition: Literal["reusable", "pending", "invalid"],
+    key: CaseKey,
+    reusable: list[CaseKey],
+    pending: list[CaseKey],
+    invalid: list[CaseKey],
+) -> None:
+    if disposition == "reusable":
+        reusable.append(key)
+    elif disposition == "pending":
+        pending.append(key)
+    elif disposition == "invalid":
+        invalid.append(key)
+    else:
+        raise AssertionError("resume disposition is invalid")
+
+
+def _classify_resume_case_retained(
+    *,
+    plan: EpochPlan,
+    paths: CasePaths,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
+    reusable: list[CaseKey],
+    pending: list[CaseKey],
+    invalid: list[CaseKey],
+) -> None:
+    manifest_case_sha256 = _validate_seal_context(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
     try:
         paths.root.lstat()
     except FileNotFoundError:
-        return False, False
+        pending.append(assignment.key)
+        return
     except OSError:
         raise ValueError("case root is unavailable") from None
-    directory = _open_case_record_directory(
-        paths=paths,
-        components=(),
-        create=False,
-        label="resume case directory",
-    )
-    with directory:
-        inventory = directory.inventory()
-        return "attempts" in inventory, "sealed" in inventory
+
+    with ExitStack() as retained:
+        case_directory = retained.enter_context(
+            _open_case_record_directory(
+                paths=paths,
+                components=(),
+                create=False,
+                label="resume case directory",
+            )
+        )
+        case_inventory = case_directory.inventory()
+        has_attempts = "attempts" in case_inventory
+        has_seal = "sealed" in case_inventory
+        if not has_attempts:
+            disposition: Literal["reusable", "pending", "invalid"] = (
+                "invalid" if has_seal else "pending"
+            )
+            if case_directory.inventory() != case_inventory:
+                raise RuntimeError(
+                    "case inventory changed before resume disposition"
+                )
+            _append_resume_disposition(
+                disposition=disposition,
+                key=assignment.key,
+                reusable=reusable,
+                pending=pending,
+                invalid=invalid,
+            )
+            return
+
+        attempts_directory = retained.enter_context(
+            _open_record_child_directory(
+                case_directory,
+                "attempts",
+                label="resume attempt root",
+            )
+        )
+        attempt_inventory = attempts_directory.inventory()
+        if attempt_inventory not in ((), ("01",), ("01", "02")):
+            if "01" not in attempt_inventory:
+                raise ValueError("attempt sequence contains a gap")
+            raise ValueError("attempt directory name or sequence is invalid")
+        if not attempt_inventory:
+            disposition = "invalid" if has_seal else "pending"
+            if attempts_directory.inventory() != attempt_inventory:
+                raise RuntimeError(
+                    "attempt inventory changed before resume disposition"
+                )
+            if case_directory.inventory() != case_inventory:
+                raise RuntimeError(
+                    "case inventory changed before resume disposition"
+                )
+            _append_resume_disposition(
+                disposition=disposition,
+                key=assignment.key,
+                reusable=reusable,
+                pending=pending,
+                invalid=invalid,
+            )
+            return
+
+        attempt_directories = tuple(
+            retained.enter_context(
+                _open_record_child_directory(
+                    attempts_directory,
+                    name,
+                    label="resume attempt directory",
+                )
+            )
+            for name in attempt_inventory
+        )
+        if attempts_directory.inventory() != attempt_inventory:
+            raise RuntimeError(
+                "attempt inventory changed while retaining resume hierarchy"
+            )
+        seals = tuple(
+            _read_attempt_seal_retained(
+                directory=directory,
+                plan=plan,
+                assignment=assignment,
+                attempt=attempt_number,
+                manifest_case_sha256=manifest_case_sha256,
+            )
+            for attempt_number, directory in enumerate(
+                attempt_directories, start=1
+            )
+        )
+
+        receipt: VerifiedTombstoneReceipt | None = None
+        cleanup_directory: _RecordChildDirectoryCapability | None = None
+        cleanup_inventory: tuple[str, ...] | None = None
+        if any(
+            seal.terminal.get("cleanup_passed") is True for seal in seals
+        ):
+            if "cleanup" not in case_inventory:
+                raise ValueError("clean attempt has no cleanup directory")
+            cleanup_directory = retained.enter_context(
+                _open_record_child_directory(
+                    case_directory,
+                    "cleanup",
+                    label="resume cleanup directory",
+                )
+            )
+            cleanup_inventory = cleanup_directory.inventory()
+            receipt = _read_verified_tombstone_receipt_retained(
+                directory=cleanup_directory,
+                plan=plan,
+                assignment=assignment,
+            )
+            if receipt.receipt.canonical_binding != "expected":
+                raise ValueError(
+                    "attempt cleanup did not preserve canonical auth binding"
+                )
+            for seal in seals:
+                if (
+                    seal.terminal.get("cleanup_passed") is True
+                    and seal.terminal.get("tombstone_receipt_sha256")
+                    != receipt.sha256
+                ):
+                    raise ValueError("attempt cleanup receipt hash differs")
+
+        sealed_directory: _RecordChildDirectoryCapability | None = None
+        sealed_inventory: tuple[str, ...] | None = None
+        if has_seal:
+            sealed_directory = retained.enter_context(
+                _open_record_child_directory(
+                    case_directory,
+                    "sealed",
+                    label="resume case seal directory",
+                )
+            )
+            sealed_inventory = sealed_directory.inventory()
+
+        if len(seals) == 2:
+            first = seals[0].terminal
+            first_decision = decide_retry(
+                classification=first["classification"],
+                attempt=1,
+                model_started=first["model_started"],
+                cleanup_passed=first["cleanup_passed"],
+                fingerprints_unchanged=True,
+            )
+            if (
+                first.get("status") != "failed"
+                or not first_decision.retry
+                or first_decision.next_attempt != 2
+                or first_decision.action != "reuse"
+            ):
+                disposition = "invalid"
+            else:
+                disposition = "pending"
+        else:
+            disposition = "pending"
+
+        final_terminal = seals[-1].terminal
+        final_attempt = len(seals)
+        final_decision = decide_retry(
+            classification=final_terminal["classification"],
+            attempt=final_attempt,
+            model_started=final_terminal["model_started"],
+            cleanup_passed=final_terminal["cleanup_passed"],
+            fingerprints_unchanged=True,
+        )
+        case_seal: CaseSeal | None = None
+        if disposition != "invalid":
+            if final_terminal.get("status") != "success":
+                if (
+                    len(seals) == 1
+                    and final_decision.retry
+                    and final_decision.next_attempt == 2
+                    and final_decision.action == "reuse"
+                    and not has_seal
+                ):
+                    disposition = "pending"
+                else:
+                    disposition = "invalid"
+            elif (
+                final_decision.action != "reuse"
+                or sum(
+                    seal.terminal.get("model_started") is True
+                    for seal in seals
+                )
+                != 1
+                or sealed_directory is None
+            ):
+                disposition = "invalid"
+            else:
+                case_seal = _read_case_seal_retained(
+                    directory=sealed_directory,
+                    plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    manifest_case=manifest_case,
+                    manifest_case_sha256=manifest_case_sha256,
+                )
+                if (
+                    case_seal.commit.get("status") != "success"
+                    or case_seal.commit.get("attempt") != final_attempt
+                ):
+                    disposition = "invalid"
+                else:
+                    disposition = "reusable"
+
+        durable_seals = tuple(
+            _read_attempt_seal_retained(
+                directory=directory,
+                plan=plan,
+                assignment=assignment,
+                attempt=attempt_number,
+                manifest_case_sha256=manifest_case_sha256,
+            )
+            for attempt_number, directory in enumerate(
+                attempt_directories, start=1
+            )
+        )
+        if durable_seals != seals:
+            raise RuntimeError("attempt records changed before disposition")
+        if receipt is not None:
+            if cleanup_directory is None or cleanup_inventory is None:
+                raise AssertionError("retained cleanup proof is incomplete")
+            durable_receipt = _read_verified_tombstone_receipt_retained(
+                directory=cleanup_directory,
+                plan=plan,
+                assignment=assignment,
+            )
+            if (
+                durable_receipt != receipt
+                or durable_receipt.receipt.canonical_binding != "expected"
+                or cleanup_directory.inventory() != cleanup_inventory
+            ):
+                raise RuntimeError(
+                    "cleanup proof changed before resume disposition"
+                )
+        if sealed_directory is not None:
+            if sealed_inventory is None:
+                raise AssertionError("retained case seal inventory is missing")
+            if case_seal is not None:
+                durable_case_seal = _read_case_seal_retained(
+                    directory=sealed_directory,
+                    plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    manifest_case=manifest_case,
+                    manifest_case_sha256=manifest_case_sha256,
+                )
+                if durable_case_seal != case_seal:
+                    raise RuntimeError(
+                        "case seal changed before resume disposition"
+                    )
+            if sealed_directory.inventory() != sealed_inventory:
+                raise RuntimeError(
+                    "case seal inventory changed before resume disposition"
+                )
+        for directory in attempt_directories:
+            if directory.inventory() != ("start.json", "terminal.json"):
+                raise RuntimeError(
+                    "attempt inventory changed before resume disposition"
+                )
+        if attempts_directory.inventory() != attempt_inventory:
+            raise RuntimeError(
+                "attempt inventory changed before resume disposition"
+            )
+        if case_directory.inventory() != case_inventory:
+            raise RuntimeError(
+                "case inventory changed before resume disposition"
+            )
+        _append_resume_disposition(
+            disposition=disposition,
+            key=assignment.key,
+            reusable=reusable,
+            pending=pending,
+            invalid=invalid,
+        )
 
 
 def plan_resume(
@@ -5452,110 +5808,15 @@ def plan_resume(
             continue
         paths = paths_for_case(canonical_root, assignment)
         try:
-            has_attempts, has_seal = _case_has_resume_records(paths)
-            if not has_attempts:
-                if has_seal:
-                    invalid.append(assignment.key)
-                else:
-                    pending.append(assignment.key)
-                continue
-            attempts = scan_attempts(
-                paths,
-                plan=plan,
-                manifest_case=manifest_case,
-            )
-            if not attempts:
-                if has_seal:
-                    invalid.append(assignment.key)
-                else:
-                    pending.append(assignment.key)
-                continue
-            seals = tuple(
-                read_attempt_seal(
-                    plan=plan,
-                    paths=paths,
-                    assignment=assignment,
-                    attempt=attempt_number,
-                    manifest_case=manifest_case,
-                )
-                for attempt_number in range(1, len(attempts) + 1)
-            )
-            for seal in seals:
-                if seal.terminal.get("cleanup_passed") is True:
-                    receipt = read_verified_tombstone_receipt(
-                        plan=plan,
-                        assignment=assignment,
-                        paths=paths,
-                    )
-                    if (
-                        seal.terminal.get("tombstone_receipt_sha256")
-                        != receipt.sha256
-                    ):
-                        raise ValueError(
-                            "attempt cleanup receipt hash differs"
-                        )
-            if len(seals) == 2:
-                first = seals[0].terminal
-                first_decision = decide_retry(
-                    classification=first["classification"],
-                    attempt=1,
-                    model_started=first["model_started"],
-                    cleanup_passed=first["cleanup_passed"],
-                    fingerprints_unchanged=True,
-                )
-                if (
-                    first.get("status") != "failed"
-                    or not first_decision.retry
-                    or first_decision.next_attempt != 2
-                    or first_decision.action != "reuse"
-                ):
-                    invalid.append(assignment.key)
-                    continue
-            final_terminal = seals[-1].terminal
-            final_attempt = len(seals)
-            final_decision = decide_retry(
-                classification=final_terminal["classification"],
-                attempt=final_attempt,
-                model_started=final_terminal["model_started"],
-                cleanup_passed=final_terminal["cleanup_passed"],
-                fingerprints_unchanged=True,
-            )
-            if final_terminal.get("status") != "success":
-                if (
-                    len(seals) == 1
-                    and final_decision.retry
-                    and final_decision.next_attempt == 2
-                    and final_decision.action == "reuse"
-                    and not has_seal
-                ):
-                    pending.append(assignment.key)
-                else:
-                    invalid.append(assignment.key)
-                continue
-            if (
-                final_decision.action != "reuse"
-                or sum(
-                    seal.terminal.get("model_started") is True
-                    for seal in seals
-                )
-                != 1
-            ):
-                invalid.append(assignment.key)
-                continue
-            case_seal = read_case_seal(
+            _classify_resume_case_retained(
                 plan=plan,
                 paths=paths,
                 assignment=assignment,
                 manifest_case=manifest_case,
+                reusable=reusable,
+                pending=pending,
+                invalid=invalid,
             )
-            if (
-                not has_seal
-                or case_seal.commit.get("status") != "success"
-                or case_seal.commit.get("attempt") != final_attempt
-            ):
-                invalid.append(assignment.key)
-                continue
-            reusable.append(assignment.key)
         except (OSError, TypeError, ValueError, RuntimeError) as error:
             if is_indeterminate_descriptor_close(error):
                 raise

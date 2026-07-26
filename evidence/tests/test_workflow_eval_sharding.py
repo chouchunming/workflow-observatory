@@ -4970,6 +4970,30 @@ class RetryResumeTests(unittest.TestCase):
             self.paths.cleanup / "tombstone.json", asdict(receipt)
         )
 
+    def _replace_tombstone_binding(self, binding):
+        receipt_path = self.paths.cleanup / "tombstone.json"
+        receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+        receipt["canonical_binding"] = binding
+        receipt_path.write_bytes(sharding.canonical_config_bytes(receipt))
+
+    def _copy_attempt(self, source, destination):
+        source_paths = sharding.paths_for_attempt(self.paths, source)
+        destination_paths = sharding.paths_for_attempt(
+            self.paths, destination
+        )
+        destination_paths.root.mkdir(mode=0o700)
+        start = json.loads(source_paths.start.read_text(encoding="ascii"))
+        terminal = json.loads(
+            source_paths.terminal.read_text(encoding="ascii")
+        )
+        start["attempt"] = destination
+        start_bytes = sharding._atomic_write_record(
+            destination_paths.start, start
+        )
+        terminal["attempt"] = destination
+        terminal["start_sha256"] = hashlib.sha256(start_bytes).hexdigest()
+        sharding._atomic_write_record(destination_paths.terminal, terminal)
+
     @staticmethod
     def _failure(classification):
         text = f"{classification} failure"
@@ -5125,6 +5149,277 @@ class RetryResumeTests(unittest.TestCase):
         )
         self.assertEqual((), resume.reusable)
         self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_retry_decision_contract_is_table_driven(self):
+        cases = (
+            (
+                "eligible first attempt",
+                "pre-model-infrastructure",
+                1,
+                False,
+                True,
+                True,
+                (True, 2, "reuse"),
+            ),
+            (
+                "successful reuse",
+                "success",
+                1,
+                True,
+                True,
+                True,
+                (False, None, "reuse"),
+            ),
+            (
+                "semantic invalidation",
+                "semantic",
+                1,
+                True,
+                True,
+                True,
+                (False, None, "invalidate"),
+            ),
+            (
+                "model invalidation",
+                "model",
+                1,
+                True,
+                True,
+                True,
+                (False, None, "invalidate"),
+            ),
+            *(
+                (
+                    f"{classification} abort",
+                    classification,
+                    1,
+                    False,
+                    True,
+                    True,
+                    (False, None, "abort"),
+                )
+                for classification in (
+                    "cleanup",
+                    "production-mutation",
+                    "manifest-mutation",
+                    "timeout",
+                    "protocol",
+                    "post-start-transport",
+                    "surviving-process",
+                    "coordinator-crash",
+                )
+            ),
+            (
+                "second attempt denied",
+                "pre-model-infrastructure",
+                2,
+                False,
+                True,
+                True,
+                (False, None, "abort"),
+            ),
+            (
+                "model already started",
+                "pre-model-infrastructure",
+                1,
+                True,
+                True,
+                True,
+                (False, None, "abort"),
+            ),
+            (
+                "cleanup not proved",
+                "pre-model-infrastructure",
+                1,
+                False,
+                False,
+                True,
+                (False, None, "abort"),
+            ),
+            (
+                "fingerprint mismatch",
+                "pre-model-infrastructure",
+                1,
+                False,
+                True,
+                False,
+                (False, None, "abort"),
+            ),
+        )
+        for (
+            label,
+            classification,
+            attempt,
+            model_started,
+            cleanup_passed,
+            fingerprints_unchanged,
+            expected,
+        ) in cases:
+            with self.subTest(label):
+                decision = sharding.decide_retry(
+                    classification=classification,
+                    attempt=attempt,
+                    model_started=model_started,
+                    cleanup_passed=cleanup_passed,
+                    fingerprints_unchanged=fingerprints_unchanged,
+                )
+                self.assertEqual(
+                    expected,
+                    (
+                        decision.retry,
+                        decision.next_attempt,
+                        decision.action,
+                    ),
+                )
+
+    def test_resume_invalidates_case_disappearance_after_initial_inventory(self):
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        real_inventory = sharding._RecordDirectoryCapability.inventory
+        disappeared = False
+
+        def disappear_after_inventory(directory):
+            nonlocal disappeared
+            inventory = real_inventory(directory)
+            if (
+                directory.label == "resume case directory"
+                and not disappeared
+            ):
+                disappeared = True
+                shutil.rmtree(self.paths.root)
+            return inventory
+
+        with mock.patch.object(
+            sharding._RecordDirectoryCapability,
+            "inventory",
+            autospec=True,
+            side_effect=disappear_after_inventory,
+        ):
+            resume = self._resume()
+
+        self.assertTrue(disappeared)
+        self.assertEqual((), resume.reusable)
+        self.assertNotIn(self.assignment.key, resume.pending)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_invalidates_attempt_two_added_after_scan(self):
+        self._write_attempt(
+            1,
+            status="success",
+            classification="success",
+            model_started=True,
+        )
+        self._seal_success(1)
+        real_read_attempt_seal = sharding.read_attempt_seal
+        added = False
+
+        def add_attempt_after_read(**kwargs):
+            nonlocal added
+            seal = real_read_attempt_seal(**kwargs)
+            if not added:
+                added = True
+                self._copy_attempt(1, 2)
+            return seal
+
+        with mock.patch.object(
+            sharding,
+            "read_attempt_seal",
+            side_effect=add_attempt_after_read,
+        ):
+            resume = self._resume()
+
+        self.assertTrue(added)
+        self.assertEqual((), resume.reusable)
+        self.assertNotIn(self.assignment.key, resume.pending)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_invalidates_attempt_replacement_after_scan(self):
+        self._write_attempt(
+            1,
+            status="success",
+            classification="success",
+            model_started=True,
+        )
+        self._seal_success(1)
+        real_read_attempt_seal = sharding.read_attempt_seal
+        replaced = False
+
+        def replace_attempt_after_read(**kwargs):
+            nonlocal replaced
+            seal = real_read_attempt_seal(**kwargs)
+            if not replaced:
+                replaced = True
+                retired = self.root / "retired-attempt-01"
+                self.paths.attempts.joinpath("01").rename(retired)
+                shutil.copytree(retired, self.paths.attempts / "01")
+            return seal
+
+        with mock.patch.object(
+            sharding,
+            "read_attempt_seal",
+            side_effect=replace_attempt_after_read,
+        ):
+            resume = self._resume()
+
+        self.assertTrue(replaced)
+        self.assertEqual((), resume.reusable)
+        self.assertNotIn(self.assignment.key, resume.pending)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_revalidates_inventory_before_final_disposition(self):
+        self._write_attempt(
+            1,
+            status="success",
+            classification="success",
+            model_started=True,
+        )
+        self._seal_success(1)
+        real_read_case_seal = sharding._read_case_seal_retained
+        mutated = False
+
+        def mutate_after_case_seal(**kwargs):
+            nonlocal mutated
+            seal = real_read_case_seal(**kwargs)
+            if not mutated:
+                mutated = True
+                (self.paths.attempts / "unexpected").mkdir(mode=0o700)
+            return seal
+
+        with mock.patch.object(
+            sharding,
+            "_read_case_seal_retained",
+            side_effect=mutate_after_case_seal,
+        ):
+            resume = self._resume()
+
+        self.assertTrue(mutated)
+        self.assertEqual((), resume.reusable)
+        self.assertNotIn(self.assignment.key, resume.pending)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_retry_requires_expected_verified_tombstone_binding(self):
+        for binding in ("missing", "replaced"):
+            with self.subTest(binding):
+                if self.paths.attempts.exists():
+                    shutil.rmtree(self.paths.attempts)
+                self._replace_tombstone_binding(binding)
+                self._write_attempt(
+                    1,
+                    status="failed",
+                    classification="pre-model-infrastructure",
+                    model_started=False,
+                )
+
+                resume = self._resume()
+
+                self.assertEqual((), resume.reusable)
+                self.assertNotIn(self.assignment.key, resume.pending)
+                self.assertEqual((self.assignment.key,), resume.invalid)
 
 
 class SealTests(unittest.TestCase):
