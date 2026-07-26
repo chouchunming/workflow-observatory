@@ -5446,7 +5446,9 @@ class SealTests(unittest.TestCase):
         forward_result = {**self.result, "record_checkpoints": None}
         with self.assertRaises(ValueError):
             sharding._validate_result_record(
-                forward_result, assignment=self.assignment
+                forward_result,
+                assignment=self.assignment,
+                manifest_case=self.manifest_case,
             )
         with self.assertRaises(ValueError):
             sharding.seal_case(
@@ -5471,7 +5473,44 @@ class SealTests(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             sharding._validate_result_record(
-                lifecycle_result, assignment=lifecycle_assignment
+                lifecycle_result,
+                assignment=lifecycle_assignment,
+                manifest_case=self._manifest_for_assignment(
+                    lifecycle_assignment
+                ),
+            )
+        command_selection_bypass = {
+            "id": lifecycle_assignment.key.case_id,
+            "record_checkpoints": None,
+            "run_count": None,
+            "draft_count": None,
+            "final_statuses": None,
+            "failure_disclosed": None,
+            "selected_command": "python3 wiki_cli.py observe",
+        }
+        with self.assertRaises(ValueError):
+            sharding._validate_result_record(
+                command_selection_bypass,
+                assignment=lifecycle_assignment,
+                manifest_case=self._manifest_for_assignment(
+                    lifecycle_assignment
+                ),
+            )
+        mutated_manifest = {
+            **self._manifest_for_assignment(lifecycle_assignment),
+            "mode": "command-selection-only",
+            "expected_record_checkpoints": None,
+            "expected_run_count": None,
+            "expected_draft_count": None,
+            "expected_final_statuses": None,
+            "expect_failure_disclosure": None,
+            "expected_selected_command": "python3 wiki_cli.py observe",
+        }
+        with self.assertRaises(ValueError):
+            sharding._validate_result_record(
+                command_selection_bypass,
+                assignment=lifecycle_assignment,
+                manifest_case=mutated_manifest,
             )
 
         run_root = self.root / "lifecycle-checkpoints" / "run"
@@ -5488,6 +5527,34 @@ class SealTests(unittest.TestCase):
                 assignment=lifecycle_assignment,
                 attempt=1,
                 result=lifecycle_result,
+                evidence=self.evidence,
+                manifest_case=self._manifest_for_assignment(
+                    lifecycle_assignment
+                ),
+            )
+        mutated_root = self.root / "lifecycle-subtype-mutation" / "run"
+        mutated_root.mkdir(parents=True, mode=0o700)
+        mutated_root.chmod(0o700)
+        (mutated_root / "cases").mkdir(mode=0o700)
+        mutated_paths = sharding.paths_for_case(
+            mutated_root, lifecycle_assignment
+        )
+        mutated_paths.root.mkdir(mode=0o700)
+        with self.assertRaises(ValueError):
+            sharding.write_attempt_start(
+                plan=self.plan,
+                paths=mutated_paths,
+                assignment=lifecycle_assignment,
+                attempt=1,
+                manifest_case=mutated_manifest,
+            )
+        with self.assertRaises(ValueError):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=lifecycle_paths,
+                assignment=lifecycle_assignment,
+                attempt=1,
+                result=command_selection_bypass,
                 evidence=self.evidence,
                 manifest_case=self._manifest_for_assignment(
                     lifecycle_assignment
@@ -5510,6 +5577,276 @@ class SealTests(unittest.TestCase):
             )
         self.assertFalse(
             (moved_root / "attempts" / "01" / "start.json").exists()
+        )
+
+    def test_attempt_lookup_rejects_inventory_added_during_uniqueness_scan(self):
+        paths, _ = self._new_seal_scenario(
+            "attempt-inventory-race", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=2,
+            manifest_case=self.manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=2,
+            manifest_case=self.manifest_case,
+            status="success",
+            classification="success",
+            model_started=True,
+            cleanup_passed=True,
+            usage=self.usage,
+            failure=None,
+        )
+        attempt_one = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        attempt_two = sharding.paths_for_attempt(paths, 2)
+        held_attempt_two = paths.root / "held-attempt-02"
+        attempt_two.root.rename(held_attempt_two)
+        real_read_attempt = sharding._read_attempt_seal_retained
+        installed = False
+
+        def read_and_install_second_attempt(**kwargs):
+            nonlocal installed
+            seal = real_read_attempt(**kwargs)
+            if kwargs["attempt"] == 1 and not installed:
+                installed = True
+                held_attempt_two.rename(attempt_two.root)
+            return seal
+
+        with mock.patch.object(
+            sharding,
+            "_read_attempt_seal_retained",
+            side_effect=read_and_install_second_attempt,
+        ):
+            with self.assertRaises((RuntimeError, ValueError)):
+                sharding._find_attempt_for_shard_terminal(
+                    plan=self.plan,
+                    assignment=self.assignment,
+                    paths=paths,
+                    manifest_case=self.manifest_case,
+                    expected_sha256=attempt_one.terminal_sha256,
+                )
+
+    def test_attempt_lookup_rejects_transient_child_aba_swap(self):
+        paths, _ = self._new_seal_scenario(
+            "attempt-child-aba", canonical_binding="expected"
+        )
+        self._write_scenario_attempt(
+            paths,
+            status="success",
+            classification="success",
+            cleanup_passed=True,
+            failure=None,
+        )
+        expected = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        attempt = sharding.paths_for_attempt(paths, 1)
+        held_expected = paths.root / "held-expected-attempt"
+        attempt.root.rename(held_expected)
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+            status="failed",
+            classification="semantic",
+            model_started=True,
+            cleanup_passed=False,
+            usage=self.usage,
+            failure={
+                "classification": "semantic",
+                "type": "SemanticFailure",
+                "chars": 1,
+                "sha256": "e" * 64,
+            },
+        )
+        held_current = paths.root / "held-current-attempt"
+        real_read_attempt = sharding.read_attempt_seal
+
+        def read_transient_expected(**kwargs):
+            attempt.root.rename(held_current)
+            held_expected.rename(attempt.root)
+            try:
+                return real_read_attempt(**kwargs)
+            finally:
+                attempt.root.rename(held_expected)
+                held_current.rename(attempt.root)
+
+        with mock.patch.object(
+            sharding,
+            "read_attempt_seal",
+            side_effect=read_transient_expected,
+        ):
+            with self.assertRaises(ValueError):
+                sharding._find_attempt_for_shard_terminal(
+                    plan=self.plan,
+                    assignment=self.assignment,
+                    paths=paths,
+                    manifest_case=self.manifest_case,
+                    expected_sha256=expected.terminal_sha256,
+                )
+
+    def test_record_capability_enter_failure_retires_all_descriptors(self):
+        paths, _ = self._new_seal_scenario("record-enter-failure")
+        directory = sharding._open_case_record_directory(
+            paths=paths,
+            components=("sealed",),
+            create=True,
+            label="case seal directory",
+        )
+        descriptors = [
+            directory._anchor_slot.descriptor,
+            *(entry.slot.descriptor for entry in directory._retained),
+        ]
+        moved_sealed = paths.sealed.with_name("sealed-moved")
+        paths.sealed.rename(moved_sealed)
+        try:
+            with self.assertRaises((OSError, RuntimeError, ValueError)):
+                with directory:
+                    self.fail("replaced record directory became authoritative")
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_attempt_inventory_failure_closes_capability_before_return(self):
+        paths, _ = self._new_seal_scenario("attempt-inventory-failure")
+        real_close = sharding._RecordDirectoryCapability.close
+        close_calls = []
+
+        def track_close(directory, primary=None):
+            close_calls.append(primary)
+            return real_close(directory, primary)
+
+        with (
+            mock.patch.object(
+                sharding._RecordDirectoryCapability,
+                "inventory",
+                side_effect=RuntimeError("inventory failed"),
+            ),
+            mock.patch.object(
+                sharding._RecordDirectoryCapability,
+                "close",
+                new=track_close,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "inventory failed"):
+                sharding.write_attempt_start(
+                    plan=self.plan,
+                    paths=paths,
+                    assignment=self.assignment,
+                    attempt=1,
+                    manifest_case=self.manifest_case,
+                )
+        self.assertEqual(1, len(close_calls))
+
+    def test_anchor_indeterminate_failure_poisons_before_later_open(self):
+        previous_poison = sharding._LEASE_PROCESS_POISON
+        failure = OSError("indeterminate anchor close")
+        setattr(failure, sharding._INDETERMINATE_CLOSE_MARKER, True)
+        sharding._LEASE_PROCESS_POISON = None
+        try:
+            with mock.patch.object(
+                sharding,
+                "_open_absolute_directory_anchor",
+                side_effect=failure,
+            ):
+                with self.assertRaises(OSError):
+                    sharding._open_anchored_record_directory(
+                        anchor_path=self.run_root,
+                        base_components=("cases", self.paths.root.name),
+                        record_components=("sealed",),
+                        create=True,
+                        label="case seal directory",
+                    )
+            self.assertIs(failure, sharding._LEASE_PROCESS_POISON)
+        finally:
+            sharding._LEASE_PROCESS_POISON = previous_poison
+
+    def test_attempt_writer_rejects_raced_symlinked_run_root_ancestor(self):
+        canonical_parent = self.root / "canonical-parent"
+        run_root = canonical_parent / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        paths = sharding.paths_for_case(run_root, self.assignment)
+        paths.root.mkdir(mode=0o700)
+
+        alternate_parent = self.root / "alternate-parent"
+        alternate_run = alternate_parent / "run"
+        alternate_run.mkdir(parents=True, mode=0o700)
+        alternate_run.chmod(0o700)
+        (alternate_run / "cases").mkdir(mode=0o700)
+        alternate_paths = sharding.paths_for_case(
+            alternate_run, self.assignment
+        )
+        alternate_paths.root.mkdir(mode=0o700)
+
+        moved_parent = self.root / "canonical-parent-moved"
+        real_open_anchor = sharding._open_absolute_directory_anchor
+        swapped = False
+
+        def swap_ancestor_then_open(path, label, **kwargs):
+            nonlocal swapped
+            if Path(path) == Path("/") and not swapped:
+                swapped = True
+                canonical_parent.rename(moved_parent)
+                canonical_parent.symlink_to(
+                    alternate_parent, target_is_directory=True
+                )
+            return real_open_anchor(path, label, **kwargs)
+
+        with mock.patch.object(
+            sharding,
+            "_open_absolute_directory_anchor",
+            side_effect=swap_ancestor_then_open,
+        ):
+            with self.assertRaises((RuntimeError, ValueError)):
+                sharding.write_attempt_start(
+                    plan=self.plan,
+                    paths=paths,
+                    assignment=self.assignment,
+                    attempt=1,
+                    manifest_case=self.manifest_case,
+                )
+        self.assertFalse(
+            (alternate_paths.root / "attempts" / "01" / "start.json").exists()
         )
 
     def test_case_seal_stops_after_retained_case_root_is_replaced(self):
@@ -6183,7 +6520,11 @@ class SealTests(unittest.TestCase):
         self.assertEqual(
             command_result,
             sharding._validate_result_record(
-                command_result, assignment=command_assignment
+                command_result,
+                assignment=command_assignment,
+                manifest_case=self._manifest_for_assignment(
+                    command_assignment
+                ),
             ),
         )
 

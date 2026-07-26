@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass, fields, replace
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -128,6 +129,11 @@ DISPATCH_VALUES = frozenset(
 )
 FIXTURE_VALUES = frozenset({"python-cli", "documentation", "wiki", "empty"})
 LIFECYCLE_MODES = frozenset({"executable", "command-selection-only"})
+_COMMAND_SELECTION_LIFECYCLE_KEY = (
+    "lifecycle",
+    8,
+    "incomplete-eval-override",
+)
 SHARD_TERMINAL_FIELDS = frozenset(
     {
         "case",
@@ -482,6 +488,99 @@ def _reconcile_named_descriptor_at(
     _validate_owned_entry(current, label=label, kind=kind, mode=mode)
 
 
+def _reconcile_trusted_descriptor(
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    if _stat_identity(opened) != identity:
+        raise RuntimeError(f"{label} descriptor identity changed")
+    _validate_trusted_parent(opened, label=label)
+
+
+def _reconcile_trusted_named_descriptor_at(
+    parent_fd: int,
+    entry: _RetainedDirectory,
+    *,
+    label: str,
+) -> None:
+    _reconcile_trusted_descriptor(
+        entry.slot.descriptor, entry.identity, label=label
+    )
+    current = os.stat(
+        entry.name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    if _stat_identity(current) != entry.identity:
+        raise RuntimeError(f"{label} name changed")
+    _validate_trusted_parent(current, label=label)
+
+
+def _open_trusted_directory_chain_at(
+    anchor_fd: int,
+    components: Sequence[str],
+    *,
+    label: str,
+) -> tuple[_RetainedDirectory, ...]:
+    nofollow = _required_os_flag("O_NOFOLLOW")
+    directory = _required_os_flag("O_DIRECTORY")
+    if any(not name or name in {".", ".."} or "/" in name for name in components):
+        raise ValueError(f"invalid {label} component")
+    retained: list[_RetainedDirectory] = []
+    parent_fd = anchor_fd
+    try:
+        for name in components:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _validate_trusted_parent(expected, label=label)
+            child_fd = os.open(
+                name,
+                os.O_RDONLY
+                | nofollow
+                | directory
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            child_slot = _DescriptorSlot(child_fd)
+            try:
+                opened = os.fstat(child_fd)
+                current = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if len(
+                    {
+                        _stat_identity(expected),
+                        _stat_identity(opened),
+                        _stat_identity(current),
+                    }
+                ) != 1:
+                    raise RuntimeError(f"{label} changed while opening")
+                _validate_trusted_parent(opened, label=label)
+            except BaseException as primary:
+                close_error = _retire_descriptor_capability(child_slot)
+                _raise_ordered_failures(
+                    f"{label} open or close failed",
+                    primary,
+                    [close_error] if close_error is not None else [],
+                )
+                raise AssertionError("trusted-directory validation produced no error")
+            retained.append(
+                _RetainedDirectory(name, _stat_identity(opened), child_slot)
+            )
+            parent_fd = child_fd
+        return tuple(retained)
+    except BaseException as primary:
+        close_errors: list[BaseException] = []
+        for entry in reversed(retained):
+            error = _retire_descriptor_capability(entry.slot)
+            if error is not None:
+                close_errors.append(error)
+        _raise_ordered_failures(
+            f"{label} traversal or close failed", primary, close_errors
+        )
+        raise AssertionError("trusted-directory traversal produced no error")
+
+
 def _open_relative_directory_chain_at(
     anchor_fd: int,
     components: Sequence[str],
@@ -629,15 +728,23 @@ class _RecordDirectoryCapability:
         anchor_slot: _DescriptorSlot,
         anchor_identity: tuple[int, int],
         retained: tuple[_RetainedDirectory, ...],
+        trusted_prefix_count: int,
         path: Path,
         label: str,
     ) -> None:
         if not retained:
             raise ValueError("record directory requires a retained path")
+        if (
+            type(trusted_prefix_count) is not int
+            or trusted_prefix_count < 0
+            or trusted_prefix_count > len(retained)
+        ):
+            raise ValueError("record directory trusted prefix is invalid")
         self._anchor_path = anchor_path
         self._anchor_slot = anchor_slot
         self._anchor_identity = anchor_identity
         self._retained = retained
+        self._trusted_prefix_count = trusted_prefix_count
         self.path = path
         self.label = label
         self._owner_pid = os.getpid()
@@ -655,30 +762,30 @@ class _RecordDirectoryCapability:
             raise ValueError(f"{self.label} anchor is unavailable") from None
         if _stat_identity(anchor_current) != self._anchor_identity:
             raise RuntimeError(f"{self.label} anchor name changed")
-        _validate_owned_entry(
-            anchor_current,
-            label=f"{self.label} anchor",
-            kind="directory",
-            mode=0o700,
+        _validate_trusted_parent(
+            anchor_current, label=f"{self.label} anchor"
         )
-        _reconcile_descriptor(
+        _reconcile_trusted_descriptor(
             self._anchor_slot.descriptor,
             self._anchor_identity,
             label=f"{self.label} anchor",
-            kind="directory",
-            mode=0o700,
         )
         parent_fd = self._anchor_slot.descriptor
-        for entry in self._retained:
-            _reconcile_named_descriptor_at(
-                parent_fd,
-                entry.name,
-                entry.slot.descriptor,
-                entry.identity,
-                label=self.label,
-                kind="directory",
-                mode=0o700,
-            )
+        for index, entry in enumerate(self._retained):
+            if index < self._trusted_prefix_count:
+                _reconcile_trusted_named_descriptor_at(
+                    parent_fd, entry, label=self.label
+                )
+            else:
+                _reconcile_named_descriptor_at(
+                    parent_fd,
+                    entry.name,
+                    entry.slot.descriptor,
+                    entry.identity,
+                    label=self.label,
+                    kind="directory",
+                    mode=0o700,
+                )
             parent_fd = entry.slot.descriptor
 
     def inventory(self) -> tuple[str, ...]:
@@ -722,7 +829,11 @@ class _RecordDirectoryCapability:
         )
 
     def __enter__(self) -> "_RecordDirectoryCapability":
-        self._validate_live()
+        try:
+            self._validate_live()
+        except BaseException as primary:
+            self.close(primary)
+            raise AssertionError("record-directory entry produced no error")
         return self
 
     def __exit__(
@@ -735,6 +846,121 @@ class _RecordDirectoryCapability:
         return False
 
 
+class _RecordChildDirectoryCapability:
+    """One retained child borrowed from a live record-directory capability."""
+
+    def __init__(
+        self,
+        *,
+        parent: _RecordDirectoryCapability,
+        retained: tuple[_RetainedDirectory, ...],
+        label: str,
+    ) -> None:
+        if len(retained) != 1:
+            raise ValueError("record child requires exactly one retained directory")
+        self._parent = parent
+        self._retained = retained
+        self.path = parent.path / retained[0].name
+        self.label = label
+        self._owner_pid = os.getpid()
+        self._closed = False
+
+    def _validate_live(self) -> None:
+        _require_lease_process_healthy()
+        if self._closed:
+            raise RuntimeError(f"{self.label} capability is closed")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError(f"{self.label} capability belongs to another process")
+        self._parent._validate_live()
+        entry = self._retained[0]
+        _reconcile_named_descriptor_at(
+            self._parent._retained[-1].slot.descriptor,
+            entry.name,
+            entry.slot.descriptor,
+            entry.identity,
+            label=self.label,
+            kind="directory",
+            mode=0o700,
+        )
+
+    def inventory(self) -> tuple[str, ...]:
+        self._validate_live()
+        descriptor = self._retained[-1].slot.descriptor
+        before = os.fstat(descriptor)
+        try:
+            names = tuple(sorted(os.listdir(descriptor)))
+        except OSError:
+            raise ValueError(f"{self.label} is unavailable") from None
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"{self.label} changed while listing")
+        self._validate_live()
+        return names
+
+    def close(self, primary: BaseException | None = None) -> None:
+        if self._closed:
+            if primary is not None:
+                raise primary
+            raise RuntimeError(f"{self.label} capability is closed")
+        self._closed = True
+        _retire_task_descriptors(
+            tuple(entry.slot for entry in reversed(self._retained)),
+            primary=primary,
+            label=f"{self.label} operation or close failed",
+        )
+
+    def __enter__(self) -> "_RecordChildDirectoryCapability":
+        try:
+            self._validate_live()
+        except BaseException as primary:
+            self.close(primary)
+            raise AssertionError("record-child entry produced no error")
+        return self
+
+    def __exit__(
+        self,
+        _error_type: type[BaseException] | None,
+        error: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        self.close(error)
+        return False
+
+
+def _open_record_child_directory(
+    parent: _RecordDirectoryCapability, name: str, *, label: str
+) -> _RecordChildDirectoryCapability:
+    parent._validate_live()
+    retained = _open_relative_directory_chain_at(
+        parent._retained[-1].slot.descriptor,
+        (name,),
+        label=label,
+        create=False,
+        required_mode=0o700,
+    )
+    capability = _RecordChildDirectoryCapability(
+        parent=parent, retained=retained, label=label
+    )
+    try:
+        capability._validate_live()
+    except BaseException as primary:
+        capability.close(primary)
+        raise AssertionError("record-child acquisition produced no error")
+    return capability
+
+
 def _open_anchored_record_directory(
     *,
     anchor_path: Path,
@@ -744,26 +970,62 @@ def _open_anchored_record_directory(
     label: str,
 ) -> _RecordDirectoryCapability:
     _require_lease_process_healthy()
-    anchor_slot, anchor_identity = _open_absolute_directory_anchor(
-        anchor_path, f"{label} run root"
-    )
+    anchor_path = Path(anchor_path)
+    if (
+        not anchor_path.is_absolute()
+        or anchor_path == Path("/")
+        or any(
+            component in {"", ".", ".."}
+            for component in anchor_path.parts[1:]
+        )
+    ):
+        raise ValueError(f"{label} run root must be an absolute canonical path")
+    try:
+        anchor_slot, anchor_identity = _open_absolute_directory_anchor(
+            Path("/"), f"{label} filesystem root", trusted_parent=True
+        )
+    except BaseException as primary:
+        _raise_task_failures(
+            primary=primary,
+            close_errors=[],
+            label=f"{label} anchor acquisition failed",
+        )
+        raise AssertionError("record-directory anchor acquisition produced no error")
+    trusted: tuple[_RetainedDirectory, ...] = ()
+    run_root: tuple[_RetainedDirectory, ...] = ()
     base: tuple[_RetainedDirectory, ...] = ()
     record: tuple[_RetainedDirectory, ...] = ()
     try:
-        _validate_owned_entry(
-            os.fstat(anchor_slot.descriptor),
+        run_components = anchor_path.parts[1:]
+        trusted = _open_trusted_directory_chain_at(
+            anchor_slot.descriptor,
+            run_components[:-1],
+            label=f"{label} run-root ancestor",
+        )
+        trusted_fd = (
+            trusted[-1].slot.descriptor
+            if trusted
+            else anchor_slot.descriptor
+        )
+        run_root = _open_relative_directory_chain_at(
+            trusted_fd,
+            run_components[-1:],
             label=f"{label} run root",
-            kind="directory",
-            mode=0o700,
+            create=False,
+            required_mode=0o700,
         )
         base = _open_relative_directory_chain_at(
-            anchor_slot.descriptor,
+            run_root[-1].slot.descriptor,
             base_components,
             label=f"{label} base",
             create=False,
             required_mode=0o700,
         )
-        base_fd = base[-1].slot.descriptor if base else anchor_slot.descriptor
+        base_fd = (
+            base[-1].slot.descriptor
+            if base
+            else run_root[-1].slot.descriptor
+        )
         record = _open_relative_directory_chain_at(
             base_fd,
             record_components,
@@ -771,21 +1033,21 @@ def _open_anchored_record_directory(
             create=create,
             required_mode=0o700,
         )
-        retained = base + record
+        retained = trusted + run_root + base + record
         capability = _RecordDirectoryCapability(
-            anchor_path=anchor_path,
+            anchor_path=Path("/"),
             anchor_slot=anchor_slot,
             anchor_identity=anchor_identity,
             retained=retained,
+            trusted_prefix_count=len(trusted),
             path=anchor_path.joinpath(*base_components, *record_components),
             label=label,
         )
         capability._validate_live()
         return capability
     except BaseException as primary:
-        slots = tuple(entry.slot for entry in reversed(base + record)) + (
-            anchor_slot,
-        )
+        retained = trusted + run_root + base + record
+        slots = tuple(entry.slot for entry in reversed(retained)) + (anchor_slot,)
         _retire_task_descriptors(
             slots,
             primary=primary,
@@ -3349,6 +3611,23 @@ def _validate_manifest_count(value: object, label: str) -> None:
         raise ValueError(f"{label} is invalid")
 
 
+def _expected_lifecycle_mode(assignment: CaseAssignment) -> str:
+    if not isinstance(assignment, CaseAssignment):
+        raise TypeError("assignment must be a CaseAssignment")
+    if assignment.key.mode != "lifecycle":
+        raise ValueError("lifecycle mode requires a lifecycle assignment")
+    identity = (
+        assignment.key.mode,
+        assignment.key.ordinal,
+        assignment.key.case_id,
+    )
+    return (
+        "command-selection-only"
+        if identity == _COMMAND_SELECTION_LIFECYCLE_KEY
+        else "executable"
+    )
+
+
 def _validate_manifest_case(
     manifest_case: dict[str, object], *, mode: EvalMode
 ) -> None:
@@ -3463,6 +3742,11 @@ def _validate_seal_context(
         "id"
     ) != assignment.key.case_id:
         raise ValueError("manifest case ID differs from the assignment")
+    if (
+        assignment.key.mode == "lifecycle"
+        and manifest_case.get("mode") != _expected_lifecycle_mode(assignment)
+    ):
+        raise ValueError("manifest lifecycle mode differs from the frozen case")
     if (
         assignment.manifest_sha256
         != (
@@ -3593,12 +3877,6 @@ def _open_attempt_directory(
         create=create,
         label="attempt directory",
     )
-    inventory = directory.inventory()
-    if inventory not in ((), ("start.json",), ("start.json", "terminal.json")):
-        directory.close(
-            ValueError("attempt inventory is partial or contains extras")
-        )
-        raise AssertionError("attempt inventory validation produced no error")
     return attempt_paths, directory
 
 
@@ -3921,8 +4199,21 @@ def read_attempt_seal(
 
 
 def _validate_result_record(
-    result: object, *, assignment: CaseAssignment
+    result: object,
+    *,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
 ) -> dict[str, object]:
+    if type(manifest_case) is not dict:
+        raise TypeError("manifest_case must be an exact dict")
+    _validate_manifest_case(manifest_case, mode=assignment.key.mode)
+    if manifest_case.get("id") != assignment.key.case_id:
+        raise ValueError("manifest case ID differs from the assignment")
+    if (
+        assignment.key.mode == "lifecycle"
+        and manifest_case.get("mode") != _expected_lifecycle_mode(assignment)
+    ):
+        raise ValueError("manifest lifecycle mode differs from the frozen case")
     if type(result) is not dict:
         raise TypeError("result must be an exact dict")
     expected = RESULT_SCHEMAS[assignment.key.mode]
@@ -3933,7 +4224,11 @@ def _validate_result_record(
         or result.get("id") != assignment.key.case_id
     ):
         raise ValueError("case result ID differs from the assignment")
-    if assignment.key.mode == "lifecycle" and result.get("selected_command") is not None:
+    command_selection = (
+        assignment.key.mode == "lifecycle"
+        and _expected_lifecycle_mode(assignment) == "command-selection-only"
+    )
+    if command_selection:
         if (
             type(result.get("selected_command")) is not str
             or not result["selected_command"].strip()
@@ -4456,7 +4751,11 @@ def seal_case(
         result_content = None
         result_sha256 = None
     else:
-        result_payload = _validate_result_record(result, assignment=assignment)
+        result_payload = _validate_result_record(
+            result,
+            assignment=assignment,
+            manifest_case=manifest_case,
+        )
         result_content = canonical_config_bytes(result_payload)
         if len(result_content) > MAX_CASE_RESULT_BYTES:
             raise ValueError("case result exceeds its byte cap")
@@ -4737,7 +5036,11 @@ def _read_case_seal_retained(
             or hashlib.sha256(result_content).hexdigest() != result_sha256
         ):
             raise ValueError("case result hash or size differs")
-        _validate_result_record(result, assignment=assignment)
+        _validate_result_record(
+            result,
+            assignment=assignment,
+            manifest_case=manifest_case,
+        )
     else:
         raise ValueError("case result commit fields are invalid")
     verified_receipt = _read_optional_verified_tombstone_receipt(
@@ -4893,27 +5196,62 @@ def _find_attempt_for_shard_terminal(
     manifest_case: dict[str, object],
     expected_sha256: str,
 ) -> AttemptSeal:
-    matches: list[AttemptSeal] = []
-    for attempt in (1, 2):
-        attempt_paths = paths_for_attempt(paths, attempt)
-        try:
-            attempt_paths.root.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            raise ValueError("shard attempt root is unavailable") from None
-        seal = read_attempt_seal(
-            plan=plan,
-            paths=paths,
-            assignment=assignment,
-            attempt=attempt,
-            manifest_case=manifest_case,
-        )
-        if seal.terminal_sha256 == expected_sha256:
-            matches.append(seal)
-    if len(matches) != 1:
-        raise ValueError("shard terminal must identify exactly one attempt terminal")
-    return matches[0]
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=("attempts",),
+        create=False,
+        label="attempt root",
+    )
+    with directory:
+        inventory = directory.inventory()
+        if not inventory or any(name not in {"01", "02"} for name in inventory):
+            raise ValueError("shard attempt inventory is invalid")
+        with ExitStack() as child_stack:
+            children = {
+                name: child_stack.enter_context(
+                    _open_record_child_directory(
+                        directory, name, label="shard attempt directory"
+                    )
+                )
+                for name in inventory
+            }
+            if directory.inventory() != inventory:
+                raise RuntimeError(
+                    "shard attempt inventory changed while retaining children"
+                )
+
+            matches: list[AttemptSeal] = []
+            manifest_case_sha256 = _validate_seal_context(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+            for attempt in (1, 2):
+                child = children.get(f"{attempt:02d}")
+                if child is None:
+                    continue
+                seal = _read_attempt_seal_retained(
+                    directory=child,
+                    plan=plan,
+                    assignment=assignment,
+                    attempt=attempt,
+                    manifest_case_sha256=manifest_case_sha256,
+                )
+                if seal.terminal_sha256 == expected_sha256:
+                    matches.append(seal)
+
+            if directory.inventory() != inventory:
+                raise RuntimeError(
+                    "shard attempt inventory changed while scanning"
+                )
+            for child in children.values():
+                child._validate_live()
+            if len(matches) != 1:
+                raise ValueError(
+                    "shard terminal must identify exactly one attempt terminal"
+                )
+            return matches[0]
 
 
 def _validate_shard_terminals(
@@ -5300,6 +5638,9 @@ def build_epoch_plan(
             else fingerprints.lifecycle_manifest_sha256
         )
         for ordinal, case in enumerate(manifests[mode], start=1):
+            if type(case) is not dict:
+                raise TypeError("manifest case must be an exact dict")
+            _validate_manifest_case(case, mode=mode)
             key = CaseKey(mode, ordinal, str(case["id"]))
             if key in seen_keys:
                 raise ValueError(f"duplicate case key: {key}")
@@ -5314,6 +5655,19 @@ def build_epoch_plan(
             expected_route: Route = "app-server" if lane == "APP" else "exec"
             if route != expected_route:
                 raise ValueError(f"case transport differs from frozen lane: {key}")
+            if (
+                mode == "lifecycle"
+                and case.get("mode")
+                != (
+                    "command-selection-only"
+                    if (mode, ordinal, key.case_id)
+                    == _COMMAND_SELECTION_LIFECYCLE_KEY
+                    else "executable"
+                )
+            ):
+                raise ValueError(
+                    f"lifecycle mode differs from the frozen case: {key}"
+                )
             assignments.append(
                 CaseAssignment(
                     key=key,

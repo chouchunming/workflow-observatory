@@ -2379,7 +2379,7 @@ gate_root=$(mktemp -d /private/tmp/workflow-observatory-parallel-gate.XXXXXX)
 mkdir -m 700 "$gate_root/base" "$gate_root/head"
 git archive 2f617fea833e583af9cae87308cfde2e620fcd82 | tar -x -C "$gate_root/base"
 git archive HEAD | tar -x -C "$gate_root/head"
-python3 "$gate_root/head/evidence/scripts/check_parallel_eval_frozen_boundary.py" --base-tree "$gate_root/base" --head-tree "$gate_root/head"
+python3 "$gate_root/head/evidence/scripts/check_parallel_eval_frozen_boundary.py" trees --base-tree "$gate_root/base" --head-tree "$gate_root/head"
 python3 -m unittest discover -s "$gate_root/head/plugins/workflow-observer/tests" -p 'test_*.py'
 cd "$gate_root/head/evidence"
 python3 -m unittest discover -s tests -p 'test_*.py'
