@@ -69,6 +69,7 @@ MAX_PROGRESS_STRING_CHARS = 256
 MAX_TOKEN_COUNT = 2**63 - 1
 MAX_PROTOCOL_RECORDS = 19
 MAX_PROTOCOL_CRASH_TEMPS = 19
+MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
 MAX_SEAL_COUNTER = 1_000_000
 MAX_SEAL_ELAPSED_MILLISECONDS = 3_600_000
 MAX_SEAL_FAILURE_CHARS = 2**63 - 1
@@ -4697,20 +4698,6 @@ def _publish_immutable_json_retained(
     return durable_content
 
 
-def _ensure_private_record_directory(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    try:
-        metadata = path.lstat()
-    except OSError:
-        raise ValueError("record directory is unavailable") from None
-    _validate_owned_entry(
-        metadata, label="record directory", kind="directory", mode=0o700
-    )
-
-
 def _directory_inventory(path: Path, label: str) -> tuple[str, ...]:
     try:
         return tuple(sorted(entry.name for entry in os.scandir(path)))
@@ -5698,6 +5685,9 @@ _PROTOCOL_IDENTITY_FIELDS = frozenset(
 _PROTOCOL_TEMP_PATTERN = re.compile(
     r"^\.[0-9]{6}\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
 )
+_PROTOCOL_IDENTITY_TEMP_PATTERN = re.compile(
+    r"^\.protocol-identity\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
+)
 
 
 def _protocol_worker_context(
@@ -5719,8 +5709,14 @@ def _protocol_worker_context(
     try:
         worker_metadata = worker_root.lstat()
         run_metadata = run_root.lstat()
+        hierarchy_metadata = (
+            worker_root.parent.lstat() if lane != "APP" else None
+        )
         resolved_worker = worker_root.resolve(strict=True)
         resolved_run = run_root.resolve(strict=True)
+        resolved_hierarchy = (
+            worker_root.parent.resolve(strict=True) if lane != "APP" else None
+        )
     except OSError:
         raise ValueError("progress worker root is unavailable") from None
     _validate_owned_entry(
@@ -5735,9 +5731,71 @@ def _protocol_worker_context(
         kind="directory",
         mode=0o700,
     )
-    if resolved_worker != worker_root or resolved_run != run_root:
+    if hierarchy_metadata is not None:
+        _validate_owned_entry(
+            hierarchy_metadata,
+            label="progress workers directory",
+            kind="directory",
+            mode=0o700,
+        )
+    if (
+        resolved_worker != worker_root
+        or resolved_run != run_root
+        or (
+            lane != "APP"
+            and resolved_hierarchy != worker_root.parent
+        )
+    ):
         raise ValueError("progress worker root must be canonical")
     return worker_root, run_root
+
+
+def _open_protocol_worker_directory(
+    worker_root: Path,
+    lane: LaneName,
+) -> _RecordDirectoryCapability:
+    bound_worker, run_root = _protocol_worker_context(worker_root, lane)
+    try:
+        worker_components = bound_worker.relative_to(run_root).parts
+    except ValueError:
+        raise ValueError("progress worker root escapes its run root") from None
+    if not worker_components:
+        raise ValueError("progress worker root does not name a worker")
+    return _open_anchored_record_directory(
+        anchor_path=run_root,
+        base_components=worker_components,
+        record_components=(),
+        create=False,
+        label="progress worker directory",
+    )
+
+
+def _open_protocol_record_directory(
+    worker: _RecordDirectoryCapability,
+    name: str,
+    *,
+    label: str,
+    create: bool = True,
+) -> _RecordChildDirectoryCapability:
+    worker._validate_live()
+    retained = _open_relative_directory_chain_at(
+        worker._retained[-1].slot.descriptor,
+        (name,),
+        label=label,
+        create=create,
+        required_mode=0o700,
+    )
+    capability = _RecordChildDirectoryCapability(
+        parent=worker,
+        retained=retained,
+        label=label,
+    )
+    try:
+        capability._validate_live()
+    except BaseException as primary:
+        capability.close(primary)
+        raise AssertionError("protocol record acquisition produced no error")
+    return capability
 
 
 def _validate_progress_case(case: object, lane: LaneName) -> CaseKey:
@@ -6275,123 +6333,6 @@ def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> N
         )
 
 
-def _write_protocol_record(
-    path: Path, payload: Mapping[str, Any], *, byte_cap: int
-) -> bytes:
-    _require_lease_process_healthy()
-    content = canonical_config_bytes(payload)
-    if len(content) > byte_cap:
-        raise ValueError(f"{path.name} exceeds its byte cap")
-    _ensure_private_record_directory(path.parent)
-    parent_descriptor, parent_metadata = _open_private_directory(
-        path.parent,
-        "protocol record directory",
-    )
-    parent_slot = _DescriptorSlot(parent_descriptor)
-    try:
-        live_parent = path.parent.lstat()
-        _validate_owned_entry(
-            live_parent,
-            label="protocol record directory",
-            kind="directory",
-            mode=0o700,
-        )
-        if (
-            live_parent.st_dev,
-            live_parent.st_ino,
-        ) != (
-            parent_metadata.st_dev,
-            parent_metadata.st_ino,
-        ):
-            raise RuntimeError("protocol record directory changed before publish")
-    except BaseException as error:
-        _retire_task_descriptors(
-            [parent_slot],
-            primary=error,
-            label="protocol directory validation or close failed",
-        )
-    temporary_name = f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
-    temporary_slot: _DescriptorSlot | None = None
-    temporary_created = False
-    collision = False
-    primary: BaseException | None = None
-    close_errors: list[BaseException] = []
-    cleanup_errors: list[BaseException] = []
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= _required_os_flag("O_NOFOLLOW") | getattr(os, "O_CLOEXEC", 0)
-        temporary_descriptor = os.open(
-            temporary_name,
-            flags,
-            0o600,
-            dir_fd=parent_slot.descriptor,
-        )
-        temporary_created = True
-        temporary_slot = _DescriptorSlot(temporary_descriptor)
-        os.fchmod(temporary_slot.descriptor, 0o600)
-        view = memoryview(content)
-        while view:
-            written = os.write(temporary_slot.descriptor, view)
-            if written <= 0:
-                raise OSError("protocol record write made no progress")
-            view = view[written:]
-        os.fsync(temporary_slot.descriptor)
-    except BaseException as error:
-        primary = error
-
-    if temporary_slot is not None:
-        close_error = _retire_descriptor_capability(temporary_slot)
-        if close_error is not None:
-            close_errors.append(close_error)
-    indeterminate = (
-        primary is not None and is_indeterminate_descriptor_close(primary)
-    ) or any(
-        is_indeterminate_descriptor_close(error) for error in close_errors
-    )
-
-    if primary is None and not close_errors and not indeterminate:
-        try:
-            os.link(
-                temporary_name,
-                path.name,
-                src_dir_fd=parent_slot.descriptor,
-                dst_dir_fd=parent_slot.descriptor,
-                follow_symlinks=False,
-            )
-            os.fsync(parent_slot.descriptor)
-        except FileExistsError:
-            collision = True
-        except BaseException as error:
-            primary = error
-            indeterminate = is_indeterminate_descriptor_close(error)
-
-    if temporary_created and not indeterminate:
-        try:
-            os.unlink(temporary_name, dir_fd=parent_slot.descriptor)
-            os.fsync(parent_slot.descriptor)
-        except FileNotFoundError as error:
-            cleanup_errors.append(error)
-        except OSError as error:
-            cleanup_errors.append(error)
-
-    parent_close_error = _retire_descriptor_capability(parent_slot)
-    if parent_close_error is not None:
-        close_errors.append(parent_close_error)
-    _raise_ordered_failures(
-        "protocol publication or cleanup failed",
-        primary,
-        [*close_errors, *cleanup_errors],
-    )
-    durable, durable_content = _read_canonical_record(
-        path, path.name, byte_cap=byte_cap
-    )
-    if durable != payload or durable_content != content:
-        if collision:
-            raise ValueError(f"{path.name} already differs")
-        raise ValueError(f"{path.name} durable readback differs")
-    return durable_content
-
-
 def _protocol_identity_payload(
     message: ProgressMessage,
 ) -> dict[str, object]:
@@ -6408,12 +6349,168 @@ def _protocol_identity_payload(
     return payload
 
 
-def _read_worker_protocol_identity(
-    worker_root: Path,
+def _read_optional_protocol_record_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    label: str,
+    *,
+    byte_cap: int,
+) -> tuple[dict[str, object], bytes] | None:
+    directory._validate_live()
+    descriptor = directory._retained[-1].slot.descriptor
+    try:
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        directory._validate_live()
+        return None
+    except OSError:
+        raise ValueError(f"{label} is unavailable") from None
+    _validate_owned_entry(
+        metadata,
+        label=label,
+        kind="file",
+        mode=0o600,
+    )
+    return _read_canonical_record_retained(
+        directory,
+        name,
+        label,
+        byte_cap=byte_cap,
+    )
+
+
+def _write_protocol_record_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    payload: Mapping[str, Any],
+    *,
+    byte_cap: int,
+) -> bytes:
+    content = canonical_config_bytes(payload)
+    if len(content) > byte_cap:
+        raise ValueError(f"{name} exceeds its byte cap")
+    existing = _read_optional_protocol_record_retained(
+        directory,
+        name,
+        name,
+        byte_cap=byte_cap,
+    )
+    if existing is not None:
+        durable, durable_content = existing
+        if durable != payload or durable_content != content:
+            raise ValueError(f"{name} already differs")
+        return durable_content
+    try:
+        return _publish_immutable_json_retained(
+            directory,
+            name,
+            payload,
+            byte_cap=byte_cap,
+        )
+    except ValueError as error:
+        durable = _read_optional_protocol_record_retained(
+            directory,
+            name,
+            name,
+            byte_cap=byte_cap,
+        )
+        if durable is not None and durable == (dict(payload), content):
+            return durable[1]
+        raise error
+
+
+def _protocol_identity_inventory_retained(
+    worker: _RecordDirectoryCapability,
+    *,
+    publishing: bool,
+) -> bool:
+    worker._validate_live()
+    descriptor = worker._retained[-1].slot.descriptor
+    before = os.fstat(descriptor)
+    crash_temp_count = 0
+    final_present = False
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            name = entry.name
+            if _PROTOCOL_IDENTITY_TEMP_PATTERN.fullmatch(name):
+                crash_temp_count += 1
+                if crash_temp_count > MAX_PROTOCOL_IDENTITY_CRASH_TEMPS:
+                    raise ValueError(
+                        "worker protocol identity crash temporary inventory "
+                        "exceeds its cap"
+                    )
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    raise ValueError(
+                        "worker protocol identity crash temporary is unavailable"
+                    ) from None
+                _validate_owned_entry(
+                    metadata,
+                    label="worker protocol identity crash temporary",
+                    kind="file",
+                    mode=0o600,
+                )
+                continue
+            if (
+                name.startswith(".protocol-identity")
+                or "protocol-identity.json.tmp-" in name
+            ):
+                raise ValueError(
+                    "worker protocol identity crash temporary is unsafe"
+                )
+            if name == "protocol-identity.json":
+                if final_present:
+                    raise AssertionError("worker protocol identity is duplicated")
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    raise ValueError(
+                        "worker protocol identity is unavailable"
+                    ) from None
+                _validate_owned_entry(
+                    metadata,
+                    label="worker protocol identity",
+                    kind="file",
+                    mode=0o600,
+                )
+                final_present = True
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise RuntimeError("worker protocol identity inventory changed while scanning")
+    if (
+        publishing
+        and not final_present
+        and crash_temp_count >= MAX_PROTOCOL_IDENTITY_CRASH_TEMPS
+    ):
+        raise ValueError(
+            "worker protocol identity crash temporary inventory exceeds its cap"
+        )
+    worker._validate_live()
+    return final_present
+
+
+def _read_worker_protocol_identity_retained(
+    worker: _RecordDirectoryCapability,
     message: ProgressMessage,
 ) -> None:
-    payload, _ = _read_canonical_record(
-        worker_root / "protocol-identity.json",
+    if not _protocol_identity_inventory_retained(worker, publishing=False):
+        raise ValueError("worker protocol identity is unavailable")
+    payload, _ = _read_canonical_record_retained(
+        worker,
+        "protocol-identity.json",
         "worker protocol identity",
         byte_cap=MAX_PROGRESS_BYTES,
     )
@@ -6431,33 +6528,62 @@ def _read_worker_protocol_identity(
         raise ValueError("worker protocol identity differs")
 
 
-def _seal_worker_protocol_identity(
-    worker_root: Path,
+def _seal_worker_protocol_identity_retained(
+    worker: _RecordDirectoryCapability,
     message: ProgressMessage,
 ) -> None:
-    _write_protocol_record(
-        worker_root / "protocol-identity.json",
+    if _protocol_identity_inventory_retained(worker, publishing=False):
+        _read_worker_protocol_identity_retained(worker, message)
+        return
+    _protocol_identity_inventory_retained(worker, publishing=True)
+    _write_protocol_record_retained(
+        worker,
+        "protocol-identity.json",
         _protocol_identity_payload(message),
         byte_cap=MAX_PROGRESS_BYTES,
     )
-    _read_worker_protocol_identity(worker_root, message)
+    _read_worker_protocol_identity_retained(worker, message)
+
+
+def _lock_protocol_worker(worker: _RecordDirectoryCapability) -> None:
+    worker._validate_live()
+    fcntl.flock(
+        worker._retained[-1].slot.descriptor,
+        fcntl.LOCK_EX,
+    )
+    worker._validate_live()
 
 
 def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
-    _validate_progress_durable(bound_worker, message)
-    _protocol_sequence_inventory(
-        bound_worker / "progress",
-        label="progress",
-        deadline=None,
-        publishing_seq=message.seq,
-    )
-    _seal_worker_protocol_identity(bound_worker, message)
+    worker = _open_protocol_worker_directory(bound_worker, message.lane)
     path = bound_worker / "progress" / f"{message.seq:06d}.json"
-    _write_protocol_record(
-        path, _encode_progress_message(message), byte_cap=MAX_PROGRESS_BYTES
-    )
+    with worker:
+        _lock_protocol_worker(worker)
+        _validate_progress_durable(bound_worker, message)
+        worker._validate_live()
+        progress = _open_protocol_record_directory(
+            worker,
+            "progress",
+            label="progress directory",
+        )
+        with progress:
+            _protocol_sequence_inventory_retained(
+                progress,
+                label="progress",
+                deadline=None,
+                publishing_seq=message.seq,
+            )
+            _seal_worker_protocol_identity_retained(worker, message)
+            _write_protocol_record_retained(
+                progress,
+                path.name,
+                _encode_progress_message(message),
+                byte_cap=MAX_PROGRESS_BYTES,
+            )
+            progress._validate_live()
+        worker._validate_live()
     return path
 
 
@@ -6480,14 +6606,45 @@ def read_progress(
         raise ValueError("progress path differs from its expected sequence")
     worker_root = path.parent.parent
     _protocol_worker_context(worker_root, expected_lane)
-    payload, _ = _read_canonical_record(
-        path, "progress", byte_cap=MAX_PROGRESS_BYTES
+    worker = _open_protocol_worker_directory(worker_root, expected_lane)
+    with worker:
+        progress = _open_protocol_record_directory(
+            worker,
+            "progress",
+            label="progress directory",
+            create=False,
+        )
+        with progress:
+            message = _read_progress_retained(
+                worker,
+                progress,
+                expected_lane=expected_lane,
+                expected_seq=expected_seq,
+            )
+        worker._validate_live()
+        return message
+
+
+def _read_progress_retained(
+    worker: _RecordDirectoryCapability,
+    progress: _RecordChildDirectoryCapability,
+    *,
+    expected_lane: LaneName,
+    expected_seq: int,
+) -> ProgressMessage:
+    expected_name = f"{expected_seq:06d}.json"
+    payload, _ = _read_canonical_record_retained(
+        progress,
+        expected_name,
+        "progress",
+        byte_cap=MAX_PROGRESS_BYTES,
     )
     message = _decode_progress_message(payload)
     if message.lane != expected_lane or message.seq != expected_seq:
         raise ValueError("progress record identity differs")
-    _read_worker_protocol_identity(worker_root, message)
-    _validate_progress_durable(worker_root, message)
+    _read_worker_protocol_identity_retained(worker, message)
+    _validate_progress_durable(worker.path, message)
+    progress._validate_live()
     return message
 
 
@@ -6499,6 +6656,102 @@ def _validate_wait_timeout(timeout: float) -> float:
     ):
         raise ValueError("timeout must be a finite non-negative number")
     return float(timeout)
+
+
+def _protocol_sequence_inventory_retained(
+    directory: _RecordChildDirectoryCapability,
+    *,
+    label: str,
+    deadline: float | None,
+    publishing_seq: int | None = None,
+) -> tuple[int, ...]:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"timed out while scanning {label} records")
+    directory._validate_live()
+    descriptor = directory._retained[-1].slot.descriptor
+    before = os.fstat(descriptor)
+    sequences: list[int] = []
+    crash_temp_count = 0
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out while scanning {label} records")
+            name = entry.name
+            if _PROTOCOL_TEMP_PATTERN.fullmatch(name):
+                crash_temp_count += 1
+                if crash_temp_count > MAX_PROTOCOL_CRASH_TEMPS:
+                    raise ValueError(
+                        f"{label} crash temporary inventory exceeds its cap"
+                    )
+                try:
+                    temporary_metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    raise ValueError(
+                        f"{label} crash temporary record is unavailable"
+                    ) from None
+                _validate_owned_entry(
+                    temporary_metadata,
+                    label=f"{label} crash temporary record",
+                    kind="file",
+                    mode=0o600,
+                )
+                continue
+            if name.startswith(".") or ".tmp-" in name:
+                raise ValueError(
+                    f"{label} directory contains an unknown crash temporary"
+                )
+            if re.fullmatch(r"[0-9]{6}\.json", name) is None:
+                raise ValueError(f"{label} directory contains an unsafe record")
+            if len(sequences) >= MAX_PROTOCOL_RECORDS:
+                raise ValueError(f"{label} record inventory exceeds its cap")
+            try:
+                record_metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                raise ValueError(f"{label} record is unavailable") from None
+            _validate_owned_entry(
+                record_metadata,
+                label=f"{label} record",
+                kind="file",
+                mode=0o600,
+            )
+            sequence = int(name[:6])
+            if sequence < 1:
+                raise ValueError(f"{label} sequence is invalid")
+            sequences.append(sequence)
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise RuntimeError(f"{label} inventory changed while scanning")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"timed out while scanning {label} records")
+    sequences.sort()
+    if (
+        publishing_seq is not None
+        and publishing_seq not in sequences
+        and len(sequences) >= MAX_PROTOCOL_RECORDS
+    ):
+        raise ValueError(f"{label} record inventory exceeds its cap")
+    if (
+        publishing_seq is not None
+        and publishing_seq not in sequences
+        and crash_temp_count >= MAX_PROTOCOL_CRASH_TEMPS
+    ):
+        raise ValueError(
+            f"{label} crash temporary inventory exceeds its cap"
+        )
+    directory._validate_live()
+    return tuple(sequences)
 
 
 def _protocol_sequence_inventory(
@@ -6655,58 +6908,94 @@ def wait_for_progress(
         raise ValueError("expected progress digest is invalid")
     timeout_value = _validate_wait_timeout(timeout)
     deadline = time.monotonic() + timeout_value
-    progress_root = bound_worker / "progress"
-    path = progress_root / f"{expected_seq:06d}.json"
-    while True:
-        sequences = _protocol_sequence_inventory(
-            progress_root,
-            label="progress",
-            deadline=deadline,
-        )
-        _require_protocol_sequence_prefix(
-            sequences,
-            expected_seq=expected_seq,
-            label="progress",
-        )
-        for sequence in range(1, expected_seq):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for durable progress")
-            read_progress(
-                progress_root / f"{sequence:06d}.json",
-                expected_lane,
-                sequence,
-            )
-        if (
-            _protocol_sequence_inventory(
-                progress_root,
-                label="progress",
-                deadline=deadline,
-            )
-            != sequences
-        ):
-            raise RuntimeError("progress inventory changed while polling")
-        if expected_seq in sequences:
-            message = read_progress(path, expected_lane, expected_seq)
-            if expected_sha256 is not None:
-                _, content = _read_canonical_record(
-                    path, "progress", byte_cap=MAX_PROGRESS_BYTES
+    worker = _open_protocol_worker_directory(bound_worker, expected_lane)
+    with worker:
+        with ExitStack() as retained:
+            progress: _RecordChildDirectoryCapability | None = None
+            while True:
+                if progress is None:
+                    try:
+                        progress = retained.enter_context(
+                            _open_protocol_record_directory(
+                                worker,
+                                "progress",
+                                label="progress directory",
+                                create=False,
+                            )
+                        )
+                    except FileNotFoundError:
+                        worker._validate_live()
+                sequences = (
+                    ()
+                    if progress is None
+                    else _protocol_sequence_inventory_retained(
+                        progress,
+                        label="progress",
+                        deadline=deadline,
+                    )
                 )
-                if hashlib.sha256(content).hexdigest() != expected_sha256:
-                    raise ValueError("progress wake-up digest differs")
-            if (
-                _protocol_sequence_inventory(
-                    progress_root,
+                _require_protocol_sequence_prefix(
+                    sequences,
+                    expected_seq=expected_seq,
                     label="progress",
-                    deadline=deadline,
                 )
-                != sequences
-            ):
-                raise RuntimeError("progress inventory changed while reading")
-            return message
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("timed out waiting for durable progress")
-        time.sleep(min(0.01, remaining))
+                if progress is not None:
+                    for sequence in range(1, expected_seq):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "timed out waiting for durable progress"
+                            )
+                        _read_progress_retained(
+                            worker,
+                            progress,
+                            expected_lane=expected_lane,
+                            expected_seq=sequence,
+                        )
+                    if (
+                        _protocol_sequence_inventory_retained(
+                            progress,
+                            label="progress",
+                            deadline=deadline,
+                        )
+                        != sequences
+                    ):
+                        raise RuntimeError(
+                            "progress inventory changed while polling"
+                        )
+                if expected_seq in sequences:
+                    if progress is None:
+                        raise AssertionError(
+                            "progress inventory exists without a directory"
+                        )
+                    message = _read_progress_retained(
+                        worker,
+                        progress,
+                        expected_lane=expected_lane,
+                        expected_seq=expected_seq,
+                    )
+                    if expected_sha256 is not None:
+                        content = canonical_config_bytes(
+                            _encode_progress_message(message)
+                        )
+                        if hashlib.sha256(content).hexdigest() != expected_sha256:
+                            raise ValueError("progress wake-up digest differs")
+                    if (
+                        _protocol_sequence_inventory_retained(
+                            progress,
+                            label="progress",
+                            deadline=deadline,
+                        )
+                        != sequences
+                    ):
+                        raise RuntimeError(
+                            "progress inventory changed while reading"
+                        )
+                    worker._validate_live()
+                    return message
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for durable progress")
+                time.sleep(min(0.01, remaining))
 
 
 def _encode_ack(ack: Ack) -> dict[str, object]:
@@ -6753,19 +7042,22 @@ def _durable_progress_hash(worker_root: Path, message: ProgressMessage) -> str:
     durable = read_progress(path, message.lane, message.seq)
     if durable != message:
         raise ValueError("durable progress differs from ACK message")
-    _, content = _read_canonical_record(
-        path, "progress", byte_cap=MAX_PROGRESS_BYTES
-    )
+    content = canonical_config_bytes(_encode_progress_message(durable))
     return hashlib.sha256(content).hexdigest()
 
 
-def _read_ack_for_progress(
-    worker_root: Path, message: ProgressMessage
+def _read_ack_for_progress_retained(
+    worker: _RecordDirectoryCapability,
+    acks: _RecordChildDirectoryCapability,
+    message: ProgressMessage,
 ) -> Ack:
-    expected_hash = _durable_progress_hash(worker_root, message)
-    path = worker_root / "acks" / f"{message.seq:06d}.json"
-    payload, _ = _read_canonical_record(
-        path, "ack", byte_cap=MAX_PROGRESS_BYTES
+    expected_hash = _durable_progress_hash(worker.path, message)
+    worker._validate_live()
+    payload, _ = _read_canonical_record_retained(
+        acks,
+        f"{message.seq:06d}.json",
+        "ack",
+        byte_cap=MAX_PROGRESS_BYTES,
     )
     ack = _decode_ack(payload)
     if (
@@ -6776,6 +7068,7 @@ def _read_ack_for_progress(
         or ack.message_sha256 != expected_hash
     ):
         raise ValueError("ACK differs from durable progress")
+    acks._validate_live()
     return ack
 
 
@@ -6784,26 +7077,44 @@ def write_ack(
 ) -> Path:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
-    _read_worker_protocol_identity(bound_worker, message)
     if type(decision) is not str or decision not in _ACK_DECISIONS:
         raise ValueError("ACK decision is invalid")
-    ack = Ack(
-        schema_version=1,
-        epoch_id=message.epoch_id,
-        run_kind=message.run_kind,
-        lane=message.lane,
-        seq=message.seq,
-        message_sha256=_durable_progress_hash(bound_worker, message),
-        decision=decision,
-    )
     path = bound_worker / "acks" / f"{message.seq:06d}.json"
-    _protocol_sequence_inventory(
-        path.parent,
-        label="ACK",
-        deadline=None,
-        publishing_seq=message.seq,
-    )
-    _write_protocol_record(path, _encode_ack(ack), byte_cap=MAX_PROGRESS_BYTES)
+    worker = _open_protocol_worker_directory(bound_worker, message.lane)
+    with worker:
+        _lock_protocol_worker(worker)
+        _read_worker_protocol_identity_retained(worker, message)
+        message_sha256 = _durable_progress_hash(bound_worker, message)
+        worker._validate_live()
+        ack = Ack(
+            schema_version=1,
+            epoch_id=message.epoch_id,
+            run_kind=message.run_kind,
+            lane=message.lane,
+            seq=message.seq,
+            message_sha256=message_sha256,
+            decision=decision,
+        )
+        acks = _open_protocol_record_directory(
+            worker,
+            "acks",
+            label="ACK directory",
+        )
+        with acks:
+            _protocol_sequence_inventory_retained(
+                acks,
+                label="ACK",
+                deadline=None,
+                publishing_seq=message.seq,
+            )
+            _write_protocol_record_retained(
+                acks,
+                path.name,
+                _encode_ack(ack),
+                byte_cap=MAX_PROGRESS_BYTES,
+            )
+            acks._validate_live()
+        worker._validate_live()
     return path
 
 
@@ -6812,53 +7123,99 @@ def wait_for_ack(
 ) -> Ack:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
-    _read_worker_protocol_identity(bound_worker, message)
-    _durable_progress_hash(bound_worker, message)
     timeout_value = _validate_wait_timeout(timeout)
     deadline = time.monotonic() + timeout_value
-    ack_root = bound_worker / "acks"
-    while True:
-        sequences = _protocol_sequence_inventory(
-            ack_root,
-            label="ACK",
-            deadline=deadline,
-        )
-        _require_protocol_sequence_prefix(
-            sequences,
-            expected_seq=message.seq,
-            label="ACK",
-        )
-        for sequence in range(1, message.seq):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for progress ACK")
-            prior_progress = read_progress(
-                bound_worker / "progress" / f"{sequence:06d}.json",
-                message.lane,
-                sequence,
-            )
-            _read_ack_for_progress(bound_worker, prior_progress)
-        if (
-            _protocol_sequence_inventory(
-                ack_root,
-                label="ACK",
-                deadline=deadline,
-            )
-            != sequences
-        ):
-            raise RuntimeError("ACK inventory changed while polling")
-        if message.seq in sequences:
-            ack = _read_ack_for_progress(bound_worker, message)
-            if _protocol_sequence_inventory(
-                ack_root,
-                label="ACK",
-                deadline=deadline,
-            ) != sequences:
-                raise RuntimeError("ACK inventory changed while reading")
-            return ack
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("timed out waiting for progress ACK")
-        time.sleep(min(0.01, remaining))
+    worker = _open_protocol_worker_directory(bound_worker, message.lane)
+    with worker:
+        _read_worker_protocol_identity_retained(worker, message)
+        _durable_progress_hash(bound_worker, message)
+        worker._validate_live()
+        with ExitStack() as retained:
+            acks: _RecordChildDirectoryCapability | None = None
+            while True:
+                if acks is None:
+                    try:
+                        acks = retained.enter_context(
+                            _open_protocol_record_directory(
+                                worker,
+                                "acks",
+                                label="ACK directory",
+                                create=False,
+                            )
+                        )
+                    except FileNotFoundError:
+                        worker._validate_live()
+                sequences = (
+                    ()
+                    if acks is None
+                    else _protocol_sequence_inventory_retained(
+                        acks,
+                        label="ACK",
+                        deadline=deadline,
+                    )
+                )
+                _require_protocol_sequence_prefix(
+                    sequences,
+                    expected_seq=message.seq,
+                    label="ACK",
+                )
+                if acks is not None:
+                    for sequence in range(1, message.seq):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "timed out waiting for progress ACK"
+                            )
+                        prior_progress = read_progress(
+                            bound_worker
+                            / "progress"
+                            / f"{sequence:06d}.json",
+                            message.lane,
+                            sequence,
+                        )
+                        worker._validate_live()
+                        _read_ack_for_progress_retained(
+                            worker,
+                            acks,
+                            prior_progress,
+                        )
+                    if (
+                        _protocol_sequence_inventory_retained(
+                            acks,
+                            label="ACK",
+                            deadline=deadline,
+                        )
+                        != sequences
+                    ):
+                        raise RuntimeError(
+                            "ACK inventory changed while polling"
+                        )
+                if message.seq in sequences:
+                    if acks is None:
+                        raise AssertionError(
+                            "ACK inventory exists without a directory"
+                        )
+                    ack = _read_ack_for_progress_retained(
+                        worker,
+                        acks,
+                        message,
+                    )
+                    if (
+                        _protocol_sequence_inventory_retained(
+                            acks,
+                            label="ACK",
+                            deadline=deadline,
+                        )
+                        != sequences
+                    ):
+                        raise RuntimeError(
+                            "ACK inventory changed while reading"
+                        )
+                    worker._validate_live()
+                    return ack
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for progress ACK")
+                time.sleep(min(0.01, remaining))
 
 
 class ProgressAckLedger:
@@ -6884,28 +7241,41 @@ class ProgressAckLedger:
         self._completed_attempts: set[tuple[CaseKey, int]] = set()
         self._epoch_id: str | None = None
         self._run_kind: RunKind | None = None
+        self._state_lock = threading.RLock()
         self._aborted = False
         self._stop_launches = max_total_tokens == 0
         self._exited: set[LaneName] = set()
 
     @property
     def total_tokens(self) -> int:
-        return self._total_tokens
+        with self._state_lock:
+            return self._total_tokens
 
     @property
     def max_total_tokens(self) -> int | None:
-        return self._max_total_tokens
+        with self._state_lock:
+            return self._max_total_tokens
 
     @property
     def stop_launches(self) -> bool:
-        return self._stop_launches
+        with self._state_lock:
+            return self._stop_launches
 
     @property
     def aborted(self) -> bool:
-        return self._aborted
+        with self._state_lock:
+            return self._aborted
 
     def accept_progress(self, message: ProgressMessage) -> AckDecision:
         payload = _encode_progress_message(message)
+        with self._state_lock:
+            return self._accept_progress_locked(message, payload)
+
+    def _accept_progress_locked(
+        self,
+        message: ProgressMessage,
+        payload: dict[str, object],
+    ) -> AckDecision:
         if self._epoch_id is not None and (
             message.epoch_id != self._epoch_id
             or message.run_kind != self._run_kind
@@ -7000,10 +7370,11 @@ class ProgressAckLedger:
     def worker_exited(self, lane: LaneName) -> AckDecision:
         if type(lane) is not str or lane not in ("E1", "E2", "E3", "APP"):
             raise ValueError("worker exit lane is invalid")
-        self._exited.add(lane)
-        self._active_cases[lane] = None
-        self._aborted = True
-        return "abort"
+        with self._state_lock:
+            self._exited.add(lane)
+            self._active_cases[lane] = None
+            self._aborted = True
+            return "abort"
 
 
 def canonical_config_bytes(config: Mapping[str, Any]) -> bytes:

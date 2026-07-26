@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import stat
@@ -8292,6 +8293,439 @@ class ProgressProtocolTests(unittest.TestCase):
                     label="progress",
                     deadline=1.0,
                 )
+
+    def _concurrent_publication_temp_peaks(self, directory, pattern, calls):
+        real_open = sharding.os.open
+        real_fsync = sharding.os.fsync
+        directory_identity = (
+            directory.stat().st_dev,
+            directory.stat().st_ino,
+        )
+        tracked = set()
+        tracked_lock = threading.Lock()
+        boundary = threading.Barrier(2)
+        peaks = []
+        results = []
+        failures = []
+
+        def tracking_open(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            dir_fd = kwargs.get("dir_fd")
+            if (
+                isinstance(path, str)
+                and pattern.fullmatch(path) is not None
+                and dir_fd is not None
+                and (
+                    os.fstat(dir_fd).st_dev,
+                    os.fstat(dir_fd).st_ino,
+                )
+                == directory_identity
+            ):
+                with tracked_lock:
+                    tracked.add(descriptor)
+            return descriptor
+
+        def observing_fsync(descriptor):
+            with tracked_lock:
+                is_temporary = descriptor in tracked
+                if is_temporary:
+                    tracked.remove(descriptor)
+            if is_temporary:
+                try:
+                    boundary.wait(0.1)
+                except threading.BrokenBarrierError:
+                    pass
+                peaks.append(
+                    sum(
+                        pattern.fullmatch(path.name) is not None
+                        for path in directory.iterdir()
+                    )
+                )
+            return real_fsync(descriptor)
+
+        def publish(call):
+            try:
+                call()
+                results.append("ok")
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch.object(
+            sharding.os,
+            "open",
+            side_effect=tracking_open,
+        ), mock.patch.object(
+            sharding.os,
+            "fsync",
+            side_effect=observing_fsync,
+        ):
+            threads = [
+                threading.Thread(target=publish, args=(call,))
+                for call in calls
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(3.0)
+                self.assertFalse(thread.is_alive())
+        return results, failures, peaks
+
+    def test_progress_ack_ledger_serializes_identity_and_token_state(self):
+        formal = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("formal"),
+        )
+        diagnostic = self._lane_message(
+            seq=1,
+            progress_type="lane-ready",
+            lane="E1",
+        )
+        mixed = replace(
+            diagnostic,
+            epoch_id=formal.epoch_id,
+            run_kind=formal.run_kind,
+            lane="E2",
+        )
+        ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        identity_boundary = threading.Barrier(2)
+        real_canonical = sharding.canonical_config_bytes
+        results = []
+        failures = []
+
+        def pause_after_identity_check(config):
+            if (
+                isinstance(config, dict)
+                and set(config) == sharding.PROGRESS_FIELDS
+                and config.get("seq") == 1
+            ):
+                try:
+                    identity_boundary.wait(0.1)
+                except threading.BrokenBarrierError:
+                    pass
+            return real_canonical(config)
+
+        def accept(message):
+            try:
+                results.append((message, ledger.accept_progress(message)))
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch.object(
+            sharding,
+            "canonical_config_bytes",
+            side_effect=pause_after_identity_check,
+        ):
+            first = threading.Thread(target=accept, args=(diagnostic,))
+            second = threading.Thread(target=accept, args=(mixed,))
+            first.start()
+            second.start()
+            first.join(2.0)
+            second.join(2.0)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+        self.assertEqual(1, len(results))
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], ValueError)
+
+        winning = results[0][0]
+        losing = mixed if winning == diagnostic else diagnostic
+        self.assertEqual(
+            "continue",
+            ledger.accept_progress(
+                replace(
+                    losing,
+                    epoch_id=winning.epoch_id,
+                    run_kind=winning.run_kind,
+                )
+            ),
+        )
+
+        terminal_e1 = self._success_terminal_message(seq=2)
+        terminal_e2 = replace(
+            terminal_e1,
+            lane="E2",
+            case=dict(sharding.FROZEN_LANE_CASES)["E2"][0],
+        )
+        token_ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        token_ledger.accept_progress(
+            self._case_started_for_terminal(terminal_e1, seq=1)
+        )
+        token_ledger.accept_progress(
+            self._case_started_for_terminal(terminal_e2, seq=1)
+        )
+        token_boundary = threading.Barrier(2)
+
+        class RacingTotal(int):
+            def __add__(self, other):
+                try:
+                    token_boundary.wait(0.1)
+                except threading.BrokenBarrierError:
+                    pass
+                return int(self) + other
+
+        token_ledger._total_tokens = RacingTotal(0)
+        token_results = []
+        token_failures = []
+
+        def accept_terminal(message):
+            try:
+                token_results.append(token_ledger.accept_progress(message))
+            except BaseException as error:
+                token_failures.append(error)
+
+        first = threading.Thread(target=accept_terminal, args=(terminal_e1,))
+        second = threading.Thread(target=accept_terminal, args=(terminal_e2,))
+        first.start()
+        second.start()
+        first.join(2.0)
+        second.join(2.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([], token_failures)
+        self.assertEqual(["continue", "continue"], sorted(token_results))
+        self.assertEqual(2 * self.usage["total_tokens"], token_ledger.total_tokens)
+
+    def test_concurrent_progress_and_ack_publishers_reserve_temp_capacity(self):
+        sequence_pattern = re.compile(
+            r"^\.[0-9]{6}\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
+        )
+
+        progress_run = self.root / "reserved-progress" / "run"
+        progress_run.mkdir(parents=True, mode=0o700)
+        progress_run.chmod(0o700)
+        progress_worker = self._worker_root(progress_run)
+        sharding.write_progress(
+            progress_worker,
+            self._lane_message(seq=1, progress_type="lane-ready"),
+        )
+        progress_dir = progress_worker / "progress"
+        for index in range(18):
+            temporary = progress_dir / (
+                f".000001.json.tmp-{index + 1}-{index:032x}"
+            )
+            temporary.write_bytes(b"")
+            temporary.chmod(0o600)
+        results, failures, peaks = self._concurrent_publication_temp_peaks(
+            progress_dir,
+            sequence_pattern,
+            (
+                lambda: sharding.write_progress(
+                    progress_worker,
+                    self._lane_message(seq=2, progress_type="lane-ready"),
+                ),
+                lambda: sharding.write_progress(
+                    progress_worker,
+                    self._lane_message(seq=3, progress_type="lane-ready"),
+                ),
+            ),
+        )
+        self.assertEqual(["ok", "ok"], sorted(results))
+        self.assertEqual([], failures)
+        self.assertTrue(peaks)
+        self.assertLessEqual(max(peaks), sharding.MAX_PROTOCOL_CRASH_TEMPS)
+
+        ack_run = self.root / "reserved-ack" / "run"
+        ack_run.mkdir(parents=True, mode=0o700)
+        ack_run.chmod(0o700)
+        ack_worker = self._worker_root(ack_run)
+        messages = tuple(
+            self._lane_message(seq=seq, progress_type="lane-ready")
+            for seq in (1, 2, 3)
+        )
+        for message in messages:
+            sharding.write_progress(ack_worker, message)
+        ack_dir = ack_worker / "acks"
+        ack_dir.mkdir(mode=0o700)
+        for index in range(18):
+            temporary = ack_dir / (
+                f".000001.json.tmp-{index + 1}-{index:032x}"
+            )
+            temporary.write_bytes(b"")
+            temporary.chmod(0o600)
+        results, failures, peaks = self._concurrent_publication_temp_peaks(
+            ack_dir,
+            sequence_pattern,
+            (
+                lambda: sharding.write_ack(
+                    ack_worker,
+                    messages[1],
+                    "continue",
+                ),
+                lambda: sharding.write_ack(
+                    ack_worker,
+                    messages[2],
+                    "continue",
+                ),
+            ),
+        )
+        self.assertEqual(["ok", "ok"], sorted(results))
+        self.assertEqual([], failures)
+        self.assertTrue(peaks)
+        self.assertLessEqual(max(peaks), sharding.MAX_PROTOCOL_CRASH_TEMPS)
+
+    def test_protocol_identity_temps_are_bounded_validated_and_idempotent(self):
+        identity_pattern = re.compile(
+            r"^\.protocol-identity\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
+        )
+        self.assertEqual(19, sharding.MAX_PROTOCOL_IDENTITY_CRASH_TEMPS)
+
+        overflow_run = self.root / "identity-overflow" / "run"
+        overflow_run.mkdir(parents=True, mode=0o700)
+        overflow_run.chmod(0o700)
+        overflow_worker = self._worker_root(overflow_run)
+        for index in range(20):
+            temporary = overflow_worker / (
+                f".protocol-identity.json.tmp-{index + 1}-{index:032x}"
+            )
+            temporary.write_bytes(b"")
+            temporary.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "identity crash temporary"):
+            sharding.write_progress(
+                overflow_worker,
+                self._lane_message(seq=1, progress_type="lane-ready"),
+            )
+        self.assertFalse(
+            (overflow_worker / "protocol-identity.json").exists()
+        )
+
+        unknown_run = self.root / "identity-unknown" / "run"
+        unknown_run.mkdir(parents=True, mode=0o700)
+        unknown_run.chmod(0o700)
+        unknown_worker = self._worker_root(unknown_run)
+        unknown = unknown_worker / ".protocol-identity.json.tmp-1-not-hex"
+        unknown.write_bytes(b"")
+        unknown.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "identity crash temporary"):
+            sharding.write_progress(
+                unknown_worker,
+                self._lane_message(seq=1, progress_type="lane-ready"),
+            )
+
+        idempotent_run = self.root / "identity-idempotent" / "run"
+        idempotent_run.mkdir(parents=True, mode=0o700)
+        idempotent_run.chmod(0o700)
+        idempotent_worker = self._worker_root(idempotent_run)
+        sharding.write_progress(
+            idempotent_worker,
+            self._lane_message(seq=1, progress_type="lane-ready"),
+        )
+        real_open = sharding.os.open
+
+        def reject_identity_temp(path, flags, *args, **kwargs):
+            if isinstance(path, str) and path.startswith(
+                ".protocol-identity.json.tmp-"
+            ):
+                raise AssertionError("idempotent identity allocated a temp")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            sharding.os,
+            "open",
+            side_effect=reject_identity_temp,
+        ):
+            sharding.write_progress(
+                idempotent_worker,
+                self._lane_message(seq=2, progress_type="lane-ready"),
+            )
+
+        race_run = self.root / "identity-race" / "run"
+        race_run.mkdir(parents=True, mode=0o700)
+        race_run.chmod(0o700)
+        race_worker = self._worker_root(race_run)
+        for index in range(18):
+            temporary = race_worker / (
+                f".protocol-identity.json.tmp-{index + 1}-{index:032x}"
+            )
+            temporary.write_bytes(b"")
+            temporary.chmod(0o600)
+        results, failures, peaks = self._concurrent_publication_temp_peaks(
+            race_worker,
+            identity_pattern,
+            (
+                lambda: sharding.write_progress(
+                    race_worker,
+                    self._lane_message(seq=1, progress_type="lane-ready"),
+                ),
+                lambda: sharding.write_progress(
+                    race_worker,
+                    self._lane_message(seq=2, progress_type="lane-ready"),
+                ),
+            ),
+        )
+        self.assertEqual(["ok", "ok"], sorted(results))
+        self.assertEqual([], failures)
+        self.assertTrue(peaks)
+        self.assertLessEqual(
+            max(peaks),
+            sharding.MAX_PROTOCOL_IDENTITY_CRASH_TEMPS,
+        )
+
+    def test_progress_retains_and_reconciles_the_complete_worker_hierarchy(self):
+        mode_run = self.root / "workers-mode" / "run"
+        mode_run.mkdir(parents=True, mode=0o700)
+        mode_run.chmod(0o700)
+        mode_worker = self._worker_root(mode_run)
+        (mode_run / "workers").chmod(0o777)
+        with self.assertRaises((PermissionError, ValueError)):
+            sharding.write_progress(
+                mode_worker,
+                self._lane_message(seq=1, progress_type="lane-ready"),
+            )
+
+        symlink_run = self.root / "workers-symlink" / "run"
+        symlink_run.mkdir(parents=True, mode=0o700)
+        symlink_run.chmod(0o700)
+        symlink_worker = self._worker_root(symlink_run)
+        original_workers = symlink_run / "workers"
+        moved_workers = symlink_run / "moved-workers"
+        original_workers.rename(moved_workers)
+        original_workers.symlink_to(moved_workers, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                symlink_worker,
+                self._lane_message(seq=1, progress_type="lane-ready"),
+            )
+
+        replaced_run = self.root / "workers-replaced" / "run"
+        replaced_run.mkdir(parents=True, mode=0o700)
+        replaced_run.chmod(0o700)
+        replaced_worker = self._worker_root(replaced_run)
+        real_validate = sharding._validate_progress_durable
+        replaced = False
+
+        def replace_hierarchy(worker_root, message):
+            nonlocal replaced
+            real_validate(worker_root, message)
+            if not replaced:
+                replaced = True
+                workers = replaced_run / "workers"
+                workers.rename(replaced_run / "workers-old")
+                workers.mkdir(mode=0o700)
+                (workers / "E1").mkdir(mode=0o700)
+
+        with mock.patch.object(
+            sharding,
+            "_validate_progress_durable",
+            side_effect=replace_hierarchy,
+        ):
+            with self.assertRaises((RuntimeError, ValueError)):
+                sharding.write_progress(
+                    replaced_worker,
+                    self._lane_message(seq=1, progress_type="lane-ready"),
+                )
+        self.assertFalse(
+            (replaced_run / "workers" / "E1" / "progress" / "000001.json").exists()
+        )
+        self.assertFalse(
+            (
+                replaced_run
+                / "workers-old"
+                / "E1"
+                / "progress"
+                / "000001.json"
+            ).exists()
+        )
 
     def test_acked_usage_is_bounded_idempotent_and_stops_future_launches(self):
         self.assertTrue(
