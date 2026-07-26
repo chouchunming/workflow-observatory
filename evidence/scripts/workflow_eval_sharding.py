@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass, fields, replace
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
@@ -69,6 +69,7 @@ MAX_PROGRESS_STRING_CHARS = 256
 MAX_TOKEN_COUNT = 2**63 - 1
 MAX_PROTOCOL_RECORDS = 19
 MAX_PROTOCOL_CRASH_TEMPS = 19
+MAX_PROTOCOL_PENDING_MARKERS = 19
 MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
 PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 0.2
 PROTOCOL_WORKER_LOCK_POLL_SECONDS = 0.01
@@ -5687,6 +5688,9 @@ _PROTOCOL_IDENTITY_FIELDS = frozenset(
 _PROTOCOL_TEMP_PATTERN = re.compile(
     r"^\.[0-9]{6}\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
 )
+_PROTOCOL_PENDING_PATTERN = re.compile(
+    r"^\.([0-9]{6})\.json\.pending$"
+)
 _PROTOCOL_IDENTITY_TEMP_PATTERN = re.compile(
     r"^\.protocol-identity\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
 )
@@ -6381,6 +6385,140 @@ def _read_optional_protocol_record_retained(
     )
 
 
+def _protocol_pending_marker_name(name: str) -> str:
+    if re.fullmatch(r"[0-9]{6}\.json", name) is None or name.startswith("000000"):
+        raise ValueError("protocol sequence record name is invalid")
+    return f".{name}.pending"
+
+
+def _protocol_pending_marker_exists_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    *,
+    label: str,
+) -> bool:
+    marker_name = _protocol_pending_marker_name(name)
+    directory._validate_live()
+    descriptor = directory._retained[-1].slot.descriptor
+    try:
+        metadata = os.stat(
+            marker_name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        directory._validate_live()
+        return False
+    except OSError:
+        raise ValueError(f"{label} pending marker is unavailable") from None
+    _validate_owned_entry(
+        metadata,
+        label=f"{label} pending marker",
+        kind="file",
+        mode=0o600,
+    )
+    if metadata.st_size != 0:
+        raise ValueError(f"{label} pending marker is unsafe")
+    directory._validate_live()
+    return True
+
+
+def _require_protocol_record_committed_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    *,
+    label: str,
+) -> None:
+    if _protocol_pending_marker_exists_retained(
+        directory,
+        name,
+        label=label,
+    ):
+        raise ValueError(f"{label} publication is pending")
+
+
+def _install_protocol_pending_marker_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    *,
+    label: str,
+    allow_existing: bool,
+) -> None:
+    marker_name = _protocol_pending_marker_name(name)
+    directory._validate_live()
+    parent_slot = directory._retained[-1].slot
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= _required_os_flag("O_NOFOLLOW") | getattr(os, "O_CLOEXEC", 0)
+    try:
+        marker_descriptor = os.open(
+            marker_name,
+            flags,
+            0o600,
+            dir_fd=parent_slot.descriptor,
+        )
+    except FileExistsError:
+        if allow_existing and _protocol_pending_marker_exists_retained(
+            directory,
+            name,
+            label=label,
+        ):
+            return
+        raise ValueError(f"{label} publication is pending") from None
+
+    marker_slot = _DescriptorSlot(marker_descriptor)
+    primary: BaseException | None = None
+    try:
+        os.fchmod(marker_slot.descriptor, 0o600)
+        os.fsync(marker_slot.descriptor)
+    except BaseException as error:
+        primary = error
+    close_error = _retire_descriptor_capability(marker_slot)
+    _raise_ordered_failures(
+        f"{label} pending marker write or close failed",
+        primary,
+        [close_error] if close_error is not None else [],
+    )
+    os.fsync(parent_slot.descriptor)
+    directory._validate_live()
+
+
+def _remove_protocol_pending_marker_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    *,
+    label: str,
+) -> None:
+    marker_name = _protocol_pending_marker_name(name)
+    directory._validate_live()
+    parent_slot = directory._retained[-1].slot
+    try:
+        os.unlink(marker_name, dir_fd=parent_slot.descriptor)
+        os.fsync(parent_slot.descriptor)
+        directory._validate_live()
+        return
+    except BaseException as primary:
+        recovery_errors: list[BaseException] = []
+        try:
+            if not _protocol_pending_marker_exists_retained(
+                directory,
+                name,
+                label=label,
+            ):
+                _install_protocol_pending_marker_retained(
+                    directory,
+                    name,
+                    label=label,
+                    allow_existing=True,
+                )
+        except BaseException as recovery_error:
+            recovery_errors.append(recovery_error)
+        _raise_ordered_failures(
+            f"{label} commit-marker cleanup failed",
+            primary,
+            recovery_errors,
+        )
+
+
 def _write_protocol_record_retained(
     directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
     name: str,
@@ -6419,6 +6557,89 @@ def _write_protocol_record_retained(
         if durable is not None and durable == (dict(payload), content):
             return durable[1]
         raise error
+
+
+@dataclass
+class _ProtocolPublicationState:
+    commit_boundary_entered: bool = False
+
+
+def _write_durable_protocol_record_retained(
+    directory: _RecordDirectoryCapability | _RecordChildDirectoryCapability,
+    name: str,
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+    byte_cap: int,
+    publication_state: _ProtocolPublicationState,
+) -> bytes:
+    content = canonical_config_bytes(payload)
+    if len(content) > byte_cap:
+        raise ValueError(f"{name} exceeds its byte cap")
+    _require_protocol_record_committed_retained(
+        directory,
+        name,
+        label=label,
+    )
+    existing = _read_optional_protocol_record_retained(
+        directory,
+        name,
+        name,
+        byte_cap=byte_cap,
+    )
+    if existing is not None:
+        durable, durable_content = existing
+        if durable != payload or durable_content != content:
+            raise ValueError(f"{name} already differs")
+        return durable_content
+
+    _install_protocol_pending_marker_retained(
+        directory,
+        name,
+        label=label,
+        allow_existing=False,
+    )
+    durable_content = _write_protocol_record_retained(
+        directory,
+        name,
+        payload,
+        byte_cap=byte_cap,
+    )
+    publication_state.commit_boundary_entered = True
+    _remove_protocol_pending_marker_retained(
+        directory,
+        name,
+        label=label,
+    )
+    return durable_content
+
+
+def _restore_protocol_pending_after_failure_retained(
+    worker: _RecordDirectoryCapability,
+    *,
+    directory_name: str,
+    directory_label: str,
+    record_name: str,
+    record_label: str,
+) -> tuple[BaseException, ...]:
+    recovery_errors: list[BaseException] = []
+    try:
+        directory = _open_protocol_record_directory(
+            worker,
+            directory_name,
+            label=directory_label,
+            create=False,
+        )
+        with directory:
+            _install_protocol_pending_marker_retained(
+                directory,
+                record_name,
+                label=record_label,
+                allow_existing=True,
+            )
+    except BaseException as recovery_error:
+        recovery_errors.append(recovery_error)
+    return tuple(recovery_errors)
 
 
 def _protocol_identity_inventory_retained(
@@ -6588,6 +6809,53 @@ def _lock_protocol_worker(
     worker._validate_live()
 
 
+def _lock_protocol_worker_shared(
+    worker: _RecordDirectoryCapability,
+    *,
+    deadline: float,
+) -> None:
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise ValueError("protocol worker read-lock deadline is invalid")
+    worker._validate_live()
+    descriptor = worker._retained[-1].slot.descriptor
+    while True:
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_SH | fcntl.LOCK_NB,
+            )
+            break
+        except (BlockingIOError, InterruptedError):
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out acquiring protocol worker read lock"
+                ) from None
+            time.sleep(min(PROTOCOL_WORKER_LOCK_POLL_SECONDS, remaining))
+    worker._validate_live()
+
+
+@contextmanager
+def _shared_protocol_worker_lock(
+    worker: _RecordDirectoryCapability,
+    *,
+    operation_deadline: float | None,
+):
+    acquired = False
+    try:
+        _lock_protocol_worker_shared(
+            worker,
+            deadline=_bounded_protocol_lock_deadline(operation_deadline),
+        )
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            descriptor = worker._retained[-1].slot.descriptor
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            worker._validate_live()
+
+
 def _write_progress_with_deadline(
     worker_root: Path,
     message: ProgressMessage,
@@ -6599,38 +6867,86 @@ def _write_progress_with_deadline(
     worker = _open_protocol_worker_directory(bound_worker, message.lane)
     path = bound_worker / "progress" / f"{message.seq:06d}.json"
     message_sha256: str | None = None
-    with worker:
-        _lock_protocol_worker(
-            worker,
-            deadline=_bounded_protocol_lock_deadline(operation_deadline),
-        )
-        _validate_progress_durable(bound_worker, message)
-        worker._validate_live()
-        progress = _open_protocol_record_directory(
-            worker,
-            "progress",
-            label="progress directory",
-        )
-        with progress:
-            _protocol_sequence_inventory_retained(
-                progress,
-                label="progress",
-                deadline=None,
-                publishing_seq=message.seq,
-            )
-            _seal_worker_protocol_identity_retained(worker, message)
-            content = _write_protocol_record_retained(
-                progress,
-                path.name,
-                _encode_progress_message(message),
-                byte_cap=MAX_PROGRESS_BYTES,
-            )
-            progress._validate_live()
-            message_sha256 = hashlib.sha256(content).hexdigest()
-        worker._validate_live()
-    if message_sha256 is None:
-        raise AssertionError("progress publication omitted its durable digest")
-    return path, message_sha256
+    publication_state = _ProtocolPublicationState()
+    try:
+        with worker:
+            try:
+                _lock_protocol_worker(
+                    worker,
+                    deadline=_bounded_protocol_lock_deadline(operation_deadline),
+                )
+                _validate_progress_durable(bound_worker, message)
+                worker._validate_live()
+                progress = _open_protocol_record_directory(
+                    worker,
+                    "progress",
+                    label="progress directory",
+                )
+                with progress:
+                    _protocol_sequence_inventory_retained(
+                        progress,
+                        label="progress",
+                        deadline=None,
+                        publishing_seq=message.seq,
+                    )
+                    _seal_worker_protocol_identity_retained(worker, message)
+                    progress_payload = _encode_progress_message(message)
+                    message_sha256 = hashlib.sha256(
+                        canonical_config_bytes(progress_payload)
+                    ).hexdigest()
+                    content = _write_durable_protocol_record_retained(
+                        progress,
+                        path.name,
+                        progress_payload,
+                        label="progress",
+                        byte_cap=MAX_PROGRESS_BYTES,
+                        publication_state=publication_state,
+                    )
+                    if hashlib.sha256(content).hexdigest() != message_sha256:
+                        raise AssertionError(
+                            "progress publication digest changed"
+                        )
+                    progress._validate_live()
+                worker._validate_live()
+            except BaseException as error:
+                if not publication_state.commit_boundary_entered:
+                    raise
+                if (
+                    message_sha256 is not None
+                    and is_indeterminate_descriptor_close(error)
+                ):
+                    return path, message_sha256
+                recovery_errors = (
+                    _restore_protocol_pending_after_failure_retained(
+                        worker,
+                        directory_name="progress",
+                        directory_label="progress directory",
+                        record_name=path.name,
+                        record_label="progress",
+                    )
+                )
+                if recovery_errors:
+                    if message_sha256 is None:
+                        raise BaseExceptionGroup(
+                            "progress post-commit failure and pending-marker "
+                            "restoration failed",
+                            [error, *recovery_errors],
+                        )
+                    return path, message_sha256
+                publication_state.commit_boundary_entered = False
+                raise error
+            if message_sha256 is None:
+                raise AssertionError(
+                    "progress publication omitted its durable digest"
+                )
+        return path, message_sha256
+    except BaseException:
+        if (
+            publication_state.commit_boundary_entered
+            and message_sha256 is not None
+        ):
+            return path, message_sha256
+        raise
 
 
 def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
@@ -6686,8 +7002,33 @@ def _read_progress_retained(
     *,
     expected_lane: LaneName,
     expected_seq: int,
+    lock_deadline: float | None = None,
+) -> ProgressMessage:
+    with _shared_protocol_worker_lock(
+        worker,
+        operation_deadline=lock_deadline,
+    ):
+        return _read_progress_with_worker_lock_retained(
+            worker,
+            progress,
+            expected_lane=expected_lane,
+            expected_seq=expected_seq,
+        )
+
+
+def _read_progress_with_worker_lock_retained(
+    worker: _RecordDirectoryCapability,
+    progress: _RecordChildDirectoryCapability,
+    *,
+    expected_lane: LaneName,
+    expected_seq: int,
 ) -> ProgressMessage:
     expected_name = f"{expected_seq:06d}.json"
+    _require_protocol_record_committed_retained(
+        progress,
+        expected_name,
+        label="progress",
+    )
     payload, _ = _read_canonical_record_retained(
         progress,
         expected_name,
@@ -6699,6 +7040,11 @@ def _read_progress_retained(
         raise ValueError("progress record identity differs")
     _read_worker_protocol_identity_retained(worker, message)
     _validate_progress_durable(worker.path, message)
+    _require_protocol_record_committed_retained(
+        progress,
+        expected_name,
+        label="progress",
+    )
     progress._validate_live()
     return message
 
@@ -6727,6 +7073,7 @@ def _protocol_sequence_inventory_retained(
     before = os.fstat(descriptor)
     sequences: list[int] = []
     crash_temp_count = 0
+    pending_sequences: set[int] = set()
     with os.scandir(descriptor) as entries:
         for entry in entries:
             if deadline is not None and time.monotonic() >= deadline:
@@ -6750,6 +7097,31 @@ def _protocol_sequence_inventory_retained(
                     kind="file",
                     mode=0o600,
                 )
+                continue
+            pending_match = _PROTOCOL_PENDING_PATTERN.fullmatch(name)
+            if pending_match is not None:
+                if len(pending_sequences) >= MAX_PROTOCOL_PENDING_MARKERS:
+                    raise ValueError(
+                        f"{label} pending marker inventory exceeds its cap"
+                    )
+                try:
+                    pending_metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    raise ValueError(
+                        f"{label} pending marker is unavailable"
+                    ) from None
+                _validate_owned_entry(
+                    pending_metadata,
+                    label=f"{label} pending marker",
+                    kind="file",
+                    mode=0o600,
+                )
+                if pending_metadata.st_size != 0:
+                    raise ValueError(f"{label} pending marker is unsafe")
+                pending_sequence = int(pending_match.group(1))
+                if pending_sequence < 1:
+                    raise ValueError(f"{label} pending sequence is invalid")
+                pending_sequences.add(pending_sequence)
                 continue
             if name.startswith(".") or ".tmp-" in name:
                 raise ValueError(
@@ -6790,6 +7162,13 @@ def _protocol_sequence_inventory_retained(
         raise RuntimeError(f"{label} inventory changed while scanning")
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError(f"timed out while scanning {label} records")
+    if len(set(sequences) | pending_sequences) > MAX_PROTOCOL_RECORDS:
+        raise ValueError(f"{label} pending marker inventory exceeds its cap")
+    if publishing_seq is not None and pending_sequences:
+        raise ValueError(f"{label} publication is pending")
+    sequences = [
+        sequence for sequence in sequences if sequence not in pending_sequences
+    ]
     sequences.sort()
     if (
         publishing_seq is not None
@@ -6835,6 +7214,7 @@ def _protocol_sequence_inventory(
     primary: BaseException | None = None
     sequences: list[int] = []
     crash_temp_count = 0
+    pending_sequences: set[int] = set()
     try:
         if (
             metadata.st_dev,
@@ -6879,6 +7259,33 @@ def _protocol_sequence_inventory(
                         mode=0o600,
                     )
                     continue
+                pending_match = _PROTOCOL_PENDING_PATTERN.fullmatch(name)
+                if pending_match is not None:
+                    if len(pending_sequences) >= MAX_PROTOCOL_PENDING_MARKERS:
+                        raise ValueError(
+                            f"{label} pending marker inventory exceeds its cap"
+                        )
+                    try:
+                        pending_metadata = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        raise ValueError(
+                            f"{label} pending marker is unavailable"
+                        ) from None
+                    _validate_owned_entry(
+                        pending_metadata,
+                        label=f"{label} pending marker",
+                        kind="file",
+                        mode=0o600,
+                    )
+                    if pending_metadata.st_size != 0:
+                        raise ValueError(f"{label} pending marker is unsafe")
+                    pending_sequence = int(pending_match.group(1))
+                    if pending_sequence < 1:
+                        raise ValueError(
+                            f"{label} pending sequence is invalid"
+                        )
+                    pending_sequences.add(pending_sequence)
+                    continue
                 if name.startswith(".") or ".tmp-" in name:
                     raise ValueError(
                         f"{label} directory contains an unknown crash temporary"
@@ -6919,6 +7326,13 @@ def _protocol_sequence_inventory(
         primary=primary,
         label=f"{label} inventory scan or close failed",
     )
+    if len(set(sequences) | pending_sequences) > MAX_PROTOCOL_RECORDS:
+        raise ValueError(f"{label} pending marker inventory exceeds its cap")
+    if publishing_seq is not None and pending_sequences:
+        raise ValueError(f"{label} publication is pending")
+    sequences = [
+        sequence for sequence in sequences if sequence not in pending_sequences
+    ]
     sequences.sort()
     if (
         publishing_seq is not None
@@ -7005,6 +7419,7 @@ def wait_for_progress(
                             progress,
                             expected_lane=expected_lane,
                             expected_seq=sequence,
+                            lock_deadline=deadline,
                         )
                     if (
                         _protocol_sequence_inventory_retained(
@@ -7027,6 +7442,7 @@ def wait_for_progress(
                         progress,
                         expected_lane=expected_lane,
                         expected_seq=expected_seq,
+                        lock_deadline=deadline,
                     )
                     if expected_sha256 is not None:
                         content = canonical_config_bytes(
@@ -7092,9 +7508,36 @@ def _decode_ack(payload: object) -> Ack:
     return ack
 
 
-def _durable_progress_hash(worker_root: Path, message: ProgressMessage) -> str:
-    path = worker_root / "progress" / f"{message.seq:06d}.json"
-    durable = read_progress(path, message.lane, message.seq)
+def _durable_progress_hash_retained(
+    worker: _RecordDirectoryCapability,
+    message: ProgressMessage,
+    *,
+    worker_lock_held: bool,
+    lock_deadline: float | None = None,
+) -> str:
+    if not worker_lock_held:
+        with _shared_protocol_worker_lock(
+            worker,
+            operation_deadline=lock_deadline,
+        ):
+            return _durable_progress_hash_retained(
+                worker,
+                message,
+                worker_lock_held=True,
+            )
+    progress = _open_protocol_record_directory(
+        worker,
+        "progress",
+        label="progress directory",
+        create=False,
+    )
+    with progress:
+        durable = _read_progress_with_worker_lock_retained(
+            worker,
+            progress,
+            expected_lane=message.lane,
+            expected_seq=message.seq,
+        )
     if durable != message:
         raise ValueError("durable progress differs from ACK message")
     content = canonical_config_bytes(_encode_progress_message(durable))
@@ -7105,26 +7548,47 @@ def _read_ack_for_progress_retained(
     worker: _RecordDirectoryCapability,
     acks: _RecordChildDirectoryCapability,
     message: ProgressMessage,
+    *,
+    lock_deadline: float | None = None,
 ) -> Ack:
-    expected_hash = _durable_progress_hash(worker.path, message)
-    worker._validate_live()
-    payload, _ = _read_canonical_record_retained(
-        acks,
-        f"{message.seq:06d}.json",
-        "ack",
-        byte_cap=MAX_PROGRESS_BYTES,
-    )
-    ack = _decode_ack(payload)
-    if (
-        ack.epoch_id != message.epoch_id
-        or ack.run_kind != message.run_kind
-        or ack.lane != message.lane
-        or ack.seq != message.seq
-        or ack.message_sha256 != expected_hash
+    with _shared_protocol_worker_lock(
+        worker,
+        operation_deadline=lock_deadline,
     ):
-        raise ValueError("ACK differs from durable progress")
-    acks._validate_live()
-    return ack
+        expected_name = f"{message.seq:06d}.json"
+        _require_protocol_record_committed_retained(
+            acks,
+            expected_name,
+            label="ACK",
+        )
+        expected_hash = _durable_progress_hash_retained(
+            worker,
+            message,
+            worker_lock_held=True,
+        )
+        worker._validate_live()
+        payload, _ = _read_canonical_record_retained(
+            acks,
+            expected_name,
+            "ack",
+            byte_cap=MAX_PROGRESS_BYTES,
+        )
+        ack = _decode_ack(payload)
+        if (
+            ack.epoch_id != message.epoch_id
+            or ack.run_kind != message.run_kind
+            or ack.lane != message.lane
+            or ack.seq != message.seq
+            or ack.message_sha256 != expected_hash
+        ):
+            raise ValueError("ACK differs from durable progress")
+        _require_protocol_record_committed_retained(
+            acks,
+            expected_name,
+            label="ACK",
+        )
+        acks._validate_live()
+        return ack
 
 
 def write_ack(
@@ -7136,44 +7600,83 @@ def write_ack(
         raise ValueError("ACK decision is invalid")
     path = bound_worker / "acks" / f"{message.seq:06d}.json"
     worker = _open_protocol_worker_directory(bound_worker, message.lane)
-    with worker:
-        _lock_protocol_worker(
-            worker,
-            deadline=_bounded_protocol_lock_deadline(None),
-        )
-        _read_worker_protocol_identity_retained(worker, message)
-        message_sha256 = _durable_progress_hash(bound_worker, message)
-        worker._validate_live()
-        ack = Ack(
-            schema_version=1,
-            epoch_id=message.epoch_id,
-            run_kind=message.run_kind,
-            lane=message.lane,
-            seq=message.seq,
-            message_sha256=message_sha256,
-            decision=decision,
-        )
-        acks = _open_protocol_record_directory(
-            worker,
-            "acks",
-            label="ACK directory",
-        )
-        with acks:
-            _protocol_sequence_inventory_retained(
-                acks,
-                label="ACK",
-                deadline=None,
-                publishing_seq=message.seq,
-            )
-            _write_protocol_record_retained(
-                acks,
-                path.name,
-                _encode_ack(ack),
-                byte_cap=MAX_PROGRESS_BYTES,
-            )
-            acks._validate_live()
-        worker._validate_live()
-    return path
+    publication_state = _ProtocolPublicationState()
+    publication_completed = False
+    try:
+        with worker:
+            try:
+                _lock_protocol_worker(
+                    worker,
+                    deadline=_bounded_protocol_lock_deadline(None),
+                )
+                _read_worker_protocol_identity_retained(worker, message)
+                message_sha256 = _durable_progress_hash_retained(
+                    worker,
+                    message,
+                    worker_lock_held=True,
+                )
+                worker._validate_live()
+                ack = Ack(
+                    schema_version=1,
+                    epoch_id=message.epoch_id,
+                    run_kind=message.run_kind,
+                    lane=message.lane,
+                    seq=message.seq,
+                    message_sha256=message_sha256,
+                    decision=decision,
+                )
+                acks = _open_protocol_record_directory(
+                    worker,
+                    "acks",
+                    label="ACK directory",
+                )
+                with acks:
+                    _protocol_sequence_inventory_retained(
+                        acks,
+                        label="ACK",
+                        deadline=None,
+                        publishing_seq=message.seq,
+                    )
+                    _write_durable_protocol_record_retained(
+                        acks,
+                        path.name,
+                        _encode_ack(ack),
+                        label="ACK",
+                        byte_cap=MAX_PROGRESS_BYTES,
+                        publication_state=publication_state,
+                    )
+                    publication_completed = True
+                    acks._validate_live()
+                worker._validate_live()
+            except BaseException as error:
+                if not publication_state.commit_boundary_entered:
+                    raise
+                if (
+                    publication_completed
+                    and is_indeterminate_descriptor_close(error)
+                ):
+                    return path
+                recovery_errors = (
+                    _restore_protocol_pending_after_failure_retained(
+                        worker,
+                        directory_name="acks",
+                        directory_label="ACK directory",
+                        record_name=path.name,
+                        record_label="ACK",
+                    )
+                )
+                if recovery_errors:
+                    return path
+                publication_state.commit_boundary_entered = False
+                raise error
+        return path
+    except BaseException:
+        if (
+            publication_state.commit_boundary_entered
+            and publication_completed
+        ):
+            return path
+        raise
 
 
 def wait_for_ack(
@@ -7186,7 +7689,12 @@ def wait_for_ack(
     worker = _open_protocol_worker_directory(bound_worker, message.lane)
     with worker:
         _read_worker_protocol_identity_retained(worker, message)
-        _durable_progress_hash(bound_worker, message)
+        _durable_progress_hash_retained(
+            worker,
+            message,
+            worker_lock_held=False,
+            lock_deadline=deadline,
+        )
         worker._validate_live()
         with ExitStack() as retained:
             acks: _RecordChildDirectoryCapability | None = None
@@ -7235,6 +7743,7 @@ def wait_for_ack(
                             worker,
                             acks,
                             prior_progress,
+                            lock_deadline=deadline,
                         )
                     if (
                         _protocol_sequence_inventory_retained(
@@ -7256,6 +7765,7 @@ def wait_for_ack(
                         worker,
                         acks,
                         message,
+                        lock_deadline=deadline,
                     )
                     if (
                         _protocol_sequence_inventory_retained(
@@ -7276,6 +7786,20 @@ def wait_for_ack(
                 time.sleep(min(0.01, remaining))
 
 
+@dataclass(frozen=True)
+class _ProgressAckLedgerState:
+    total_tokens: int
+    last_sequence: dict[LaneName, int]
+    accepted: dict[tuple[LaneName, int], tuple[str, AckDecision]]
+    active_cases: dict[LaneName, tuple[CaseKey, int] | None]
+    completed_attempts: frozenset[tuple[CaseKey, int]]
+    epoch_id: str | None
+    run_kind: RunKind | None
+    aborted: bool
+    stop_launches: bool
+    exited: frozenset[LaneName]
+
+
 class ProgressAckLedger:
     """Sequence, idempotence, and cumulative launch-ceiling state."""
 
@@ -7288,27 +7812,28 @@ class ProgressAckLedger:
                 "max_total_tokens must be null or a non-negative exact integer"
             )
         self._max_total_tokens = max_total_tokens
-        self._total_tokens = 0
-        self._last_sequence = {
-            lane: 0 for lane in ("E1", "E2", "E3", "APP")
-        }
-        self._accepted: dict[tuple[LaneName, int], tuple[str, AckDecision]] = {}
-        self._active_cases: dict[LaneName, tuple[CaseKey, int] | None] = {
-            lane: None for lane in ("E1", "E2", "E3", "APP")
-        }
-        self._completed_attempts: set[tuple[CaseKey, int]] = set()
-        self._epoch_id: str | None = None
-        self._run_kind: RunKind | None = None
         self._state_lock = threading.RLock()
-        self._transition_owner: int | None = None
-        self._aborted = False
-        self._stop_launches = max_total_tokens == 0
-        self._exited: set[LaneName] = set()
+        self._state = _ProgressAckLedgerState(
+            total_tokens=0,
+            last_sequence={
+                lane: 0 for lane in ("E1", "E2", "E3", "APP")
+            },
+            accepted={},
+            active_cases={
+                lane: None for lane in ("E1", "E2", "E3", "APP")
+            },
+            completed_attempts=frozenset(),
+            epoch_id=None,
+            run_kind=None,
+            aborted=False,
+            stop_launches=max_total_tokens == 0,
+            exited=frozenset(),
+        )
 
     @property
     def total_tokens(self) -> int:
         with self._state_lock:
-            return self._total_tokens
+            return self._state.total_tokens
 
     @property
     def max_total_tokens(self) -> int | None:
@@ -7318,70 +7843,60 @@ class ProgressAckLedger:
     @property
     def stop_launches(self) -> bool:
         with self._state_lock:
-            return self._stop_launches
+            return self._state.stop_launches
 
     @property
     def aborted(self) -> bool:
         with self._state_lock:
-            return self._aborted
+            return self._state.aborted
 
     def accept_progress(self, message: ProgressMessage) -> AckDecision:
         with self._state_lock:
-            self._begin_transition_locked()
-            try:
-                payload = _encode_progress_message(message)
-                return self._accept_progress_locked(message, payload)
-            finally:
-                self._end_transition_locked()
+            self._require_outermost_transition_locked()
+            payload = _encode_progress_message(message)
+            return self._accept_progress_locked(message, payload)
 
-    def _begin_transition_locked(self) -> None:
-        owner = threading.get_ident()
-        if self._transition_owner is not None:
-            if self._transition_owner != owner:
-                raise AssertionError(
-                    "ledger transition lock admitted a competing owner"
-                )
+    def _require_outermost_transition_locked(self) -> None:
+        recursion_count = getattr(self._state_lock, "_recursion_count", None)
+        if not callable(recursion_count):
+            raise RuntimeError("ledger transition recursion state is unavailable")
+        if recursion_count() != 1:
             raise RuntimeError("ledger transition is already active")
-        self._transition_owner = owner
-
-    def _end_transition_locked(self) -> None:
-        if self._transition_owner != threading.get_ident():
-            raise AssertionError("ledger transition owner changed")
-        self._transition_owner = None
 
     def _accept_progress_locked(
         self,
         message: ProgressMessage,
         payload: dict[str, object],
     ) -> AckDecision:
-        if self._epoch_id is not None and (
-            message.epoch_id != self._epoch_id
-            or message.run_kind != self._run_kind
+        state = self._state
+        if state.epoch_id is not None and (
+            message.epoch_id != state.epoch_id
+            or message.run_kind != state.run_kind
         ):
             raise ValueError("progress differs from the ledger protocol identity")
         message_sha256 = hashlib.sha256(
             canonical_config_bytes(payload)
         ).hexdigest()
         key = (message.lane, message.seq)
-        previous = self._accepted.get(key)
+        previous = state.accepted.get(key)
         if previous is not None:
             previous_sha256, previous_decision = previous
             if previous_sha256 != message_sha256:
                 raise ValueError("progress sequence already names a different message")
             return previous_decision
-        expected_seq = self._last_sequence[message.lane] + 1
+        expected_seq = state.last_sequence[message.lane] + 1
         if message.seq != expected_seq:
             raise ValueError("progress sequence is gapped or reordered")
-        if message.lane in self._exited:
+        if message.lane in state.exited:
             raise ValueError("progress arrived after worker exit")
 
-        active = self._active_cases[message.lane]
+        active = state.active_cases[message.lane]
         case_attempt: tuple[CaseKey, int] | None = None
         if message.type in ("case-started", "case-terminal"):
             if message.case is None or message.attempt is None:
                 raise AssertionError("case progress lacks its identity")
             case_attempt = (message.case, message.attempt)
-            if case_attempt in self._completed_attempts:
+            if case_attempt in state.completed_attempts:
                 raise ValueError("completed case attempt cannot be replayed")
         if message.type == "case-started":
             if active is not None:
@@ -7392,8 +7907,8 @@ class ProgressAckLedger:
             if active != case_attempt:
                 raise ValueError("case terminal differs from the active attempt")
 
-        new_total = self._total_tokens
-        reaches_ceiling = self._stop_launches
+        new_total = state.total_tokens
+        reaches_ceiling = state.stop_launches
         if message.type == "case-terminal" and message.usage is not None:
             new_total += message.usage.total_tokens
             if (
@@ -7403,60 +7918,88 @@ class ProgressAckLedger:
                 reaches_ceiling = True
 
         decision: AckDecision
-        if self._aborted:
+        aborted = state.aborted
+        if aborted:
             decision = "abort"
         elif message.type == "case-terminal" and message.status == "failed":
-            self._aborted = True
+            aborted = True
             decision = "abort"
         elif message.type == "shard-terminal" and message.status == "failed":
-            self._aborted = True
+            aborted = True
             decision = "abort"
         elif message.type == "worker-stopped" and (
-            self._active_cases[message.lane] is not None
+            state.active_cases[message.lane] is not None
         ):
-            self._aborted = True
+            aborted = True
             decision = "abort"
         elif reaches_ceiling:
             decision = "stop-launches"
         else:
             decision = "continue"
 
-        self._total_tokens = new_total
-        self._stop_launches = reaches_ceiling
+        active_cases = dict(state.active_cases)
+        completed_attempts = set(state.completed_attempts)
+        exited = set(state.exited)
         if message.type == "case-started" and decision == "continue":
             if message.case is None or message.attempt is None:
                 raise AssertionError("case-started progress lacks its identity")
-            self._active_cases[message.lane] = (
+            active_cases[message.lane] = (
                 message.case,
                 message.attempt,
             )
         elif message.type == "case-terminal":
             if case_attempt is None:
                 raise AssertionError("case terminal lacks its completed identity")
-            self._completed_attempts.add(case_attempt)
-            self._active_cases[message.lane] = None
+            completed_attempts.add(case_attempt)
+            active_cases[message.lane] = None
         elif message.type == "worker-stopped":
-            self._exited.add(message.lane)
+            exited.add(message.lane)
 
-        self._accepted[key] = (message_sha256, decision)
-        self._last_sequence[message.lane] = message.seq
-        if self._epoch_id is None:
-            self._epoch_id = message.epoch_id
-            self._run_kind = message.run_kind
+        accepted = dict(state.accepted)
+        accepted[key] = (message_sha256, decision)
+        last_sequence = dict(state.last_sequence)
+        last_sequence[message.lane] = message.seq
+        self._state = _ProgressAckLedgerState(
+            total_tokens=new_total,
+            last_sequence=last_sequence,
+            accepted=accepted,
+            active_cases=active_cases,
+            completed_attempts=frozenset(completed_attempts),
+            epoch_id=(
+                message.epoch_id if state.epoch_id is None else state.epoch_id
+            ),
+            run_kind=(
+                message.run_kind if state.run_kind is None else state.run_kind
+            ),
+            aborted=aborted,
+            stop_launches=reaches_ceiling,
+            exited=frozenset(exited),
+        )
         return decision
 
     def worker_exited(self, lane: LaneName) -> AckDecision:
         if type(lane) is not str or lane not in ("E1", "E2", "E3", "APP"):
             raise ValueError("worker exit lane is invalid")
         with self._state_lock:
-            self._begin_transition_locked()
-            try:
-                self._exited.add(lane)
-                self._active_cases[lane] = None
-                self._aborted = True
-                return "abort"
-            finally:
-                self._end_transition_locked()
+            self._require_outermost_transition_locked()
+            state = self._state
+            exited = set(state.exited)
+            exited.add(lane)
+            active_cases = dict(state.active_cases)
+            active_cases[lane] = None
+            self._state = _ProgressAckLedgerState(
+                total_tokens=state.total_tokens,
+                last_sequence=state.last_sequence,
+                accepted=state.accepted,
+                active_cases=active_cases,
+                completed_attempts=state.completed_attempts,
+                epoch_id=state.epoch_id,
+                run_kind=state.run_kind,
+                aborted=True,
+                stop_launches=state.stop_launches,
+                exited=frozenset(exited),
+            )
+            return "abort"
 
 
 def canonical_config_bytes(config: Mapping[str, Any]) -> bytes:

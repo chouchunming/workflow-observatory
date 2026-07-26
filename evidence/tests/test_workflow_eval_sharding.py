@@ -8294,6 +8294,783 @@ class ProgressProtocolTests(unittest.TestCase):
                     deadline=1.0,
                 )
 
+    def test_progress_and_ack_directory_fsync_failures_remain_pending(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        for protocol in ("progress", "ACK"):
+            for failed_boundary in range(1, 5):
+                with self.subTest(
+                    protocol=protocol,
+                    failed_directory_fsync=failed_boundary,
+                ):
+                    run_root = (
+                        self.root
+                        / f"pending-{protocol.lower()}-{failed_boundary}"
+                        / "run"
+                    )
+                    run_root.mkdir(parents=True, mode=0o700)
+                    run_root.chmod(0o700)
+                    worker_root = self._worker_root(run_root)
+                    if protocol == "progress":
+                        directory = worker_root / "progress"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_progress(
+                            worker_root,
+                            ready,
+                        )
+                        readers = (
+                            lambda: sharding.read_progress(
+                                directory / "000001.json",
+                                "E1",
+                                1,
+                            ),
+                            lambda: sharding.wait_for_progress(
+                                worker_root=worker_root,
+                                expected_lane="E1",
+                                expected_seq=1,
+                                timeout=0.01,
+                            ),
+                        )
+                    else:
+                        sharding.write_progress(worker_root, ready)
+                        directory = worker_root / "acks"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_ack(
+                            worker_root,
+                            ready,
+                            "continue",
+                        )
+                        readers = (
+                            lambda: sharding.wait_for_ack(
+                                worker_root,
+                                ready,
+                                0.01,
+                            ),
+                        )
+
+                    directory_identity = (
+                        directory.stat().st_dev,
+                        directory.stat().st_ino,
+                    )
+                    real_fsync = sharding.os.fsync
+                    directory_fsyncs = 0
+
+                    def fail_selected_directory_fsync(descriptor):
+                        nonlocal directory_fsyncs
+                        metadata = os.fstat(descriptor)
+                        if (
+                            stat.S_ISDIR(metadata.st_mode)
+                            and (metadata.st_dev, metadata.st_ino)
+                            == directory_identity
+                        ):
+                            directory_fsyncs += 1
+                            if directory_fsyncs == failed_boundary:
+                                raise OSError(
+                                    "injected protocol directory fsync failure"
+                                )
+                        return real_fsync(descriptor)
+
+                    with mock.patch.object(
+                        sharding.os,
+                        "fsync",
+                        side_effect=fail_selected_directory_fsync,
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError,
+                            "protocol directory fsync failure",
+                        ):
+                            publish()
+
+                    self.assertGreaterEqual(
+                        directory_fsyncs,
+                        failed_boundary,
+                    )
+                    pending = directory / ".000001.json.pending"
+                    self.assertTrue(
+                        pending.is_file(),
+                        "failed publication did not leave a fail-closed marker",
+                    )
+                    for reader in readers:
+                        with self.assertRaises(
+                            (FileNotFoundError, TimeoutError, ValueError)
+                        ):
+                            reader()
+
+                    final = directory / "000001.json"
+                    if final.exists():
+                        before = final.read_bytes()
+                        with self.assertRaisesRegex(ValueError, "pending"):
+                            publish()
+                        self.assertEqual(before, final.read_bytes())
+
+    def test_progress_and_ack_cleanup_failures_remain_pending(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        for protocol in ("progress", "ACK"):
+            for cleanup_target in ("temporary", "pending"):
+                with self.subTest(
+                    protocol=protocol,
+                    cleanup_target=cleanup_target,
+                ):
+                    run_root = (
+                        self.root
+                        / f"cleanup-{protocol.lower()}-{cleanup_target}"
+                        / "run"
+                    )
+                    run_root.mkdir(parents=True, mode=0o700)
+                    run_root.chmod(0o700)
+                    worker_root = self._worker_root(run_root)
+                    if protocol == "progress":
+                        directory = worker_root / "progress"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_progress(
+                            worker_root,
+                            ready,
+                        )
+                        reader = lambda: sharding.read_progress(
+                            directory / "000001.json",
+                            "E1",
+                            1,
+                        )
+                    else:
+                        sharding.write_progress(worker_root, ready)
+                        directory = worker_root / "acks"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_ack(
+                            worker_root,
+                            ready,
+                            "continue",
+                        )
+                        reader = lambda: sharding.wait_for_ack(
+                            worker_root,
+                            ready,
+                            0.01,
+                        )
+
+                    directory_identity = (
+                        directory.stat().st_dev,
+                        directory.stat().st_ino,
+                    )
+                    real_unlink = sharding.os.unlink
+
+                    def fail_selected_cleanup(name, *args, **kwargs):
+                        dir_fd = kwargs.get("dir_fd")
+                        matches_directory = (
+                            dir_fd is not None
+                            and (
+                                os.fstat(dir_fd).st_dev,
+                                os.fstat(dir_fd).st_ino,
+                            )
+                            == directory_identity
+                        )
+                        matches_target = (
+                            cleanup_target == "temporary"
+                            and isinstance(name, str)
+                            and ".tmp-" in name
+                        ) or (
+                            cleanup_target == "pending"
+                            and name == ".000001.json.pending"
+                        )
+                        if matches_directory and matches_target:
+                            raise OSError(
+                                "injected protocol cleanup failure"
+                            )
+                        return real_unlink(name, *args, **kwargs)
+
+                    with mock.patch.object(
+                        sharding.os,
+                        "unlink",
+                        side_effect=fail_selected_cleanup,
+                    ):
+                        with self.assertRaises(BaseException):
+                            publish()
+
+                    self.assertTrue(
+                        (directory / ".000001.json.pending").is_file()
+                    )
+                    self.assertTrue((directory / "000001.json").is_file())
+                    with self.assertRaises(
+                        (FileNotFoundError, TimeoutError, ValueError)
+                    ):
+                        reader()
+
+    def test_pending_cleanup_window_is_serialized_from_readers(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        for protocol in ("progress", "ACK"):
+            with self.subTest(protocol=protocol):
+                run_root = (
+                    self.root
+                    / f"serialized-pending-cleanup-{protocol.lower()}"
+                    / "run"
+                )
+                run_root.mkdir(parents=True, mode=0o700)
+                run_root.chmod(0o700)
+                worker_root = self._worker_root(run_root)
+                if protocol == "progress":
+                    directory = worker_root / "progress"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_progress(
+                        worker_root,
+                        ready,
+                    )
+                    read = lambda: sharding.read_progress(
+                        directory / "000001.json",
+                        "E1",
+                        1,
+                    )
+                else:
+                    sharding.write_progress(worker_root, ready)
+                    directory = worker_root / "acks"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_ack(
+                        worker_root,
+                        ready,
+                        "continue",
+                    )
+                    read = lambda: sharding.wait_for_ack(
+                        worker_root,
+                        ready,
+                        1.0,
+                    )
+
+                directory_identity = (
+                    directory.stat().st_dev,
+                    directory.stat().st_ino,
+                )
+                real_fsync = sharding.os.fsync
+                cleanup_fsync_entered = threading.Event()
+                release_cleanup_fsync = threading.Event()
+                directory_fsyncs = 0
+                writer_errors = []
+                reader_results = []
+                reader_errors = []
+                reader_finished = threading.Event()
+                process_reader = None
+                reader = None
+                process_stdout = ""
+                process_stderr = ""
+
+                def pause_then_fail_cleanup_fsync(descriptor):
+                    nonlocal directory_fsyncs
+                    metadata = os.fstat(descriptor)
+                    if (
+                        stat.S_ISDIR(metadata.st_mode)
+                        and (metadata.st_dev, metadata.st_ino)
+                        == directory_identity
+                    ):
+                        directory_fsyncs += 1
+                        if directory_fsyncs == 4:
+                            cleanup_fsync_entered.set()
+                            if not release_cleanup_fsync.wait(2.0):
+                                raise AssertionError(
+                                    "pending cleanup fsync was not released"
+                                )
+                            raise OSError(
+                                "injected pending cleanup fsync failure"
+                            )
+                    return real_fsync(descriptor)
+
+                def invoke_writer():
+                    try:
+                        publish()
+                    except BaseException as error:
+                        writer_errors.append(error)
+
+                def invoke_reader():
+                    try:
+                        reader_results.append(read())
+                    except BaseException as error:
+                        reader_errors.append(error)
+                    finally:
+                        reader_finished.set()
+
+                with mock.patch.object(
+                    sharding.os,
+                    "fsync",
+                    side_effect=pause_then_fail_cleanup_fsync,
+                ):
+                    writer = threading.Thread(target=invoke_writer)
+                    writer.start()
+                    try:
+                        self.assertTrue(cleanup_fsync_entered.wait(2.0))
+                        self.assertTrue((directory / "000001.json").is_file())
+                        self.assertFalse(
+                            (directory / ".000001.json.pending").exists()
+                        )
+                        reader = threading.Thread(target=invoke_reader)
+                        reader.start()
+                        if protocol == "progress":
+                            process_script = """
+import sys
+from pathlib import Path
+from scripts import workflow_eval_sharding as sharding
+sharding.read_progress(Path(sys.argv[1]), "E1", 1)
+"""
+                            process_argument = str(directory / "000001.json")
+                        else:
+                            process_script = """
+import sys
+from pathlib import Path
+from scripts import workflow_eval_sharding as sharding
+worker_root = Path(sys.argv[1])
+message = sharding.read_progress(
+    worker_root / "progress" / "000001.json", "E1", 1
+)
+sharding.wait_for_ack(worker_root, message, 0.05)
+"""
+                            process_argument = str(worker_root)
+                        process_reader = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-c",
+                                process_script,
+                                process_argument,
+                            ],
+                            cwd=Path(__file__).resolve().parents[1],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        self.assertFalse(
+                            reader_finished.wait(0.05),
+                            "reader bypassed the in-progress writer lock",
+                        )
+                        self.assertIsNone(
+                            process_reader.poll(),
+                            "process reader bypassed the in-progress writer lock",
+                        )
+                    finally:
+                        release_cleanup_fsync.set()
+                        writer.join(2.0)
+                        if reader is not None:
+                            reader.join(2.0)
+                        if process_reader is not None:
+                            try:
+                                process_stdout, process_stderr = (
+                                    process_reader.communicate(timeout=2.0)
+                                )
+                            except subprocess.TimeoutExpired:
+                                process_reader.kill()
+                                process_stdout, process_stderr = (
+                                    process_reader.communicate(timeout=2.0)
+                                )
+
+                self.assertFalse(writer.is_alive())
+                self.assertIsNotNone(reader)
+                self.assertFalse(reader.is_alive())
+                self.assertIsNotNone(process_reader)
+                self.assertEqual(1, len(writer_errors))
+                self.assertEqual([], reader_results)
+                self.assertEqual(1, len(reader_errors))
+                self.assertIsInstance(
+                    reader_errors[0],
+                    (TimeoutError, ValueError),
+                )
+                self.assertTrue(
+                    (directory / ".000001.json.pending").is_file()
+                )
+                self.assertNotEqual(
+                    0,
+                    process_reader.returncode,
+                    process_stdout,
+                )
+                self.assertRegex(
+                    process_stderr,
+                    "pending|timed out|ValueError",
+                )
+
+    def test_post_commit_failures_restore_pending_before_writer_raises(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        class InjectedPostCommitBase(BaseException):
+            pass
+
+        for protocol in ("progress", "ACK"):
+            for failure_point in ("validation", "retirement"):
+                with self.subTest(
+                    protocol=protocol,
+                    failure_point=failure_point,
+                ):
+                    run_root = (
+                        self.root
+                        / f"post-commit-{protocol.lower()}-{failure_point}"
+                        / "run"
+                    )
+                    run_root.mkdir(parents=True, mode=0o700)
+                    run_root.chmod(0o700)
+                    worker_root = self._worker_root(run_root)
+                    if protocol == "progress":
+                        directory = worker_root / "progress"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_progress(
+                            worker_root,
+                            ready,
+                        )
+                        read = lambda: sharding.read_progress(
+                            directory / "000001.json",
+                            "E1",
+                            1,
+                        )
+                    else:
+                        sharding.write_progress(worker_root, ready)
+                        directory = worker_root / "acks"
+                        directory.mkdir(mode=0o700)
+                        publish = lambda: sharding.write_ack(
+                            worker_root,
+                            ready,
+                            "continue",
+                        )
+                        read = lambda: sharding.wait_for_ack(
+                            worker_root,
+                            ready,
+                            0.01,
+                        )
+
+                    final = directory / "000001.json"
+                    pending = directory / ".000001.json.pending"
+                    if failure_point == "validation":
+                        real_validate = (
+                            sharding._RecordChildDirectoryCapability._validate_live
+                        )
+                        clear_validations = 0
+
+                        def fail_second_clear_validation(capability):
+                            nonlocal clear_validations
+                            result = real_validate(capability)
+                            if (
+                                capability.path == directory
+                                and final.exists()
+                                and not pending.exists()
+                            ):
+                                clear_validations += 1
+                                if clear_validations == 2:
+                                    raise InjectedPostCommitBase(
+                                        "injected post-commit validation failure"
+                                    )
+                            return result
+
+                        patcher = mock.patch.object(
+                            sharding._RecordChildDirectoryCapability,
+                            "_validate_live",
+                            new=fail_second_clear_validation,
+                        )
+                        expected_error = InjectedPostCommitBase
+                    else:
+                        real_close = (
+                            sharding._RecordChildDirectoryCapability.close
+                        )
+                        injected = False
+
+                        def fail_committed_retirement(
+                            capability,
+                            primary=None,
+                        ):
+                            nonlocal injected
+                            if (
+                                not injected
+                                and capability.path == directory
+                                and final.exists()
+                                and not pending.exists()
+                                and primary is None
+                            ):
+                                injected = True
+                                real_close(capability, primary)
+                                raise OSError(
+                                    "injected post-commit retirement failure"
+                                )
+                            return real_close(capability, primary)
+
+                        patcher = mock.patch.object(
+                            sharding._RecordChildDirectoryCapability,
+                            "close",
+                            new=fail_committed_retirement,
+                        )
+                        expected_error = OSError
+
+                    with patcher:
+                        with self.assertRaises(expected_error):
+                            publish()
+                    self.assertTrue(final.is_file())
+                    self.assertTrue(pending.is_file())
+                    with self.assertRaises(
+                        (FileNotFoundError, TimeoutError, ValueError)
+                    ):
+                        read()
+
+    def test_final_worker_retirement_failure_reports_committed_success(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        for protocol in ("progress", "ACK"):
+            with self.subTest(protocol=protocol):
+                run_root = (
+                    self.root
+                    / f"committed-worker-retirement-{protocol.lower()}"
+                    / "run"
+                )
+                run_root.mkdir(parents=True, mode=0o700)
+                run_root.chmod(0o700)
+                worker_root = self._worker_root(run_root)
+                if protocol == "progress":
+                    directory = worker_root / "progress"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_progress(
+                        worker_root,
+                        ready,
+                    )
+                    read = lambda path: sharding.read_progress(
+                        path,
+                        "E1",
+                        1,
+                    )
+                else:
+                    sharding.write_progress(worker_root, ready)
+                    directory = worker_root / "acks"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_ack(
+                        worker_root,
+                        ready,
+                        "continue",
+                    )
+                    read = lambda _path: sharding.wait_for_ack(
+                        worker_root,
+                        ready,
+                        0.1,
+                    )
+
+                final = directory / "000001.json"
+                pending = directory / ".000001.json.pending"
+                real_close = sharding._RecordDirectoryCapability.close
+                injected = False
+
+                def fail_final_worker_retirement(capability, primary=None):
+                    nonlocal injected
+                    if (
+                        not injected
+                        and capability.path == worker_root
+                        and final.exists()
+                        and not pending.exists()
+                        and primary is None
+                    ):
+                        injected = True
+                        real_close(capability, primary)
+                        raise OSError(
+                            "injected final worker retirement failure"
+                        )
+                    return real_close(capability, primary)
+
+                with mock.patch.object(
+                    sharding._RecordDirectoryCapability,
+                    "close",
+                    new=fail_final_worker_retirement,
+                ):
+                    published = publish()
+
+                self.assertTrue(injected)
+                self.assertEqual(final, published)
+                self.assertFalse(pending.exists())
+                self.assertIsNotNone(read(published))
+
+    def test_failed_pending_restoration_reports_committed_success(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        class InjectedPostCommitBase(BaseException):
+            pass
+
+        for protocol in ("progress", "ACK"):
+            with self.subTest(protocol=protocol):
+                run_root = (
+                    self.root
+                    / f"failed-pending-restoration-{protocol.lower()}"
+                    / "run"
+                )
+                run_root.mkdir(parents=True, mode=0o700)
+                run_root.chmod(0o700)
+                worker_root = self._worker_root(run_root)
+                if protocol == "progress":
+                    directory = worker_root / "progress"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_progress(
+                        worker_root,
+                        ready,
+                    )
+                    read = lambda path: sharding.read_progress(
+                        path,
+                        "E1",
+                        1,
+                    )
+                else:
+                    sharding.write_progress(worker_root, ready)
+                    directory = worker_root / "acks"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_ack(
+                        worker_root,
+                        ready,
+                        "continue",
+                    )
+                    read = lambda _path: sharding.wait_for_ack(
+                        worker_root,
+                        ready,
+                        0.1,
+                    )
+
+                final = directory / "000001.json"
+                pending = directory / ".000001.json.pending"
+                real_validate = (
+                    sharding._RecordChildDirectoryCapability._validate_live
+                )
+                real_open_directory = sharding._open_protocol_record_directory
+                clear_validations = 0
+                post_commit_failure = False
+
+                def fail_second_clear_validation(capability):
+                    nonlocal clear_validations, post_commit_failure
+                    result = real_validate(capability)
+                    if (
+                        capability.path == directory
+                        and final.exists()
+                        and not pending.exists()
+                    ):
+                        clear_validations += 1
+                        if clear_validations == 2:
+                            post_commit_failure = True
+                            raise InjectedPostCommitBase(
+                                "injected post-commit validation failure"
+                            )
+                    return result
+
+                def fail_restoration_open(*args, **kwargs):
+                    if post_commit_failure:
+                        raise OSError(
+                            "injected pending restoration open failure"
+                        )
+                    return real_open_directory(*args, **kwargs)
+
+                with mock.patch.object(
+                    sharding._RecordChildDirectoryCapability,
+                    "_validate_live",
+                    new=fail_second_clear_validation,
+                ), mock.patch.object(
+                    sharding,
+                    "_open_protocol_record_directory",
+                    side_effect=fail_restoration_open,
+                ):
+                    published = publish()
+
+                self.assertTrue(post_commit_failure)
+                self.assertEqual(final, published)
+                self.assertFalse(pending.exists())
+                self.assertIsNotNone(read(published))
+
+    def test_async_during_pending_restoration_cannot_expose_writer_failure(self):
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+
+        class InjectedPostCommitBase(BaseException):
+            pass
+
+        for protocol in ("progress", "ACK"):
+            with self.subTest(protocol=protocol):
+                run_root = (
+                    self.root
+                    / f"async-pending-restoration-{protocol.lower()}"
+                    / "run"
+                )
+                run_root.mkdir(parents=True, mode=0o700)
+                run_root.chmod(0o700)
+                worker_root = self._worker_root(run_root)
+                if protocol == "progress":
+                    directory = worker_root / "progress"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_progress(
+                        worker_root,
+                        ready,
+                    )
+                    read = lambda: sharding.read_progress(
+                        directory / "000001.json",
+                        "E1",
+                        1,
+                    )
+                else:
+                    sharding.write_progress(worker_root, ready)
+                    directory = worker_root / "acks"
+                    directory.mkdir(mode=0o700)
+                    publish = lambda: sharding.write_ack(
+                        worker_root,
+                        ready,
+                        "continue",
+                    )
+                    read = lambda: sharding.wait_for_ack(
+                        worker_root,
+                        ready,
+                        0.01,
+                    )
+
+                final = directory / "000001.json"
+                pending = directory / ".000001.json.pending"
+                real_validate = (
+                    sharding._RecordChildDirectoryCapability._validate_live
+                )
+                real_restore = (
+                    sharding._restore_protocol_pending_after_failure_retained
+                )
+                clear_validations = 0
+
+                def fail_second_clear_validation(capability):
+                    nonlocal clear_validations
+                    result = real_validate(capability)
+                    if (
+                        capability.path == directory
+                        and final.exists()
+                        and not pending.exists()
+                    ):
+                        clear_validations += 1
+                        if clear_validations == 2:
+                            raise InjectedPostCommitBase(
+                                "injected post-commit validation failure"
+                            )
+                    return result
+
+                def interrupt_after_restoration(*args, **kwargs):
+                    self.assertEqual((), real_restore(*args, **kwargs))
+                    raise InjectedPostCommitBase(
+                        "interrupted after pending restoration"
+                    )
+
+                with mock.patch.object(
+                    sharding._RecordChildDirectoryCapability,
+                    "_validate_live",
+                    new=fail_second_clear_validation,
+                ), mock.patch.object(
+                    sharding,
+                    "_restore_protocol_pending_after_failure_retained",
+                    side_effect=interrupt_after_restoration,
+                ):
+                    published = publish()
+
+                self.assertEqual(final, published)
+                self.assertTrue(pending.is_file())
+                with self.assertRaises(
+                    (FileNotFoundError, TimeoutError, ValueError)
+                ):
+                    read()
+
+    def test_protocol_pending_marker_inventory_is_bounded(self):
+        run_root = self.root / "pending-inventory" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        progress_root = self._worker_root(run_root) / "progress"
+        progress_root.mkdir(mode=0o700)
+        for sequence in range(1, sharding.MAX_PROTOCOL_RECORDS + 2):
+            marker = progress_root / f".{sequence:06d}.json.pending"
+            marker.write_bytes(b"")
+            marker.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "pending.*cap"):
+            sharding._protocol_sequence_inventory(
+                progress_root,
+                label="progress",
+                deadline=None,
+            )
+
     def _concurrent_publication_temp_peaks(self, directory, pattern, calls):
         real_open = sharding.os.open
         real_fsync = sharding.os.fsync
@@ -8464,7 +9241,10 @@ class ProgressProtocolTests(unittest.TestCase):
                     pass
                 return int(self) + other
 
-        token_ledger._total_tokens = RacingTotal(0)
+        token_ledger._state = replace(
+            token_ledger._state,
+            total_tokens=RacingTotal(0),
+        )
         token_results = []
         token_failures = []
 
@@ -8825,15 +9605,74 @@ class ProgressProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(0, ledger.total_tokens)
 
+        exit_ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        exit_errors = []
+        real_encode = sharding._encode_progress_message
+
+        def reenter_worker_exit(message):
+            if message == outer and not exit_errors:
+                try:
+                    exit_ledger.worker_exited("E2")
+                except BaseException as error:
+                    exit_errors.append(error)
+            return real_encode(message)
+
+        with mock.patch.object(
+            sharding,
+            "_encode_progress_message",
+            side_effect=reenter_worker_exit,
+        ):
+            self.assertEqual("continue", exit_ledger.accept_progress(outer))
+        self.assertEqual(1, len(exit_errors))
+        self.assertIsInstance(exit_errors[0], RuntimeError)
+        self.assertFalse(exit_ledger.aborted)
+        self.assertEqual(
+            "continue",
+            exit_ledger.accept_progress(
+                replace(outer, lane="E2")
+            ),
+        )
+
         cleanup_ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+
+        class InjectedTransitionBase(BaseException):
+            pass
+
+        self.assertFalse(hasattr(cleanup_ledger, "_transition_owner"))
+        self.assertFalse(hasattr(cleanup_ledger, "_begin_transition_locked"))
+        self.assertFalse(hasattr(cleanup_ledger, "_end_transition_locked"))
         with mock.patch.object(
             sharding,
             "canonical_config_bytes",
-            side_effect=ValueError("serialization callback failed"),
+            side_effect=InjectedTransitionBase(
+                "serialization callback failed"
+            ),
         ):
-            with self.assertRaisesRegex(ValueError, "serialization callback"):
+            with self.assertRaisesRegex(
+                InjectedTransitionBase,
+                "serialization callback",
+            ):
                 cleanup_ledger.accept_progress(outer)
         self.assertEqual("continue", cleanup_ledger.accept_progress(outer))
+
+        committed_ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        real_accept = committed_ledger._accept_progress_locked
+
+        def interrupt_after_commit(message, payload):
+            real_accept(message, payload)
+            raise InjectedTransitionBase("interrupted after ledger commit")
+
+        with mock.patch.object(
+            committed_ledger,
+            "_accept_progress_locked",
+            side_effect=interrupt_after_commit,
+        ):
+            with self.assertRaisesRegex(
+                InjectedTransitionBase,
+                "after ledger commit",
+            ):
+                committed_ledger.accept_progress(outer)
+        self.assertEqual("continue", committed_ledger.accept_progress(outer))
 
     def test_protocol_writer_lock_wait_is_bounded_and_retires_capabilities(self):
         from scripts import run_observing_workflows_eval_worker as worker
