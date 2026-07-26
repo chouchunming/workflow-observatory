@@ -1864,6 +1864,22 @@ class EpochPlan:
     assignments: tuple[CaseAssignment, ...]
 
 
+@dataclass(frozen=True)
+class RetryDecision:
+    retry: bool
+    next_attempt: Literal[2] | None
+    action: Literal["reuse", "invalidate", "abort"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class ResumePlan:
+    run_kind: RunKind
+    reusable: tuple[CaseKey, ...]
+    pending: tuple[CaseKey, ...]
+    invalid: tuple[CaseKey, ...]
+
+
 _PROGRESS_EPOCH_CONTEXTS: dict[str, tuple[EpochPlan, bytes]] = {}
 
 
@@ -3443,49 +3459,19 @@ def stage_marketplace_for_case(
     return destination
 
 
-def _validated_attempt_file(path: Path, label: str) -> None:
-    try:
-        descriptor, metadata = _open_regular_file(path, label)
-    except ValueError:
-        raise ValueError(f"{label} must be a regular non-symlink file") from None
-    slot = _DescriptorSlot(descriptor)
-    content = bytearray()
-    primary: BaseException | None = None
-    try:
-        while True:
-            chunk = os.read(slot.descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            content.extend(chunk)
-    except BaseException as error:
-        primary = error
-    close_error = _retire_descriptor_capability(slot)
-    _raise_ordered_failures(
-        f"{label} read or descriptor close failed",
-        primary,
-        [close_error] if close_error is not None else [],
-    )
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise ValueError(f"{label} must have mode 0600")
-    try:
-        decoded = json.loads(bytes(content).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError(f"{label} must contain valid JSON") from None
-    if not isinstance(decoded, dict):
-        raise ValueError(f"{label} must contain a JSON object")
-
-
 def scan_attempts(
-    case: CasePaths, *, plan: EpochPlan
+    case: CasePaths,
+    *,
+    plan: EpochPlan,
+    manifest_case: dict[str, object],
 ) -> tuple[AttemptPaths, ...]:
     if not isinstance(case, CasePaths):
         raise TypeError("case must be CasePaths")
-    assignments = getattr(plan, "assignments", None)
-    if not isinstance(assignments, tuple):
-        raise TypeError("plan must provide tuple assignments")
+    if not isinstance(plan, EpochPlan):
+        raise TypeError("plan must be EpochPlan")
     run_root = canonical_run_root(case.root.parent.parent)
     matches = []
-    for assignment in assignments:
+    for assignment in plan.assignments:
         if not isinstance(assignment, CaseAssignment):
             continue
         expected = paths_for_case(run_root, assignment)
@@ -3493,49 +3479,75 @@ def scan_attempts(
             matches.append((assignment, expected))
     if len(matches) != 1:
         raise ValueError("case paths do not identify exactly one planned case")
-    _, canonical = matches[0]
+    assignment, canonical = matches[0]
     if case != canonical:
         raise ValueError("case paths differ from canonical planned paths")
-    if not case.attempts.exists() and not case.attempts.is_symlink():
+    manifest_case_sha256 = _validate_seal_context(
+        plan=plan,
+        paths=case,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
+    try:
+        case.root.lstat()
+    except FileNotFoundError:
         return ()
-    try:
-        attempts_metadata = case.attempts.lstat()
     except OSError:
-        raise ValueError("attempt root is unavailable") from None
-    if stat.S_ISLNK(attempts_metadata.st_mode) or not stat.S_ISDIR(
-        attempts_metadata.st_mode
-    ):
-        raise ValueError("attempt root must be a real directory")
-    try:
-        entries = sorted(os.scandir(case.attempts), key=lambda entry: entry.name)
-    except OSError:
-        raise ValueError("could not scan attempts") from None
-    names = [entry.name for entry in entries]
-    if any(name not in {"01", "02"} for name in names):
-        raise ValueError("attempt directory name is invalid")
-    if names not in ([], ["01"], ["01", "02"]):
-        raise ValueError("attempt sequence contains a gap or duplicate")
+        raise ValueError("case root is unavailable") from None
 
-    found = []
-    for attempt_number, entry in enumerate(entries, start=1):
-        try:
-            metadata = entry.stat(follow_symlinks=False)
-        except OSError:
-            raise ValueError("attempt directory is unavailable") from None
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("attempt entry must be a real directory")
-        paths = paths_for_attempt(case, attempt_number)
-        try:
-            child_names = sorted(child.name for child in os.scandir(paths.root))
-        except OSError:
-            raise ValueError("could not scan attempt directory") from None
-        expected = ["start.json", "terminal.json"]
-        if child_names != expected:
-            raise ValueError("attempt is partial or contains unexpected files")
-        _validated_attempt_file(paths.start, "attempt start")
-        _validated_attempt_file(paths.terminal, "attempt terminal")
-        found.append(paths)
-    return tuple(found)
+    case_directory = _open_case_record_directory(
+        paths=case,
+        components=(),
+        create=False,
+        label="case record directory",
+    )
+    with case_directory:
+        case_inventory = case_directory.inventory()
+        if "attempts" not in case_inventory:
+            return ()
+
+    directory = _open_case_record_directory(
+        paths=case,
+        components=("attempts",),
+        create=False,
+        label="attempt root",
+    )
+    with directory:
+        inventory = directory.inventory()
+        if inventory not in ((), ("01",), ("01", "02")):
+            if "01" not in inventory:
+                raise ValueError("attempt sequence contains a gap")
+            raise ValueError("attempt directory name or sequence is invalid")
+        with ExitStack() as child_stack:
+            children = tuple(
+                child_stack.enter_context(
+                    _open_record_child_directory(
+                        directory,
+                        name,
+                        label="attempt directory",
+                    )
+                )
+                for name in inventory
+            )
+            if directory.inventory() != inventory:
+                raise RuntimeError(
+                    "attempt inventory changed while retaining children"
+                )
+            found: list[AttemptPaths] = []
+            for attempt_number, child in enumerate(children, start=1):
+                _read_attempt_seal_retained(
+                    directory=child,
+                    plan=plan,
+                    assignment=assignment,
+                    attempt=attempt_number,
+                    manifest_case_sha256=manifest_case_sha256,
+                )
+                found.append(paths_for_attempt(case, attempt_number))
+            if directory.inventory() != inventory:
+                raise RuntimeError("attempt inventory changed while scanning")
+            for child in children:
+                child._validate_live()
+            return tuple(found)
 
 
 _ATTEMPT_START_FIELDS = frozenset(
@@ -5188,6 +5200,373 @@ def read_case_seal(
             manifest_case=manifest_case,
             manifest_case_sha256=manifest_case_sha256,
         )
+
+
+def decide_retry(
+    *,
+    classification: OutcomeClass,
+    attempt: int,
+    model_started: bool,
+    cleanup_passed: bool,
+    fingerprints_unchanged: bool,
+) -> RetryDecision:
+    if (
+        type(classification) is not str
+        or classification not in _OUTCOME_CLASSES
+    ):
+        raise ValueError("retry classification is invalid")
+    if type(attempt) is not int or attempt not in (1, 2):
+        raise ValueError("retry attempt must be exactly 1 or 2")
+    if (
+        type(model_started) is not bool
+        or type(cleanup_passed) is not bool
+        or type(fingerprints_unchanged) is not bool
+    ):
+        raise TypeError("retry predicates must be exact bools")
+    if not cleanup_passed:
+        return RetryDecision(
+            retry=False,
+            next_attempt=None,
+            action="abort",
+            reason="cleanup was not proved complete",
+        )
+    if not fingerprints_unchanged:
+        return RetryDecision(
+            retry=False,
+            next_attempt=None,
+            action="abort",
+            reason="captured input fingerprints changed",
+        )
+    if classification == "success":
+        if not model_started:
+            return RetryDecision(
+                retry=False,
+                next_attempt=None,
+                action="abort",
+                reason="success without a model start is inconsistent",
+            )
+        return RetryDecision(
+            retry=False,
+            next_attempt=None,
+            action="reuse",
+            reason="successful attempt is reusable",
+        )
+    if classification in ("semantic", "model"):
+        return RetryDecision(
+            retry=False,
+            next_attempt=None,
+            action="invalidate",
+            reason="semantic or model failure invalidates the case",
+        )
+    if (
+        classification == "pre-model-infrastructure"
+        and attempt == 1
+        and not model_started
+    ):
+        return RetryDecision(
+            retry=True,
+            next_attempt=2,
+            action="reuse",
+            reason="one proved pre-model infrastructure retry is permitted",
+        )
+    return RetryDecision(
+        retry=False,
+        next_attempt=None,
+        action="abort",
+        reason="outcome is not eligible for retry",
+    )
+
+
+def _fingerprints_are_complete(fingerprints: InputFingerprints) -> bool:
+    return (
+        type(fingerprints) is InputFingerprints
+        and type(fingerprints.schema_version) is int
+        and fingerprints.schema_version == 1
+        and type(fingerprints.run_kind) is str
+        and fingerprints.run_kind in ("diagnostic", "discovery", "formal")
+        and _is_sha256(fingerprints.epoch_id)
+        and all(
+            _is_sha256(value)
+            for value in (
+                fingerprints.archive_sha256,
+                fingerprints.marketplace_sha256,
+                fingerprints.evaluator_sha256,
+                fingerprints.transport_config_sha256,
+                fingerprints.forward_manifest_sha256,
+                fingerprints.lifecycle_manifest_sha256,
+            )
+        )
+    )
+
+
+def _frozen_manifest_sha256(rows: list[dict[str, object]]) -> str:
+    content = (
+        json.dumps(rows, ensure_ascii=True, indent=2).encode("ascii")
+        + b"\n"
+    )
+    return hashlib.sha256(content).hexdigest()
+
+
+def _resume_all_invalid(plan: EpochPlan) -> ResumePlan:
+    return ResumePlan(
+        run_kind=plan.run_kind,
+        reusable=(),
+        pending=(),
+        invalid=tuple(assignment.key for assignment in plan.assignments),
+    )
+
+
+def _resume_all_pending(plan: EpochPlan) -> ResumePlan:
+    return ResumePlan(
+        run_kind=plan.run_kind,
+        reusable=(),
+        pending=tuple(assignment.key for assignment in plan.assignments),
+        invalid=(),
+    )
+
+
+def _resume_run_root_has_cases(run_root: Path) -> bool:
+    directory = _open_anchored_record_directory(
+        anchor_path=run_root,
+        base_components=(),
+        record_components=(),
+        create=False,
+        label="resume run root",
+    )
+    with directory:
+        inventory = directory.inventory()
+        if "cases" not in inventory:
+            return False
+    cases = _open_anchored_record_directory(
+        anchor_path=run_root,
+        base_components=(),
+        record_components=("cases",),
+        create=False,
+        label="resume cases root",
+    )
+    with cases:
+        cases.inventory()
+    return True
+
+
+def _case_has_resume_records(paths: CasePaths) -> tuple[bool, bool]:
+    try:
+        paths.root.lstat()
+    except FileNotFoundError:
+        return False, False
+    except OSError:
+        raise ValueError("case root is unavailable") from None
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=(),
+        create=False,
+        label="resume case directory",
+    )
+    with directory:
+        inventory = directory.inventory()
+        return "attempts" in inventory, "sealed" in inventory
+
+
+def plan_resume(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    current_fingerprints: InputFingerprints,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+) -> ResumePlan:
+    if type(plan) is not EpochPlan:
+        raise TypeError("plan must be an exact EpochPlan")
+    if type(current_fingerprints) is not InputFingerprints:
+        raise TypeError(
+            "current_fingerprints must be exact InputFingerprints"
+        )
+    if type(run_root) is not type(Path(".")):
+        raise TypeError("run_root must be an exact Path")
+    canonical_root = canonical_run_root(run_root)
+    if type(plan.assignments) is not tuple or any(
+        type(assignment) is not CaseAssignment
+        for assignment in plan.assignments
+    ):
+        raise ValueError("plan assignments must be an exact tuple")
+    if not plan.assignments:
+        raise ValueError("plan assignments must not be empty")
+    if type(manifests) is not dict:
+        raise TypeError("manifests must be an exact dict")
+    if set(manifests) != {"forward", "lifecycle"} or any(
+        type(manifests.get(mode)) is not list
+        for mode in ("forward", "lifecycle")
+    ):
+        return _resume_all_invalid(plan)
+    if (
+        type(plan.schema_version) is not int
+        or plan.schema_version != 1
+        or type(plan.epoch_id) is not str
+        or not _is_sha256(plan.epoch_id)
+        or type(plan.run_kind) is not str
+        or plan.run_kind not in ("diagnostic", "discovery", "formal")
+        or not _fingerprints_are_complete(plan.fingerprints)
+        or not _fingerprints_are_complete(current_fingerprints)
+        or current_fingerprints != plan.fingerprints
+        or plan.fingerprints.epoch_id != plan.epoch_id
+        or plan.fingerprints.run_kind != plan.run_kind
+        or _frozen_manifest_sha256(manifests["forward"])
+        != current_fingerprints.forward_manifest_sha256
+        or _frozen_manifest_sha256(manifests["lifecycle"])
+        != current_fingerprints.lifecycle_manifest_sha256
+    ):
+        return _resume_all_invalid(plan)
+    try:
+        rebuilt = build_epoch_plan(
+            run_kind=plan.run_kind,
+            manifests=manifests,
+            fingerprints=current_fingerprints,
+        )
+    except (TypeError, ValueError):
+        return _resume_all_invalid(plan)
+    if rebuilt != plan:
+        return _resume_all_invalid(plan)
+    try:
+        if not _resume_run_root_has_cases(canonical_root):
+            return _resume_all_pending(plan)
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        if is_indeterminate_descriptor_close(error):
+            raise
+        _require_lease_process_healthy()
+        return _resume_all_invalid(plan)
+
+    reusable: list[CaseKey] = []
+    pending: list[CaseKey] = []
+    invalid: list[CaseKey] = []
+    for assignment in plan.assignments:
+        manifest_rows = manifests[assignment.key.mode]
+        index = assignment.key.ordinal - 1
+        if index < 0 or index >= len(manifest_rows):
+            invalid.append(assignment.key)
+            continue
+        manifest_case = manifest_rows[index]
+        if (
+            type(manifest_case) is not dict
+            or manifest_case.get("id") != assignment.key.case_id
+        ):
+            invalid.append(assignment.key)
+            continue
+        paths = paths_for_case(canonical_root, assignment)
+        try:
+            has_attempts, has_seal = _case_has_resume_records(paths)
+            if not has_attempts:
+                if has_seal:
+                    invalid.append(assignment.key)
+                else:
+                    pending.append(assignment.key)
+                continue
+            attempts = scan_attempts(
+                paths,
+                plan=plan,
+                manifest_case=manifest_case,
+            )
+            if not attempts:
+                if has_seal:
+                    invalid.append(assignment.key)
+                else:
+                    pending.append(assignment.key)
+                continue
+            seals = tuple(
+                read_attempt_seal(
+                    plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    attempt=attempt_number,
+                    manifest_case=manifest_case,
+                )
+                for attempt_number in range(1, len(attempts) + 1)
+            )
+            for seal in seals:
+                if seal.terminal.get("cleanup_passed") is True:
+                    receipt = read_verified_tombstone_receipt(
+                        plan=plan,
+                        assignment=assignment,
+                        paths=paths,
+                    )
+                    if (
+                        seal.terminal.get("tombstone_receipt_sha256")
+                        != receipt.sha256
+                    ):
+                        raise ValueError(
+                            "attempt cleanup receipt hash differs"
+                        )
+            if len(seals) == 2:
+                first = seals[0].terminal
+                first_decision = decide_retry(
+                    classification=first["classification"],
+                    attempt=1,
+                    model_started=first["model_started"],
+                    cleanup_passed=first["cleanup_passed"],
+                    fingerprints_unchanged=True,
+                )
+                if (
+                    first.get("status") != "failed"
+                    or not first_decision.retry
+                    or first_decision.next_attempt != 2
+                    or first_decision.action != "reuse"
+                ):
+                    invalid.append(assignment.key)
+                    continue
+            final_terminal = seals[-1].terminal
+            final_attempt = len(seals)
+            final_decision = decide_retry(
+                classification=final_terminal["classification"],
+                attempt=final_attempt,
+                model_started=final_terminal["model_started"],
+                cleanup_passed=final_terminal["cleanup_passed"],
+                fingerprints_unchanged=True,
+            )
+            if final_terminal.get("status") != "success":
+                if (
+                    len(seals) == 1
+                    and final_decision.retry
+                    and final_decision.next_attempt == 2
+                    and final_decision.action == "reuse"
+                    and not has_seal
+                ):
+                    pending.append(assignment.key)
+                else:
+                    invalid.append(assignment.key)
+                continue
+            if (
+                final_decision.action != "reuse"
+                or sum(
+                    seal.terminal.get("model_started") is True
+                    for seal in seals
+                )
+                != 1
+            ):
+                invalid.append(assignment.key)
+                continue
+            case_seal = read_case_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+            if (
+                not has_seal
+                or case_seal.commit.get("status") != "success"
+                or case_seal.commit.get("attempt") != final_attempt
+            ):
+                invalid.append(assignment.key)
+                continue
+            reusable.append(assignment.key)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            if is_indeterminate_descriptor_close(error):
+                raise
+            _require_lease_process_healthy()
+            invalid.append(assignment.key)
+    return ResumePlan(
+        run_kind=plan.run_kind,
+        reusable=tuple(reusable),
+        pending=tuple(pending),
+        invalid=tuple(invalid),
+    )
 
 
 _SHARD_COMMIT_FIELDS = frozenset(

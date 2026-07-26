@@ -2699,27 +2699,90 @@ class RuntimeIsolationTests(unittest.TestCase):
                     destination=root / "special-stage",
                 )
 
-            assignment = self._assignment("forward", 1, "case")
-            paths = sharding.paths_for_case(root / "run", assignment)
+            manifests = {
+                "forward": load_cases("observing_workflows_cases.json"),
+                "lifecycle": load_cases(
+                    "observing_workflows_lifecycle_cases.json"
+                ),
+            }
+            plan = sharding.build_epoch_plan(
+                run_kind="diagnostic",
+                manifests=manifests,
+                fingerprints=input_fingerprints("diagnostic"),
+            )
+            assignment = plan.assignments[0]
+            manifest_case = manifests["forward"][0]
+            run_root = root / "run"
+            (run_root / "cases").mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.root.mkdir(mode=0o700)
+            sharding.write_attempt_start(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+            )
             attempt = sharding.paths_for_attempt(paths, 1)
-            attempt.root.mkdir(parents=True, mode=0o700)
-            attempt.start.write_text("{}", encoding="utf-8")
-            attempt.start.chmod(0o600)
-            plan = type("Plan", (), {"assignments": (assignment,)})()
-            with self.assertRaisesRegex(ValueError, "partial"):
-                sharding.scan_attempts(paths, plan=plan)
-            attempt.terminal.write_text("{}", encoding="utf-8")
-            attempt.terminal.chmod(0o600)
-            self.assertEqual(1, len(sharding.scan_attempts(paths, plan=plan)))
+            with self.assertRaisesRegex(ValueError, "partial|incomplete"):
+                sharding.scan_attempts(
+                    paths,
+                    plan=plan,
+                    manifest_case=manifest_case,
+                )
+            start = json.loads(attempt.start.read_text(encoding="ascii"))
+            failure_text = "pre-model failure"
+            sharding._atomic_write_record(
+                attempt.terminal,
+                {
+                    **start,
+                    "start_sha256": hashlib.sha256(
+                        attempt.start.read_bytes()
+                    ).hexdigest(),
+                    "status": "failed",
+                    "classification": "pre-model-infrastructure",
+                    "model_started": False,
+                    "cleanup_passed": False,
+                    "usage": None,
+                    "failure": {
+                        "classification": "pre-model-infrastructure",
+                        "type": "RuntimeError",
+                        "chars": len(failure_text),
+                        "sha256": hashlib.sha256(
+                            failure_text.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "tombstone_receipt_sha256": None,
+                },
+            )
+            self.assertEqual(
+                1,
+                len(
+                    sharding.scan_attempts(
+                        paths,
+                        plan=plan,
+                        manifest_case=manifest_case,
+                    )
+                ),
+            )
             gap = paths.attempts / "02"
             attempt.root.rename(gap)
             with self.assertRaisesRegex(ValueError, "gap"):
-                sharding.scan_attempts(paths, plan=plan)
+                sharding.scan_attempts(
+                    paths,
+                    plan=plan,
+                    manifest_case=manifest_case,
+                )
             gap.rename(attempt.root)
             extra = paths.attempts / "03"
             extra.mkdir(mode=0o700)
             with self.assertRaisesRegex(ValueError, "attempt"):
-                sharding.scan_attempts(paths, plan=plan)
+                sharding.scan_attempts(
+                    paths,
+                    plan=plan,
+                    manifest_case=manifest_case,
+                )
 
     def test_runtime_factory_rejects_symlinked_case_ancestor(self):
         from scripts import run_observing_workflows_eval_worker as worker
@@ -2827,15 +2890,66 @@ class RuntimeIsolationTests(unittest.TestCase):
             root = Path(temporary).resolve(strict=True)
             run_root = root / "run"
             run_root.mkdir(mode=0o700)
-            assignment = self._assignment("forward", 1, "case")
+            manifests = {
+                "forward": load_cases("observing_workflows_cases.json"),
+                "lifecycle": load_cases(
+                    "observing_workflows_lifecycle_cases.json"
+                ),
+            }
+            plan = sharding.build_epoch_plan(
+                run_kind="diagnostic",
+                manifests=manifests,
+                fingerprints=input_fingerprints("diagnostic"),
+            )
+            assignment = plan.assignments[0]
+            manifest_case = manifests["forward"][0]
+            (run_root / "cases").mkdir(mode=0o700)
+            run_root.chmod(0o700)
             paths = sharding.paths_for_case(run_root, assignment)
+            paths.root.mkdir(mode=0o700)
+            sharding.write_attempt_start(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+            )
             attempt = sharding.paths_for_attempt(paths, 1)
-            attempt.root.mkdir(parents=True, mode=0o700)
-            for artifact in (attempt.start, attempt.terminal):
-                artifact.write_text("{}", encoding="utf-8")
-                artifact.chmod(0o600)
-            plan = type("Plan", (), {"assignments": (assignment,)})()
-            self.assertEqual(1, len(sharding.scan_attempts(paths, plan=plan)))
+            start = json.loads(attempt.start.read_text(encoding="ascii"))
+            failure_text = "pre-model failure"
+            sharding._atomic_write_record(
+                attempt.terminal,
+                {
+                    **start,
+                    "start_sha256": hashlib.sha256(
+                        attempt.start.read_bytes()
+                    ).hexdigest(),
+                    "status": "failed",
+                    "classification": "pre-model-infrastructure",
+                    "model_started": False,
+                    "cleanup_passed": False,
+                    "usage": None,
+                    "failure": {
+                        "classification": "pre-model-infrastructure",
+                        "type": "RuntimeError",
+                        "chars": len(failure_text),
+                        "sha256": hashlib.sha256(
+                            failure_text.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "tombstone_receipt_sha256": None,
+                },
+            )
+            self.assertEqual(
+                1,
+                len(
+                    sharding.scan_attempts(
+                        paths,
+                        plan=plan,
+                        manifest_case=manifest_case,
+                    )
+                ),
+            )
 
             unrelated = root / "unrelated"
             unrelated.mkdir(mode=0o700)
@@ -2853,20 +2967,32 @@ class RuntimeIsolationTests(unittest.TestCase):
                 forged = replace(paths, **{field.name: redirected})
                 with self.subTest(field=field.name):
                     with self.assertRaises(ValueError):
-                        sharding.scan_attempts(forged, plan=plan)
+                        sharding.scan_attempts(
+                            forged,
+                            plan=plan,
+                            manifest_case=manifest_case,
+                        )
 
             dotdot = replace(
                 paths,
                 attempts=paths.root / "nested" / ".." / "attempts",
             )
             with self.assertRaisesRegex(ValueError, "canonical"):
-                sharding.scan_attempts(dotdot, plan=plan)
+                sharding.scan_attempts(
+                    dotdot,
+                    plan=plan,
+                    manifest_case=manifest_case,
+                )
 
             alias = root / "attempt-alias"
             alias.symlink_to(paths.attempts, target_is_directory=True)
             symlinked = replace(paths, attempts=alias)
             with self.assertRaisesRegex(ValueError, "canonical"):
-                sharding.scan_attempts(symlinked, plan=plan)
+                sharding.scan_attempts(
+                    symlinked,
+                    plan=plan,
+                    manifest_case=manifest_case,
+                )
 
     def test_runtime_factory_preserves_setup_and_auth_cleanup_failures(self):
         from scripts import run_observing_workflows_eval_worker as worker
@@ -4727,6 +4853,278 @@ class RuntimeIsolationTests(unittest.TestCase):
             self.assertIsInstance(runtime.writable_roots, tuple)
             with self.assertRaises(AttributeError):
                 runtime.writable_roots.append(root / "forged")
+
+
+class RetryResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.plan = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("formal"),
+        )
+        self.assignment = self.plan.assignments[0]
+        self.manifest_case = self.manifests["forward"][0]
+        self.run_root = self.root / "run"
+        (self.run_root / "cases").mkdir(parents=True, mode=0o700)
+        self.run_root.chmod(0o700)
+        self.paths = sharding.paths_for_case(
+            self.run_root, self.assignment
+        )
+        self.paths.root.mkdir(mode=0o700)
+        self.paths.cleanup.mkdir(mode=0o700)
+        self.paths.codex_home.mkdir(mode=0o700)
+        self.usage = {
+            "input_tokens": 10,
+            "cached_input_tokens": 2,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 1,
+            "total_tokens": 15,
+        }
+        self.result = {
+            "id": self.assignment.key.case_id,
+            "decisions": [
+                {
+                    "after_turn": 1,
+                    "triggered": True,
+                    "task_type": "feature",
+                    "workflow_variant": "implementation-basic",
+                }
+            ],
+            "record_checkpoints": [
+                {
+                    "after_turn": 1,
+                    "records": [
+                        {
+                            "role": "run-1",
+                            "status": "success",
+                            "start_mode": "planned",
+                            "superseded_by_role": None,
+                        }
+                    ],
+                }
+            ],
+            "run_count": 1,
+            "draft_count": 0,
+            "final_statuses": ["success"],
+        }
+        self.evidence = {
+            "status": "success",
+            "classification": "success",
+            "model_started": True,
+            "elapsed_milliseconds": 25,
+            "usage": self.usage,
+            "failure": None,
+            "store_record_count": 1,
+            "store_invalidated_count": 0,
+            "audit_event_count": 3,
+            "payload_file_count": 0,
+            "output_file_count": 0,
+            "process_cleanup_passed": True,
+            "credential_cleanup_passed": True,
+        }
+        self._write_expected_tombstone()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _write_expected_tombstone(self):
+        root_stat = self.paths.root.stat()
+        home_stat = self.paths.codex_home.stat()
+        ownership = sharding.CaseAuthOwnership(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            case=self.assignment.key,
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+        )
+        ownership_bytes = sharding._atomic_write_record(
+            self.paths.cleanup / "ownership.json", asdict(ownership)
+        )
+        receipt = sharding.TombstoneReceipt(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            case=self.assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="worker",
+        )
+        sharding._atomic_write_record(
+            self.paths.cleanup / "tombstone.json", asdict(receipt)
+        )
+
+    @staticmethod
+    def _failure(classification):
+        text = f"{classification} failure"
+        return {
+            "classification": classification,
+            "type": "RuntimeError",
+            "chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+
+    def _write_attempt(
+        self,
+        attempt,
+        *,
+        status,
+        classification,
+        model_started,
+        cleanup_passed=True,
+    ):
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=attempt,
+            manifest_case=self.manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=attempt,
+            manifest_case=self.manifest_case,
+            status=status,
+            classification=classification,
+            model_started=model_started,
+            cleanup_passed=cleanup_passed,
+            usage=self.usage if status == "success" else None,
+            failure=(
+                None
+                if status == "success"
+                else self._failure(classification)
+            ),
+        )
+
+    def _seal_success(self, attempt):
+        sharding.seal_case(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=attempt,
+            result=self.result,
+            evidence=self.evidence,
+            manifest_case=self.manifest_case,
+        )
+
+    def _resume(self):
+        return sharding.plan_resume(
+            plan=self.plan,
+            run_root=self.run_root,
+            current_fingerprints=self.plan.fingerprints,
+            manifests=self.manifests,
+        )
+
+    def test_two_attempt_layout_requires_proved_pre_model_first_attempt(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        self.assertIs(worker.RetryDecision, sharding.RetryDecision)
+        self.assertIs(worker.decide_retry, sharding.decide_retry)
+        decision = sharding.decide_retry(
+            classification="pre-model-infrastructure",
+            attempt=1,
+            model_started=False,
+            cleanup_passed=True,
+            fingerprints_unchanged=True,
+        )
+        self.assertIsInstance(decision, sharding.RetryDecision)
+        self.assertTrue(decision.retry)
+        self.assertEqual(2, decision.next_attempt)
+        self.assertEqual("reuse", decision.action)
+        self.assertTrue(decision.reason)
+
+        self._write_attempt(
+            1,
+            status="failed",
+            classification="pre-model-infrastructure",
+            model_started=False,
+        )
+        self._write_attempt(
+            2,
+            status="success",
+            classification="success",
+            model_started=True,
+        )
+        self._seal_success(2)
+
+        attempts = sharding.scan_attempts(
+            self.paths,
+            plan=self.plan,
+            manifest_case=self.manifest_case,
+        )
+        self.assertEqual((1, 2), tuple(
+            int(attempt.root.name) for attempt in attempts
+        ))
+        resume = self._resume()
+        self.assertEqual((self.assignment.key,), resume.reusable)
+        self.assertEqual(
+            tuple(assignment.key for assignment in self.plan.assignments[1:]),
+            resume.pending,
+        )
+        self.assertEqual((), resume.invalid)
+
+        sharding.paths_for_attempt(self.paths, 1).terminal.unlink()
+        resume = self._resume()
+        self.assertEqual((), resume.reusable)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_rejects_forged_case_digest_with_unchanged_manifest_identity(self):
+        self._write_attempt(
+            1,
+            status="success",
+            classification="success",
+            model_started=True,
+        )
+        self._seal_success(1)
+        self.assertEqual(
+            (self.assignment.key,), self._resume().reusable
+        )
+
+        epoch_id = self.plan.epoch_id
+        forward_manifest_sha256 = (
+            self.plan.fingerprints.forward_manifest_sha256
+        )
+        forged_digest = hashlib.sha256(
+            sharding.canonical_config_bytes(self.manifests["forward"][1])
+        ).hexdigest()
+        attempt = sharding.paths_for_attempt(self.paths, 1)
+        start = json.loads(attempt.start.read_text(encoding="ascii"))
+        terminal = json.loads(attempt.terminal.read_text(encoding="ascii"))
+        start["manifest_case_sha256"] = forged_digest
+        start_bytes = sharding.canonical_config_bytes(start)
+        terminal["manifest_case_sha256"] = forged_digest
+        terminal["start_sha256"] = hashlib.sha256(start_bytes).hexdigest()
+        attempt.start.write_bytes(start_bytes)
+        attempt.terminal.write_bytes(
+            sharding.canonical_config_bytes(terminal)
+        )
+
+        resume = self._resume()
+        self.assertEqual(epoch_id, self.plan.epoch_id)
+        self.assertEqual(
+            forward_manifest_sha256,
+            self.plan.fingerprints.forward_manifest_sha256,
+        )
+        self.assertEqual((), resume.reusable)
+        self.assertEqual((self.assignment.key,), resume.invalid)
 
 
 class SealTests(unittest.TestCase):
