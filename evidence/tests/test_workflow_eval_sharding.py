@@ -7388,6 +7388,55 @@ class ProgressProtocolTests(unittest.TestCase):
         )
         return worker_root, message
 
+    def _failed_precommit_scenario(
+        self,
+        name,
+        *,
+        fault_point,
+        cleanup_passed=True,
+        canonical_binding="expected",
+        include_result=True,
+    ):
+        worker_root, message = self._failed_terminal_scenario(
+            name,
+            cleanup_passed=cleanup_passed,
+            canonical_binding=canonical_binding,
+        )
+        paths = sharding.paths_for_case(
+            worker_root.parent.parent,
+            self.assignment,
+        )
+        terminal = json.loads(
+            sharding.paths_for_attempt(paths, 1).terminal.read_text(
+                encoding="ascii"
+            )
+        )
+        evidence = {
+            **self.evidence,
+            "status": "failed",
+            "classification": "semantic",
+            "failure": terminal["failure"],
+            "process_cleanup_passed": cleanup_passed,
+            "credential_cleanup_passed": cleanup_passed,
+        }
+
+        def interrupt(point):
+            if point == fault_point:
+                raise RuntimeError(f"fault at {point}")
+
+        with self.assertRaisesRegex(RuntimeError, f"fault at {fault_point}"):
+            sharding.seal_case(
+                plan=self.plan,
+                paths=paths,
+                assignment=self.assignment,
+                attempt=1,
+                result={**self.result} if include_result else None,
+                evidence=evidence,
+                manifest_case=self.manifest_case,
+                fault_injector=interrupt,
+            )
+        return worker_root, paths, message
+
     def _success_terminal_scenario(self, name):
         run_root = self.root / name / "run"
         run_root.mkdir(parents=True, mode=0o700)
@@ -7908,6 +7957,341 @@ class ProgressProtocolTests(unittest.TestCase):
             with self.subTest(invalid=message):
                 with self.assertRaises((TypeError, ValueError)):
                     sharding.write_progress(worker_root, message)
+
+    def test_failed_terminal_accepts_only_authoritative_precommit_case_artifacts(self):
+        for fault_point, expected_inventory in (
+            ("after-result-replace", ("case-result.json",)),
+            (
+                "before-case-commit",
+                ("case-evidence.json", "case-result.json"),
+            ),
+        ):
+            with self.subTest(fault_point=fault_point):
+                worker_root, paths, message = self._failed_precommit_scenario(
+                    f"valid-{fault_point}",
+                    fault_point=fault_point,
+                )
+                self.assertEqual(
+                    expected_inventory,
+                    tuple(sorted(path.name for path in paths.sealed.iterdir())),
+                )
+                progress_path = sharding.write_progress(worker_root, message)
+                observed = sharding.read_progress(progress_path, "E1", 1)
+                ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+                self.assertEqual(
+                    "continue",
+                    ledger.accept_progress(
+                        self._case_started_for_terminal(observed, seq=1)
+                    ),
+                )
+                self.assertEqual(
+                    "abort",
+                    ledger.accept_progress(replace(observed, seq=2)),
+                )
+                self.assertFalse((paths.sealed / "case-commit.json").exists())
+
+        worker_root, paths, message = self._failed_precommit_scenario(
+            "valid-evidence-only",
+            fault_point="before-case-commit",
+            cleanup_passed=False,
+            canonical_binding=None,
+            include_result=False,
+        )
+        self.assertEqual(
+            ("case-evidence.json",),
+            tuple(path.name for path in paths.sealed.iterdir()),
+        )
+        sharding.write_progress(worker_root, message)
+
+        empty_root, empty_message = self._failed_terminal_scenario(
+            "valid-empty-seal",
+            cleanup_passed=False,
+            canonical_binding=None,
+        )
+        empty_paths = sharding.paths_for_case(
+            empty_root.parent.parent,
+            self.assignment,
+        )
+        empty_paths.sealed.mkdir(mode=0o700)
+        sharding.write_progress(empty_root, empty_message)
+
+        for mutation in ("orphan-evidence", "cross-case-result", "extra-record"):
+            with self.subTest(mutation=mutation):
+                worker_root, paths, message = self._failed_precommit_scenario(
+                    f"invalid-{mutation}",
+                    fault_point="before-case-commit",
+                )
+                if mutation == "orphan-evidence":
+                    (paths.sealed / "case-result.json").unlink()
+                elif mutation == "cross-case-result":
+                    result_path = paths.sealed / "case-result.json"
+                    result = json.loads(result_path.read_text(encoding="ascii"))
+                    result["id"] = dict(sharding.FROZEN_LANE_CASES)["E1"][1].case_id
+                    sharding._atomic_write_record(result_path, result)
+                else:
+                    sharding._atomic_write_record(
+                        paths.sealed / "unexpected.json",
+                        {"unexpected": True},
+                    )
+                with self.assertRaises(ValueError):
+                    sharding.write_progress(worker_root, message)
+
+    def test_worker_protocol_and_ledger_reject_mixed_epoch_and_run_kind(self):
+        formal = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("formal"),
+        )
+        diagnostic_first = self._lane_message(
+            seq=1,
+            progress_type="lane-ready",
+        )
+        formal_second = replace(
+            diagnostic_first,
+            epoch_id=formal.epoch_id,
+            run_kind=formal.run_kind,
+            seq=2,
+        )
+
+        progress_run_root = self.root / "mixed-progress" / "run"
+        progress_run_root.mkdir(parents=True, mode=0o700)
+        progress_run_root.chmod(0o700)
+        progress_root = self._worker_root(progress_run_root)
+        sharding.write_progress(progress_root, diagnostic_first)
+        progress_path = progress_root / "progress" / "000002.json"
+        sharding._atomic_write_record(progress_path, asdict(formal_second))
+        with self.assertRaises(ValueError):
+            sharding.wait_for_progress(
+                worker_root=progress_root,
+                expected_lane="E1",
+                expected_seq=2,
+                timeout=0.1,
+            )
+
+        ack_run_root = self.root / "mixed-ack" / "run"
+        ack_run_root.mkdir(parents=True, mode=0o700)
+        ack_run_root.chmod(0o700)
+        ack_root = self._worker_root(ack_run_root)
+        sharding.write_progress(ack_root, diagnostic_first)
+        sharding.write_ack(ack_root, diagnostic_first, "continue")
+        formal_content = sharding._atomic_write_record(
+            ack_root / "progress" / "000002.json",
+            asdict(formal_second),
+        )
+        sharding._atomic_write_record(
+            ack_root / "acks" / "000002.json",
+            {
+                "schema_version": 1,
+                "epoch_id": formal_second.epoch_id,
+                "run_kind": formal_second.run_kind,
+                "lane": formal_second.lane,
+                "seq": formal_second.seq,
+                "message_sha256": hashlib.sha256(formal_content).hexdigest(),
+                "decision": "continue",
+            },
+        )
+        with self.assertRaises(ValueError):
+            sharding.wait_for_ack(ack_root, formal_second, 0.1)
+
+        for mixed in (
+            formal_second,
+            replace(
+                diagnostic_first,
+                seq=2,
+                run_kind="formal",
+            ),
+        ):
+            with self.subTest(ledger=mixed):
+                ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+                self.assertEqual(
+                    "continue",
+                    ledger.accept_progress(diagnostic_first),
+                )
+                with self.assertRaises(ValueError):
+                    ledger.accept_progress(mixed)
+                self.assertEqual(
+                    "continue",
+                    ledger.accept_progress(
+                        replace(diagnostic_first, seq=2)
+                    ),
+                )
+                self.assertEqual(0, ledger.total_tokens)
+
+    def test_concurrent_different_progress_and_ack_publishers_never_clobber(self):
+        def exercise(*, target, first_call, second_call, first_value, second_value):
+            real_optional = sharding._read_optional_protocol_record
+            real_atomic = sharding._atomic_write_record
+            real_read = sharding._read_canonical_record
+            stale_absence = threading.Barrier(2)
+            first_readback = threading.Event()
+            successes = []
+            failures = []
+
+            def synchronized_optional(path, label, *, byte_cap):
+                if path == target and not path.exists():
+                    stale_absence.wait(2.0)
+                    return None
+                return real_optional(path, label, byte_cap=byte_cap)
+
+            def ordered_atomic(path, payload):
+                if path == target and (
+                    payload.get("type") == second_value
+                    or payload.get("decision") == second_value
+                ):
+                    if not first_readback.wait(2.0):
+                        raise AssertionError("first publisher never read back")
+                return real_atomic(path, payload)
+
+            def signal_first_readback(path, label, *, byte_cap):
+                value = real_read(path, label, byte_cap=byte_cap)
+                if (
+                    path == target
+                    and threading.current_thread().name == "protocol-first"
+                ):
+                    first_readback.set()
+                return value
+
+            def publish(call, value):
+                try:
+                    call()
+                    successes.append(value)
+                except BaseException as error:
+                    failures.append(error)
+
+            with mock.patch.object(
+                sharding,
+                "_read_optional_protocol_record",
+                side_effect=synchronized_optional,
+            ), mock.patch.object(
+                sharding,
+                "_atomic_write_record",
+                side_effect=ordered_atomic,
+            ), mock.patch.object(
+                sharding,
+                "_read_canonical_record",
+                side_effect=signal_first_readback,
+            ):
+                first = threading.Thread(
+                    target=publish,
+                    args=(first_call, first_value),
+                    name="protocol-first",
+                )
+                second = threading.Thread(
+                    target=publish,
+                    args=(second_call, second_value),
+                    name="protocol-second",
+                )
+                first.start()
+                second.start()
+                first.join(3.0)
+                second.join(3.0)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+
+            self.assertEqual(1, len(successes))
+            self.assertEqual(1, len(failures))
+            payload = json.loads(target.read_text(encoding="ascii"))
+            durable_value = payload.get("type", payload.get("decision"))
+            self.assertEqual(successes[0], durable_value)
+            self.assertEqual(
+                [],
+                [
+                    path.name
+                    for path in target.parent.iterdir()
+                    if ".tmp-" in path.name
+                ],
+            )
+
+        progress_run = self.root / "progress-race" / "run"
+        progress_run.mkdir(parents=True, mode=0o700)
+        progress_run.chmod(0o700)
+        progress_worker = self._worker_root(progress_run)
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        stopped = self._lane_message(seq=1, progress_type="worker-stopped")
+        exercise(
+            target=progress_worker / "progress" / "000001.json",
+            first_call=lambda: sharding.write_progress(progress_worker, ready),
+            second_call=lambda: sharding.write_progress(progress_worker, stopped),
+            first_value="lane-ready",
+            second_value="worker-stopped",
+        )
+
+        ack_run = self.root / "ack-race" / "run"
+        ack_run.mkdir(parents=True, mode=0o700)
+        ack_run.chmod(0o700)
+        ack_worker = self._worker_root(ack_run)
+        sharding.write_progress(ack_worker, ready)
+        exercise(
+            target=ack_worker / "acks" / "000001.json",
+            first_call=lambda: sharding.write_ack(
+                ack_worker,
+                ready,
+                "continue",
+            ),
+            second_call=lambda: sharding.write_ack(
+                ack_worker,
+                ready,
+                "abort",
+            ),
+            first_value="continue",
+            second_value="abort",
+        )
+
+    def test_protocol_inventory_caps_crash_temps_and_checks_deadline_while_scanning(self):
+        self.assertEqual(19, sharding.MAX_PROTOCOL_RECORDS)
+        self.assertEqual(19, sharding.MAX_PROTOCOL_CRASH_TEMPS)
+        run_root = self.root / "bounded-inventory" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        progress_root = worker_root / "progress"
+        progress_root.mkdir(mode=0o700)
+        for index in range(sharding.MAX_PROTOCOL_CRASH_TEMPS + 1):
+            path = progress_root / (
+                f".000001.json.tmp-{index + 1}-{index:032x}"
+            )
+            path.write_bytes(b"")
+            path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "crash temporary"):
+            sharding._protocol_sequence_inventory(
+                progress_root,
+                label="progress",
+                deadline=None,
+            )
+        with self.assertRaisesRegex(ValueError, "crash temporary"):
+            sharding.write_progress(
+                worker_root,
+                self._lane_message(seq=1, progress_type="lane-ready"),
+            )
+        self.assertFalse((progress_root / "000001.json").exists())
+
+        for path in progress_root.iterdir():
+            path.unlink()
+        unknown = progress_root / ".000001.json.tmp-1-not-hex"
+        unknown.write_bytes(b"")
+        unknown.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "crash temporary"):
+            sharding._protocol_sequence_inventory(
+                progress_root,
+                label="progress",
+                deadline=None,
+            )
+
+        unknown.unlink()
+        first = progress_root / f".000001.json.tmp-1-{'0' * 32}"
+        first.write_bytes(b"")
+        first.chmod(0o600)
+        with mock.patch.object(
+            sharding.time,
+            "monotonic",
+            side_effect=(0.0, 2.0),
+        ):
+            with self.assertRaises(TimeoutError):
+                sharding._protocol_sequence_inventory(
+                    progress_root,
+                    label="progress",
+                    deadline=1.0,
+                )
 
     def test_acked_usage_is_bounded_idempotent_and_stops_future_launches(self):
         self.assertTrue(

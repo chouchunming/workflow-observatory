@@ -67,6 +67,8 @@ MAX_SHARD_COMMIT_BYTES = 64 * 1024
 MAX_PROGRESS_BYTES = 4096
 MAX_PROGRESS_STRING_CHARS = 256
 MAX_TOKEN_COUNT = 2**63 - 1
+MAX_PROTOCOL_RECORDS = 19
+MAX_PROTOCOL_CRASH_TEMPS = 19
 MAX_SEAL_COUNTER = 1_000_000
 MAX_SEAL_ELAPSED_MILLISECONDS = 3_600_000
 MAX_SEAL_FAILURE_CHARS = 2**63 - 1
@@ -5690,6 +5692,9 @@ _PROGRESS_TYPES = {
     "worker-stopped",
 }
 _ACK_DECISIONS = {"continue", "stop-launches", "abort"}
+_PROTOCOL_IDENTITY_FIELDS = frozenset(
+    {"schema_version", "epoch_id", "run_kind"}
+)
 _PROTOCOL_TEMP_PATTERN = re.compile(
     r"^\.[0-9]{6}\.json\.tmp-[0-9]+-[0-9a-f]{32}$"
 )
@@ -5992,7 +5997,7 @@ def _read_progress_attempt(
     assignment: CaseAssignment,
     manifest_case: dict[str, object],
     paths: CasePaths,
-) -> tuple[dict[str, object], CasePaths]:
+) -> tuple[AttemptSeal, CasePaths]:
     if message.case is None or message.attempt is None:
         raise AssertionError("case-terminal progress lacks a case binding")
     attempt_seal = _find_attempt_for_shard_terminal(
@@ -6014,7 +6019,7 @@ def _read_progress_attempt(
         != message.tombstone_receipt_sha256
     ):
         raise ValueError("case-terminal progress differs from its durable attempt")
-    return terminal, paths
+    return attempt_seal, paths
 
 
 def _read_optional_protocol_record(
@@ -6036,6 +6041,7 @@ def _validate_progress_case_commit(
     assignment: CaseAssignment,
     manifest_case: dict[str, object],
     paths: CasePaths,
+    attempt_seal: AttemptSeal,
 ) -> None:
     record = _read_optional_protocol_record(
         paths.sealed / "case-commit.json",
@@ -6046,19 +6052,92 @@ def _validate_progress_case_commit(
         if record is not None:
             raise ValueError("case-terminal progress omitted a durable case commit")
         try:
-            metadata = paths.sealed.lstat()
+            paths.sealed.lstat()
         except FileNotFoundError:
             return
         except OSError:
             raise ValueError("progress case seal is unavailable") from None
-        _validate_owned_entry(
-            metadata,
+        directory = _open_case_record_directory(
+            paths=paths,
+            components=("sealed",),
+            create=False,
             label="progress case seal",
-            kind="directory",
-            mode=0o700,
         )
-        if _directory_inventory(paths.sealed, "progress case seal"):
-            raise ValueError("uncommitted progress case seal is not empty")
+        with directory:
+            inventory = directory.inventory()
+            if inventory not in (
+                (),
+                ("case-result.json",),
+                ("case-evidence.json",),
+                ("case-evidence.json", "case-result.json"),
+            ):
+                raise ValueError(
+                    "uncommitted progress case seal is partial or contains extras"
+                )
+            result_sha256 = None
+            if "case-result.json" in inventory:
+                result, result_content = _read_canonical_record_retained(
+                    directory,
+                    "case-result.json",
+                    "progress case result",
+                    byte_cap=MAX_CASE_RESULT_BYTES,
+                )
+                _validate_result_record(
+                    result,
+                    assignment=assignment,
+                    manifest_case=manifest_case,
+                )
+                result_sha256 = hashlib.sha256(result_content).hexdigest()
+            if "case-evidence.json" in inventory:
+                evidence, _ = _read_canonical_record_retained(
+                    directory,
+                    "case-evidence.json",
+                    "progress case evidence",
+                    byte_cap=MAX_CASE_EVIDENCE_BYTES,
+                )
+                _require_exact_field_names(
+                    evidence,
+                    _CASE_EVIDENCE_FIELDS,
+                    "progress case evidence",
+                )
+                manifest_case_sha256 = _validate_seal_context(
+                    plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    manifest_case=manifest_case,
+                )
+                verified_receipt = _read_optional_verified_tombstone_receipt(
+                    plan=plan,
+                    assignment=assignment,
+                    paths=paths,
+                )
+                verified_receipt_sha256 = (
+                    verified_receipt.sha256
+                    if verified_receipt is not None
+                    else None
+                )
+                _validate_stored_case_evidence(
+                    evidence,
+                    plan=plan,
+                    assignment=assignment,
+                    manifest_case_sha256=manifest_case_sha256,
+                    attempt_seal=attempt_seal,
+                    result_sha256=result_sha256,
+                    tombstone_receipt_sha256=verified_receipt_sha256,
+                )
+                if (
+                    evidence.get("process_cleanup_passed") is True
+                    and evidence.get("credential_cleanup_passed") is True
+                    and (
+                        result_sha256 is None
+                        or verified_receipt is None
+                    )
+                ):
+                    raise ValueError("clean pre-commit case seal is incomplete")
+            if directory.inventory() != inventory:
+                raise RuntimeError(
+                    "uncommitted progress case seal changed while reading"
+                )
         return
     if record is None:
         raise ValueError("case-terminal progress names a missing case commit")
@@ -6157,7 +6236,7 @@ def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> N
             plan=plan,
             manifests=manifests,
         )
-        terminal, paths = _read_progress_attempt(
+        attempt_seal, paths = _read_progress_attempt(
             message=message,
             plan=plan,
             assignment=assignment,
@@ -6170,10 +6249,11 @@ def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> N
             assignment=assignment,
             manifest_case=manifest_case,
             paths=paths,
+            attempt_seal=attempt_seal,
         )
         _validate_progress_tombstone(
             message=message,
-            terminal=terminal,
+            terminal=attempt_seal.terminal,
             plan=plan,
             assignment=assignment,
             paths=paths,
@@ -6198,31 +6278,182 @@ def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> N
 def _write_protocol_record(
     path: Path, payload: Mapping[str, Any], *, byte_cap: int
 ) -> bytes:
+    _require_lease_process_healthy()
     content = canonical_config_bytes(payload)
     if len(content) > byte_cap:
         raise ValueError(f"{path.name} exceeds its byte cap")
     _ensure_private_record_directory(path.parent)
-    existing = _read_optional_protocol_record(
-        path, path.name, byte_cap=byte_cap
+    parent_descriptor, parent_metadata = _open_private_directory(
+        path.parent,
+        "protocol record directory",
     )
-    if existing is not None:
-        existing_payload, existing_content = existing
-        if existing_payload != payload or existing_content != content:
-            raise ValueError(f"{path.name} already differs")
-        return existing_content
-    _atomic_write_record(path, payload)
+    parent_slot = _DescriptorSlot(parent_descriptor)
+    try:
+        live_parent = path.parent.lstat()
+        _validate_owned_entry(
+            live_parent,
+            label="protocol record directory",
+            kind="directory",
+            mode=0o700,
+        )
+        if (
+            live_parent.st_dev,
+            live_parent.st_ino,
+        ) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            raise RuntimeError("protocol record directory changed before publish")
+    except BaseException as error:
+        _retire_task_descriptors(
+            [parent_slot],
+            primary=error,
+            label="protocol directory validation or close failed",
+        )
+    temporary_name = f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
+    temporary_slot: _DescriptorSlot | None = None
+    temporary_created = False
+    collision = False
+    primary: BaseException | None = None
+    close_errors: list[BaseException] = []
+    cleanup_errors: list[BaseException] = []
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= _required_os_flag("O_NOFOLLOW") | getattr(os, "O_CLOEXEC", 0)
+        temporary_descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=parent_slot.descriptor,
+        )
+        temporary_created = True
+        temporary_slot = _DescriptorSlot(temporary_descriptor)
+        os.fchmod(temporary_slot.descriptor, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(temporary_slot.descriptor, view)
+            if written <= 0:
+                raise OSError("protocol record write made no progress")
+            view = view[written:]
+        os.fsync(temporary_slot.descriptor)
+    except BaseException as error:
+        primary = error
+
+    if temporary_slot is not None:
+        close_error = _retire_descriptor_capability(temporary_slot)
+        if close_error is not None:
+            close_errors.append(close_error)
+    indeterminate = (
+        primary is not None and is_indeterminate_descriptor_close(primary)
+    ) or any(
+        is_indeterminate_descriptor_close(error) for error in close_errors
+    )
+
+    if primary is None and not close_errors and not indeterminate:
+        try:
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_slot.descriptor,
+                dst_dir_fd=parent_slot.descriptor,
+                follow_symlinks=False,
+            )
+            os.fsync(parent_slot.descriptor)
+        except FileExistsError:
+            collision = True
+        except BaseException as error:
+            primary = error
+            indeterminate = is_indeterminate_descriptor_close(error)
+
+    if temporary_created and not indeterminate:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_slot.descriptor)
+            os.fsync(parent_slot.descriptor)
+        except FileNotFoundError as error:
+            cleanup_errors.append(error)
+        except OSError as error:
+            cleanup_errors.append(error)
+
+    parent_close_error = _retire_descriptor_capability(parent_slot)
+    if parent_close_error is not None:
+        close_errors.append(parent_close_error)
+    _raise_ordered_failures(
+        "protocol publication or cleanup failed",
+        primary,
+        [*close_errors, *cleanup_errors],
+    )
     durable, durable_content = _read_canonical_record(
         path, path.name, byte_cap=byte_cap
     )
     if durable != payload or durable_content != content:
+        if collision:
+            raise ValueError(f"{path.name} already differs")
         raise ValueError(f"{path.name} durable readback differs")
     return durable_content
+
+
+def _protocol_identity_payload(
+    message: ProgressMessage,
+) -> dict[str, object]:
+    payload = {
+        "schema_version": 1,
+        "epoch_id": message.epoch_id,
+        "run_kind": message.run_kind,
+    }
+    _require_exact_field_names(
+        payload,
+        _PROTOCOL_IDENTITY_FIELDS,
+        "worker protocol identity",
+    )
+    return payload
+
+
+def _read_worker_protocol_identity(
+    worker_root: Path,
+    message: ProgressMessage,
+) -> None:
+    payload, _ = _read_canonical_record(
+        worker_root / "protocol-identity.json",
+        "worker protocol identity",
+        byte_cap=MAX_PROGRESS_BYTES,
+    )
+    _require_exact_field_names(
+        payload,
+        _PROTOCOL_IDENTITY_FIELDS,
+        "worker protocol identity",
+    )
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("epoch_id") != message.epoch_id
+        or payload.get("run_kind") != message.run_kind
+    ):
+        raise ValueError("worker protocol identity differs")
+
+
+def _seal_worker_protocol_identity(
+    worker_root: Path,
+    message: ProgressMessage,
+) -> None:
+    _write_protocol_record(
+        worker_root / "protocol-identity.json",
+        _protocol_identity_payload(message),
+        byte_cap=MAX_PROGRESS_BYTES,
+    )
+    _read_worker_protocol_identity(worker_root, message)
 
 
 def write_progress(worker_root: Path, message: ProgressMessage) -> Path:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
     _validate_progress_durable(bound_worker, message)
+    _protocol_sequence_inventory(
+        bound_worker / "progress",
+        label="progress",
+        deadline=None,
+        publishing_seq=message.seq,
+    )
+    _seal_worker_protocol_identity(bound_worker, message)
     path = bound_worker / "progress" / f"{message.seq:06d}.json"
     _write_protocol_record(
         path, _encode_progress_message(message), byte_cap=MAX_PROGRESS_BYTES
@@ -6255,6 +6486,7 @@ def read_progress(
     message = _decode_progress_message(payload)
     if message.lane != expected_lane or message.seq != expected_seq:
         raise ValueError("progress record identity differs")
+    _read_worker_protocol_identity(worker_root, message)
     _validate_progress_durable(worker_root, message)
     return message
 
@@ -6270,8 +6502,14 @@ def _validate_wait_timeout(timeout: float) -> float:
 
 
 def _protocol_sequence_inventory(
-    directory: Path, *, label: str
+    directory: Path,
+    *,
+    label: str,
+    deadline: float | None,
+    publishing_seq: int | None = None,
 ) -> tuple[int, ...]:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"timed out while scanning {label} records")
     try:
         metadata = directory.lstat()
     except FileNotFoundError:
@@ -6281,16 +6519,105 @@ def _protocol_sequence_inventory(
     _validate_owned_entry(
         metadata, label=f"{label} directory", kind="directory", mode=0o700
     )
-    sequences = []
-    for name in _directory_inventory(directory, f"{label} directory"):
-        if _PROTOCOL_TEMP_PATTERN.fullmatch(name):
-            continue
-        if not re.fullmatch(r"[0-9]{6}\.json", name):
-            raise ValueError(f"{label} directory contains an unsafe record")
-        sequence = int(name[:6])
-        if sequence < 1:
-            raise ValueError(f"{label} sequence is invalid")
-        sequences.append(sequence)
+    descriptor, opened = _open_private_directory(
+        directory,
+        f"{label} directory",
+    )
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    sequences: list[int] = []
+    crash_temp_count = 0
+    try:
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise RuntimeError(f"{label} directory changed before scanning")
+        _validate_owned_entry(
+            opened,
+            label=f"{label} directory",
+            kind="directory",
+            mode=0o700,
+        )
+        with os.scandir(slot.descriptor) as entries:
+            for entry in entries:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out while scanning {label} records"
+                    )
+                name = entry.name
+                if _PROTOCOL_TEMP_PATTERN.fullmatch(name):
+                    crash_temp_count += 1
+                    crash_temp_cap = MAX_PROTOCOL_CRASH_TEMPS - (
+                        1 if publishing_seq is not None else 0
+                    )
+                    if crash_temp_count > crash_temp_cap:
+                        raise ValueError(
+                            f"{label} crash temporary inventory exceeds its cap"
+                        )
+                    try:
+                        temporary_metadata = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        raise ValueError(
+                            f"{label} crash temporary record is unavailable"
+                        ) from None
+                    _validate_owned_entry(
+                        temporary_metadata,
+                        label=f"{label} crash temporary record",
+                        kind="file",
+                        mode=0o600,
+                    )
+                    continue
+                if name.startswith(".") or ".tmp-" in name:
+                    raise ValueError(
+                        f"{label} directory contains an unknown crash temporary"
+                    )
+                if re.fullmatch(r"[0-9]{6}\.json", name) is None:
+                    raise ValueError(
+                        f"{label} directory contains an unsafe record"
+                    )
+                if len(sequences) >= MAX_PROTOCOL_RECORDS:
+                    raise ValueError(
+                        f"{label} record inventory exceeds its cap"
+                    )
+                sequence = int(name[:6])
+                if sequence < 1:
+                    raise ValueError(f"{label} sequence is invalid")
+                sequences.append(sequence)
+        after = os.fstat(slot.descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"{label} inventory changed while scanning")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out while scanning {label} records")
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [slot],
+        primary=primary,
+        label=f"{label} inventory scan or close failed",
+    )
+    sequences.sort()
+    if (
+        publishing_seq is not None
+        and publishing_seq not in sequences
+        and len(sequences) >= MAX_PROTOCOL_RECORDS
+    ):
+        raise ValueError(f"{label} record inventory exceeds its cap")
     return tuple(sequences)
 
 
@@ -6332,7 +6659,9 @@ def wait_for_progress(
     path = progress_root / f"{expected_seq:06d}.json"
     while True:
         sequences = _protocol_sequence_inventory(
-            progress_root, label="progress"
+            progress_root,
+            label="progress",
+            deadline=deadline,
         )
         _require_protocol_sequence_prefix(
             sequences,
@@ -6340,13 +6669,19 @@ def wait_for_progress(
             label="progress",
         )
         for sequence in range(1, expected_seq):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for durable progress")
             read_progress(
                 progress_root / f"{sequence:06d}.json",
                 expected_lane,
                 sequence,
             )
         if (
-            _protocol_sequence_inventory(progress_root, label="progress")
+            _protocol_sequence_inventory(
+                progress_root,
+                label="progress",
+                deadline=deadline,
+            )
             != sequences
         ):
             raise RuntimeError("progress inventory changed while polling")
@@ -6360,7 +6695,9 @@ def wait_for_progress(
                     raise ValueError("progress wake-up digest differs")
             if (
                 _protocol_sequence_inventory(
-                    progress_root, label="progress"
+                    progress_root,
+                    label="progress",
+                    deadline=deadline,
                 )
                 != sequences
             ):
@@ -6447,6 +6784,7 @@ def write_ack(
 ) -> Path:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
+    _read_worker_protocol_identity(bound_worker, message)
     if type(decision) is not str or decision not in _ACK_DECISIONS:
         raise ValueError("ACK decision is invalid")
     ack = Ack(
@@ -6459,6 +6797,12 @@ def write_ack(
         decision=decision,
     )
     path = bound_worker / "acks" / f"{message.seq:06d}.json"
+    _protocol_sequence_inventory(
+        path.parent,
+        label="ACK",
+        deadline=None,
+        publishing_seq=message.seq,
+    )
     _write_protocol_record(path, _encode_ack(ack), byte_cap=MAX_PROGRESS_BYTES)
     return path
 
@@ -6468,30 +6812,46 @@ def wait_for_ack(
 ) -> Ack:
     _validate_progress_message(message)
     bound_worker, _ = _protocol_worker_context(worker_root, message.lane)
+    _read_worker_protocol_identity(bound_worker, message)
     _durable_progress_hash(bound_worker, message)
     timeout_value = _validate_wait_timeout(timeout)
     deadline = time.monotonic() + timeout_value
     ack_root = bound_worker / "acks"
     while True:
-        sequences = _protocol_sequence_inventory(ack_root, label="ACK")
+        sequences = _protocol_sequence_inventory(
+            ack_root,
+            label="ACK",
+            deadline=deadline,
+        )
         _require_protocol_sequence_prefix(
             sequences,
             expected_seq=message.seq,
             label="ACK",
         )
         for sequence in range(1, message.seq):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for progress ACK")
             prior_progress = read_progress(
                 bound_worker / "progress" / f"{sequence:06d}.json",
                 message.lane,
                 sequence,
             )
             _read_ack_for_progress(bound_worker, prior_progress)
-        if _protocol_sequence_inventory(ack_root, label="ACK") != sequences:
+        if (
+            _protocol_sequence_inventory(
+                ack_root,
+                label="ACK",
+                deadline=deadline,
+            )
+            != sequences
+        ):
             raise RuntimeError("ACK inventory changed while polling")
         if message.seq in sequences:
             ack = _read_ack_for_progress(bound_worker, message)
             if _protocol_sequence_inventory(
-                ack_root, label="ACK"
+                ack_root,
+                label="ACK",
+                deadline=deadline,
             ) != sequences:
                 raise RuntimeError("ACK inventory changed while reading")
             return ack
@@ -6522,6 +6882,8 @@ class ProgressAckLedger:
             lane: None for lane in ("E1", "E2", "E3", "APP")
         }
         self._completed_attempts: set[tuple[CaseKey, int]] = set()
+        self._epoch_id: str | None = None
+        self._run_kind: RunKind | None = None
         self._aborted = False
         self._stop_launches = max_total_tokens == 0
         self._exited: set[LaneName] = set()
@@ -6544,6 +6906,11 @@ class ProgressAckLedger:
 
     def accept_progress(self, message: ProgressMessage) -> AckDecision:
         payload = _encode_progress_message(message)
+        if self._epoch_id is not None and (
+            message.epoch_id != self._epoch_id
+            or message.run_kind != self._run_kind
+        ):
+            raise ValueError("progress differs from the ledger protocol identity")
         message_sha256 = hashlib.sha256(
             canonical_config_bytes(payload)
         ).hexdigest()
@@ -6625,6 +6992,9 @@ class ProgressAckLedger:
 
         self._accepted[key] = (message_sha256, decision)
         self._last_sequence[message.lane] = message.seq
+        if self._epoch_id is None:
+            self._epoch_id = message.epoch_id
+            self._run_kind = message.run_kind
         return decision
 
     def worker_exited(self, lane: LaneName) -> AckDecision:
