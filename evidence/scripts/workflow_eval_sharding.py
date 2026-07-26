@@ -1858,6 +1858,9 @@ class EpochPlan:
     assignments: tuple[CaseAssignment, ...]
 
 
+_PROGRESS_EPOCH_CONTEXTS: dict[str, tuple[EpochPlan, bytes]] = {}
+
+
 @dataclass(frozen=True)
 class ResolvedTransportConfig:
     schema_version: int
@@ -5912,110 +5915,103 @@ def _decode_progress_message(payload: object) -> ProgressMessage:
     return message
 
 
-def _paths_for_progress_case(run_root: Path, case: CaseKey, lane: LaneName) -> CasePaths:
-    route: Route = "app-server" if lane == "APP" else "exec"
-    return paths_for_case(
-        run_root,
-        CaseAssignment(
-            key=case,
-            lane=lane,
-            route=route,
-            manifest_sha256="0" * 64,
-        ),
+def _register_progress_epoch_context(
+    *, plan: EpochPlan, manifests: dict[EvalMode, list[dict[str, object]]]
+) -> None:
+    content = canonical_config_bytes(manifests)
+    existing = _PROGRESS_EPOCH_CONTEXTS.get(plan.epoch_id)
+    context = (plan, content)
+    if existing is not None and existing != context:
+        raise ValueError("epoch progress context differs for the same identity")
+    _PROGRESS_EPOCH_CONTEXTS[plan.epoch_id] = context
+
+
+def _resolve_progress_epoch_context(
+    message: ProgressMessage,
+) -> tuple[EpochPlan, dict[EvalMode, list[dict[str, object]]]]:
+    context = _PROGRESS_EPOCH_CONTEXTS.get(message.epoch_id)
+    if context is None:
+        raise ValueError("progress epoch context is unavailable")
+    plan, content = context
+    if (
+        plan.epoch_id != message.epoch_id
+        or plan.run_kind != message.run_kind
+    ):
+        raise ValueError("progress differs from its epoch plan")
+    decoded = json.loads(content)
+    if (
+        type(decoded) is not dict
+        or set(decoded) != {"forward", "lifecycle"}
+        or any(
+            type(decoded.get(mode)) is not list
+            for mode in ("forward", "lifecycle")
+        )
+    ):
+        raise AssertionError("registered progress manifests are invalid")
+    return plan, decoded
+
+
+def _resolve_progress_case_context(
+    *,
+    run_root: Path,
+    message: ProgressMessage,
+    plan: EpochPlan,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+) -> tuple[CaseAssignment, dict[str, object], CasePaths]:
+    if message.case is None:
+        raise AssertionError("case progress lacks its frozen case")
+    matches = tuple(
+        assignment
+        for assignment in plan.assignments
+        if assignment.key == message.case
     )
+    if len(matches) != 1:
+        raise ValueError("progress case is absent from the epoch plan")
+    assignment = matches[0]
+    if assignment.lane != message.lane:
+        raise ValueError("progress case lane differs from the epoch plan")
+    rows = manifests[assignment.key.mode]
+    index = assignment.key.ordinal - 1
+    if index < 0 or index >= len(rows) or type(rows[index]) is not dict:
+        raise ValueError("progress manifest case is unavailable")
+    manifest_case = rows[index]
+    paths = paths_for_case(run_root, assignment)
+    _validate_seal_context(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
+    return assignment, manifest_case, paths
 
 
 def _read_progress_attempt(
-    *, run_root: Path, message: ProgressMessage
+    *,
+    message: ProgressMessage,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
+    paths: CasePaths,
 ) -> tuple[dict[str, object], CasePaths]:
     if message.case is None or message.attempt is None:
         raise AssertionError("case-terminal progress lacks a case binding")
-    paths = _paths_for_progress_case(run_root, message.case, message.lane)
-    attempt_paths = paths_for_attempt(paths, message.attempt)
-    start, start_content = _read_canonical_record(
-        attempt_paths.start,
-        "progress attempt start",
-        byte_cap=MAX_ATTEMPT_START_BYTES,
+    attempt_seal = read_attempt_seal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        attempt=message.attempt,
+        manifest_case=manifest_case,
     )
-    terminal, terminal_content = _read_canonical_record(
-        attempt_paths.terminal,
-        "progress attempt terminal",
-        byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
-    )
-    _require_exact_field_names(
-        start, _ATTEMPT_START_FIELDS, "progress attempt start"
-    )
-    _require_exact_field_names(
-        terminal, _ATTEMPT_TERMINAL_FIELDS, "progress attempt terminal"
-    )
-    expected_route = "app-server" if message.lane == "APP" else "exec"
-    for payload, label in (
-        (start, "progress attempt start"),
-        (terminal, "progress attempt terminal"),
-    ):
-        if (
-            type(payload.get("schema_version")) is not int
-            or payload.get("schema_version") != 1
-            or payload.get("epoch_id") != message.epoch_id
-            or payload.get("run_kind") != message.run_kind
-            or _decode_case_key(payload.get("case"), label) != message.case
-            or payload.get("lane") != message.lane
-            or payload.get("route") != expected_route
-            or type(payload.get("attempt")) is not int
-            or payload.get("attempt") != message.attempt
-            or not _is_sha256(payload.get("manifest_sha256"))
-            or not _is_sha256(payload.get("manifest_case_sha256"))
-        ):
-            raise ValueError(f"{label} differs from progress")
-    for field_name in _ATTEMPT_START_FIELDS:
-        if terminal.get(field_name) != start.get(field_name):
-            raise ValueError("progress attempt terminal binding differs from start")
-    start_sha256 = hashlib.sha256(start_content).hexdigest()
-    if terminal.get("start_sha256") != start_sha256:
-        raise ValueError("progress attempt terminal start hash differs")
-    status = terminal.get("status")
-    classification = terminal.get("classification")
+    terminal = attempt_seal.terminal
     if (
-        type(status) is not str
-        or status not in ("success", "failed")
-        or type(classification) is not str
-        or classification not in _OUTCOME_CLASSES
-        or type(terminal.get("model_started")) is not bool
-        or type(terminal.get("cleanup_passed")) is not bool
-    ):
-        raise ValueError("progress attempt terminal outcome is invalid")
-    usage = _validate_usage(terminal.get("usage"), nullable=status == "failed")
-    failure = _validate_failure(
-        terminal.get("failure"),
-        classification=classification,
-        nullable=status == "success",
-    )
-    tombstone_sha256 = terminal.get("tombstone_receipt_sha256")
-    if tombstone_sha256 is not None and not _is_sha256(tombstone_sha256):
-        raise ValueError("progress attempt tombstone hash is invalid")
-    if status == "success":
-        if (
-            classification != "success"
-            or terminal.get("model_started") is not True
-            or terminal.get("cleanup_passed") is not True
-            or usage is None
-            or failure is not None
-            or tombstone_sha256 is None
-        ):
-            raise ValueError("successful progress attempt terminal is invalid")
-    elif classification == "success" or failure is None:
-        raise ValueError("failed progress attempt terminal is invalid")
-    if terminal.get("cleanup_passed") is True and tombstone_sha256 is None:
-        raise ValueError("clean progress attempt omitted its tombstone")
-    if (
-        hashlib.sha256(terminal_content).hexdigest()
-        != message.attempt_terminal_sha256
-        or status != message.status
-        or classification != message.classification
+        attempt_seal.terminal_sha256 != message.attempt_terminal_sha256
+        or terminal.get("status") != message.status
+        or terminal.get("classification") != message.classification
         or terminal.get("model_started") != message.model_started
-        or usage
+        or terminal.get("usage")
         != (asdict(message.usage) if message.usage is not None else None)
-        or tombstone_sha256 != message.tombstone_receipt_sha256
+        or terminal.get("tombstone_receipt_sha256")
+        != message.tombstone_receipt_sha256
     ):
         raise ValueError("case-terminal progress differs from its durable attempt")
     return terminal, paths
@@ -6036,7 +6032,9 @@ def _read_optional_protocol_record(
 def _validate_progress_case_commit(
     *,
     message: ProgressMessage,
-    terminal: dict[str, object],
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
     paths: CasePaths,
 ) -> None:
     record = _read_optional_protocol_record(
@@ -6047,331 +6045,154 @@ def _validate_progress_case_commit(
     if message.case_commit_sha256 is None:
         if record is not None:
             raise ValueError("case-terminal progress omitted a durable case commit")
+        try:
+            metadata = paths.sealed.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise ValueError("progress case seal is unavailable") from None
+        _validate_owned_entry(
+            metadata,
+            label="progress case seal",
+            kind="directory",
+            mode=0o700,
+        )
+        if _directory_inventory(paths.sealed, "progress case seal"):
+            raise ValueError("uncommitted progress case seal is not empty")
         return
     if record is None:
         raise ValueError("case-terminal progress names a missing case commit")
-    commit, content = record
-    _require_exact_field_names(commit, _CASE_COMMIT_FIELDS, "progress case commit")
+    case_seal = read_case_seal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
+    commit = case_seal.commit
     if (
-        hashlib.sha256(content).hexdigest() != message.case_commit_sha256
-        or type(commit.get("schema_version")) is not int
-        or commit.get("schema_version") != 1
-        or commit.get("epoch_id") != message.epoch_id
-        or commit.get("run_kind") != message.run_kind
-        or _decode_case_key(commit.get("case"), "progress case commit")
-        != message.case
-        or commit.get("lane") != message.lane
-        or commit.get("route") != terminal.get("route")
+        case_seal.commit_sha256 != message.case_commit_sha256
         or commit.get("attempt") != message.attempt
-        or commit.get("manifest_sha256") != terminal.get("manifest_sha256")
-        or commit.get("manifest_case_sha256")
-        != terminal.get("manifest_case_sha256")
         or commit.get("attempt_terminal_sha256")
         != message.attempt_terminal_sha256
-        or commit.get("attempt_start_sha256") != terminal.get("start_sha256")
         or commit.get("status") != message.status
-        or commit.get("tombstone_receipt_sha256")
+        or case_seal.tombstone_receipt_sha256
         != message.tombstone_receipt_sha256
-        or commit.get("evidence_file") != "case-evidence.json"
-        or not _is_sha256(commit.get("evidence_sha256"))
     ):
         raise ValueError("case-terminal progress case commit binding differs")
-    result_file = commit.get("result_file")
-    result_sha256 = commit.get("result_sha256")
-    if not (
-        (result_file is None and result_sha256 is None)
-        or (result_file == "case-result.json" and _is_sha256(result_sha256))
-    ):
-        raise ValueError("progress case commit result binding is invalid")
-    evidence, evidence_content = _read_canonical_record(
-        paths.sealed / "case-evidence.json",
-        "progress case evidence",
-        byte_cap=MAX_CASE_EVIDENCE_BYTES,
-    )
-    _require_exact_field_names(
-        evidence, _CASE_EVIDENCE_FIELDS, "progress case evidence"
-    )
-    expected_route = terminal.get("route")
-    if (
-        hashlib.sha256(evidence_content).hexdigest()
-        != commit.get("evidence_sha256")
-        or type(evidence.get("schema_version")) is not int
-        or evidence.get("schema_version") != 1
-        or evidence.get("epoch_id") != message.epoch_id
-        or evidence.get("run_kind") != message.run_kind
-        or _decode_case_key(evidence.get("case"), "progress case evidence")
-        != message.case
-        or evidence.get("lane") != message.lane
-        or evidence.get("route") != expected_route
-        or evidence.get("attempt") != message.attempt
-        or evidence.get("manifest_sha256") != terminal.get("manifest_sha256")
-        or evidence.get("manifest_case_sha256")
-        != terminal.get("manifest_case_sha256")
-        or any(
-            not _is_sha256(evidence.get(field_name))
-            for field_name in (
-                "archive_sha256",
-                "marketplace_sha256",
-                "evaluator_sha256",
-                "transport_config_sha256",
-            )
-        )
-        or evidence.get("attempt_start_sha256") != terminal.get("start_sha256")
-        or evidence.get("attempt_terminal_sha256")
-        != message.attempt_terminal_sha256
-        or evidence.get("result_sha256") != result_sha256
-        or evidence.get("tombstone_receipt_sha256")
-        != message.tombstone_receipt_sha256
-    ):
-        raise ValueError("case-terminal progress evidence binding differs")
-    evidence_input = {
-        field_name: evidence[field_name]
-        for field_name in _EVIDENCE_INPUT_FIELDS
-    }
-    _validate_evidence_input(
-        evidence_input,
-        attempt_seal=AttemptSeal(
-            start={},
-            terminal=terminal,
-            start_sha256=terminal["start_sha256"],
-            terminal_sha256=message.attempt_terminal_sha256,
-        ),
-        result_sha256=result_sha256,
-    )
-    expected_inventory = {
-        "case-commit.json",
-        "case-evidence.json",
-    }
-    if result_file == "case-result.json":
-        _, result_content = _read_canonical_record(
-            paths.sealed / "case-result.json",
-            "progress case result",
-            byte_cap=MAX_CASE_RESULT_BYTES,
-        )
-        if hashlib.sha256(result_content).hexdigest() != result_sha256:
-            raise ValueError("case-terminal progress result binding differs")
-        expected_inventory.add("case-result.json")
-    inventory = set(_directory_inventory(paths.sealed, "progress case seal"))
-    if inventory != expected_inventory:
-        raise ValueError("progress case seal inventory is invalid")
 
 
 def _validate_progress_tombstone(
     *,
     message: ProgressMessage,
     terminal: dict[str, object],
+    plan: EpochPlan,
+    assignment: CaseAssignment,
     paths: CasePaths,
 ) -> None:
-    tombstone_path = paths.cleanup / "tombstone.json"
-    tombstone_record = _read_optional_protocol_record(
-        tombstone_path,
-        "progress tombstone",
-        byte_cap=MAX_PROGRESS_BYTES,
+    verified = _read_optional_verified_tombstone_receipt(
+        plan=plan,
+        assignment=assignment,
+        paths=paths,
     )
     if message.tombstone_receipt_sha256 is None:
         if terminal.get("cleanup_passed") is True:
             raise ValueError("clean case-terminal progress omitted its receipt")
-        if tombstone_record is not None:
+        if verified is not None:
             raise ValueError("case-terminal progress omitted a durable receipt")
         return
-    if tombstone_record is None:
+    if verified is None:
         raise ValueError("case-terminal progress names a missing receipt")
-    ownership, ownership_content = _read_canonical_record(
-        paths.cleanup / "ownership.json",
-        "progress cleanup ownership",
-        byte_cap=MAX_PROGRESS_BYTES,
-    )
-    _require_exact_fields(
-        ownership, CaseAuthOwnership, "progress cleanup ownership"
-    )
-    ownership_case = _decode_case_key(
-        ownership.get("case"), "progress cleanup ownership"
-    )
-    numeric = (
-        ownership.get("schema_version"),
-        ownership.get("case_root_device"),
-        ownership.get("case_root_inode"),
-        ownership.get("codex_home_device"),
-        ownership.get("codex_home_inode"),
-    )
     if (
-        any(type(value) is not int or value < 0 for value in numeric)
-        or ownership.get("schema_version") != 1
-        or ownership.get("epoch_id") != message.epoch_id
-        or ownership.get("run_kind") != message.run_kind
-        or ownership_case != message.case
-    ):
-        raise ValueError("progress cleanup ownership binding differs")
-    payload, content = tombstone_record
-    receipt = _tombstone_receipt_from_payload(payload)
-    if (
-        hashlib.sha256(content).hexdigest()
-        != message.tombstone_receipt_sha256
-        or receipt.epoch_id != message.epoch_id
-        or receipt.run_kind != message.run_kind
-        or receipt.case != message.case
-        or receipt.ownership_sha256
-        != hashlib.sha256(ownership_content).hexdigest()
-        or receipt.case_root_device != ownership.get("case_root_device")
-        or receipt.case_root_inode != ownership.get("case_root_inode")
-        or receipt.codex_home_device != ownership.get("codex_home_device")
-        or receipt.codex_home_inode != ownership.get("codex_home_inode")
+        verified.sha256 != message.tombstone_receipt_sha256
+        or verified.receipt.case != message.case
     ):
         raise ValueError("case-terminal progress tombstone binding differs")
-    if message.status == "success" and receipt.canonical_binding != "expected":
+    if (
+        message.status == "success"
+        and verified.receipt.canonical_binding != "expected"
+    ):
         raise ValueError("successful progress requires an expected tombstone")
 
 
 def _validate_progress_shard(
-    *, worker_root: Path, message: ProgressMessage
+    *,
+    worker_root: Path,
+    message: ProgressMessage,
+    plan: EpochPlan,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    run_root: Path,
 ) -> None:
     if message.shard_commit_sha256 is None:
         raise AssertionError("shard-terminal progress lacks its digest")
-    payload, content = _read_canonical_record(
-        worker_root / "sealed" / "shard-commit.json",
-        "progress shard commit",
-        byte_cap=MAX_SHARD_COMMIT_BYTES,
+    assignments = tuple(
+        assignment
+        for assignment in plan.assignments
+        if assignment.lane == message.lane
     )
-    _require_exact_field_names(payload, _SHARD_COMMIT_FIELDS, "progress shard commit")
+    case_paths = {
+        assignment.key: paths_for_case(run_root, assignment)
+        for assignment in assignments
+    }
+    shard = read_shard_seal(
+        worker_root=worker_root,
+        plan=plan,
+        lane=message.lane,
+        manifests=manifests,
+        case_paths=case_paths,
+    )
     if (
-        hashlib.sha256(content).hexdigest() != message.shard_commit_sha256
-        or type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 1
-        or payload.get("epoch_id") != message.epoch_id
-        or payload.get("run_kind") != message.run_kind
-        or payload.get("lane") != message.lane
-        or payload.get("status") != message.status
-        or type(payload.get("terminals")) is not list
+        shard.commit_sha256 != message.shard_commit_sha256
+        or shard.status != message.status
     ):
         raise ValueError("shard-terminal progress differs from its durable commit")
-    lane_cases = dict(FROZEN_LANE_CASES)[message.lane]
-    decoded_terminals = tuple(
-        _decode_shard_terminal(item, run_kind=message.run_kind)
-        for item in payload["terminals"]
-    )
-    if not decoded_terminals or len(decoded_terminals) > len(lane_cases):
-        raise ValueError("progress shard terminal sequence length is invalid")
-    for index, terminal in enumerate(decoded_terminals):
-        if terminal.key != lane_cases[index]:
-            raise ValueError("progress shard terminal order differs")
-        paths = _paths_for_progress_case(
-            worker_root.parent
-            if message.lane == "APP"
-            else worker_root.parent.parent,
-            terminal.key,
-            message.lane,
-        )
-        try:
-            attempts_metadata = paths.attempts.lstat()
-        except OSError:
-            raise ValueError("progress shard attempt root is unavailable") from None
-        _validate_owned_entry(
-            attempts_metadata,
-            label="progress shard attempt root",
-            kind="directory",
-            mode=0o700,
-        )
-        inventory = _directory_inventory(
-            paths.attempts, "progress shard attempt root"
-        )
-        if inventory not in (("01",), ("01", "02")):
-            raise ValueError("progress shard attempt inventory is invalid")
-        matching_attempts = []
-        for name in inventory:
-            attempt_record = _read_optional_protocol_record(
-                paths.attempts / name / "terminal.json",
-                "progress shard attempt terminal",
-                byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
-            )
-            if attempt_record is not None and hashlib.sha256(
-                attempt_record[1]
-            ).hexdigest() == terminal.attempt_terminal_sha256:
-                matching_attempts.append(int(name))
-        if len(matching_attempts) != 1:
-            raise ValueError(
-                "progress shard terminal must identify one durable attempt"
-            )
-        attempt_number = matching_attempts[0]
-        attempt_payload, _ = _read_canonical_record(
-            paths.attempts / f"{attempt_number:02d}" / "terminal.json",
-            "progress shard attempt terminal",
-            byte_cap=MAX_ATTEMPT_TERMINAL_BYTES,
-        )
-        usage_payload = _validate_usage(
-            attempt_payload.get("usage"),
-            nullable=terminal.status == "failed",
-        )
-        case_message = ProgressMessage(
-            schema_version=1,
-            epoch_id=message.epoch_id,
-            run_kind=message.run_kind,
-            lane=message.lane,
-            seq=message.seq,
-            type="case-terminal",
-            case=terminal.key,
-            attempt=attempt_number,
-            status=terminal.status,
-            classification=terminal.classification,
-            model_started=attempt_payload.get("model_started"),
-            usage=(
-                TokenUsage(**usage_payload)
-                if usage_payload is not None
-                else None
-            ),
-            attempt_terminal_sha256=terminal.attempt_terminal_sha256,
-            case_commit_sha256=terminal.case_commit_sha256,
-            shard_commit_sha256=None,
-            tombstone_receipt_sha256=terminal.tombstone_receipt_sha256,
-        )
-        _validate_progress_message(case_message)
-        durable_attempt, durable_paths = _read_progress_attempt(
-            run_root=paths.root.parent.parent,
-            message=case_message,
-        )
-        expected_failure = (
-            asdict(terminal.failure) if terminal.failure is not None else None
-        )
-        if durable_attempt.get("failure") != expected_failure:
-            raise ValueError("progress shard failure differs from its attempt")
-        _validate_progress_case_commit(
-            message=case_message,
-            terminal=durable_attempt,
-            paths=durable_paths,
-        )
-        _validate_progress_tombstone(
-            message=case_message,
-            terminal=durable_attempt,
-            paths=durable_paths,
-        )
-    if payload["status"] == "success":
-        if len(decoded_terminals) != len(lane_cases) or any(
-            terminal.status != "success" for terminal in decoded_terminals
-        ):
-            raise ValueError("successful progress shard is incomplete")
-    elif (
-        decoded_terminals[-1].status != "failed"
-        or any(
-            terminal.status != "success"
-            for terminal in decoded_terminals[:-1]
-        )
-    ):
-        raise ValueError("failed progress shard terminal prefix is invalid")
 
 
 def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> None:
     _, run_root = _protocol_worker_context(worker_root, message.lane)
+    plan, manifests = _resolve_progress_epoch_context(message)
     if message.type == "case-terminal":
+        assignment, manifest_case, paths = _resolve_progress_case_context(
+            run_root=run_root,
+            message=message,
+            plan=plan,
+            manifests=manifests,
+        )
         terminal, paths = _read_progress_attempt(
-            run_root=run_root, message=message
+            message=message,
+            plan=plan,
+            assignment=assignment,
+            manifest_case=manifest_case,
+            paths=paths,
         )
         _validate_progress_case_commit(
-            message=message, terminal=terminal, paths=paths
+            message=message,
+            plan=plan,
+            assignment=assignment,
+            manifest_case=manifest_case,
+            paths=paths,
         )
         _validate_progress_tombstone(
-            message=message, terminal=terminal, paths=paths
+            message=message,
+            terminal=terminal,
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+        )
+    elif message.type == "case-started":
+        _resolve_progress_case_context(
+            run_root=run_root,
+            message=message,
+            plan=plan,
+            manifests=manifests,
         )
     elif message.type == "shard-terminal":
-        _validate_progress_shard(worker_root=worker_root, message=message)
+        _validate_progress_shard(
+            worker_root=worker_root,
+            message=message,
+            plan=plan,
+            manifests=manifests,
+            run_root=run_root,
+        )
 
 
 def _write_protocol_record(
@@ -6637,7 +6458,7 @@ class ProgressAckLedger:
             lane: 0 for lane in ("E1", "E2", "E3", "APP")
         }
         self._accepted: dict[tuple[LaneName, int], tuple[str, AckDecision]] = {}
-        self._active_cases: dict[LaneName, CaseKey | None] = {
+        self._active_cases: dict[LaneName, tuple[CaseKey, int] | None] = {
             lane: None for lane in ("E1", "E2", "E3", "APP")
         }
         self._aborted = False
@@ -6681,12 +6502,11 @@ class ProgressAckLedger:
         active = self._active_cases[message.lane]
         if message.type == "case-started" and active is not None:
             raise ValueError("worker started a case before its prior terminal")
-        if (
-            message.type == "case-terminal"
-            and active is not None
-            and active != message.case
-        ):
-            raise ValueError("case terminal differs from the active case")
+        if message.type == "case-terminal":
+            if active is None:
+                raise ValueError("case terminal lacks launch authority")
+            if active != (message.case, message.attempt):
+                raise ValueError("case terminal differs from the active attempt")
 
         new_total = self._total_tokens
         reaches_ceiling = self._stop_launches
@@ -6720,7 +6540,12 @@ class ProgressAckLedger:
         self._total_tokens = new_total
         self._stop_launches = reaches_ceiling
         if message.type == "case-started" and decision == "continue":
-            self._active_cases[message.lane] = message.case
+            if message.case is None or message.attempt is None:
+                raise AssertionError("case-started progress lacks its identity")
+            self._active_cases[message.lane] = (
+                message.case,
+                message.attempt,
+            )
         elif message.type == "case-terminal":
             self._active_cases[message.lane] = None
         elif message.type == "worker-stopped":
@@ -6829,10 +6654,12 @@ def build_epoch_plan(
     }
     epoch_id = hashlib.sha256(canonical_config_bytes(identity)).hexdigest()
     bound_fingerprints = replace(fingerprints, epoch_id=epoch_id)
-    return EpochPlan(
+    plan = EpochPlan(
         schema_version=fingerprints.schema_version,
         epoch_id=epoch_id,
         run_kind=run_kind,
         fingerprints=bound_fingerprints,
         assignments=tuple(assignments),
     )
+    _register_progress_epoch_context(plan=plan, manifests=manifests)
+    return plan
