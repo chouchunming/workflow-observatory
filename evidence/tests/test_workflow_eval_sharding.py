@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import get_args, get_type_hints
 import unittest
 from unittest import mock
@@ -6968,6 +6969,1041 @@ finally:
                     completed.returncode,
                     f"{role}: stdout={completed.stdout!r} stderr={completed.stderr!r}",
                 )
+
+
+class ProgressProtocolTests(unittest.TestCase):
+    setUp = SealTests.setUp
+    tearDown = SealTests.tearDown
+    _write_expected_tombstone = SealTests._write_expected_tombstone
+    _write_attempt_one_success = SealTests._write_attempt_one_success
+    _new_seal_scenario = SealTests._new_seal_scenario
+    _write_scenario_attempt = SealTests._write_scenario_attempt
+    _manifest_for_assignment = SealTests._manifest_for_assignment
+    _prepare_lane_terminal = SealTests._prepare_lane_terminal
+    _result_for_assignment = SealTests._result_for_assignment
+
+    def _worker_root(self, run_root=None, lane="E1"):
+        run_root = self.run_root if run_root is None else run_root
+        parent = run_root / ("app-server" if lane == "APP" else "workers")
+        parent.mkdir(mode=0o700, exist_ok=True)
+        worker_root = parent if lane == "APP" else parent / lane
+        worker_root.mkdir(mode=0o700, exist_ok=True)
+        return worker_root
+
+    def _success_terminal_message(self, *, seq=1):
+        sharding.seal_case(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            result={**self.result},
+            evidence={**self.evidence},
+            manifest_case=self.manifest_case,
+        )
+        attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        case = sharding.read_case_seal(
+            plan=self.plan,
+            paths=self.paths,
+            assignment=self.assignment,
+            manifest_case=self.manifest_case,
+        )
+        return sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane=self.assignment.lane,
+            seq=seq,
+            type="case-terminal",
+            case=self.assignment.key,
+            attempt=1,
+            status="success",
+            classification="success",
+            model_started=True,
+            usage=sharding.TokenUsage(**self.usage),
+            attempt_terminal_sha256=attempt.terminal_sha256,
+            case_commit_sha256=case.commit_sha256,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=self.tombstone_sha256,
+        )
+
+    def test_lost_wakeup_recovers_and_ack_blocks_next_launch(self):
+        self.assertTrue(
+            all(
+                hasattr(sharding, name)
+                for name in (
+                    "ProgressMessage",
+                    "TokenUsage",
+                    "wait_for_progress",
+                    "write_ack",
+                )
+            ),
+            "durable progress/ACK protocol is absent",
+        )
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        self.assertTrue(
+            hasattr(worker, "publish_progress_and_wait_for_ack"),
+            "worker ACK launch barrier is absent",
+        )
+        worker_root = self._worker_root()
+        message = self._success_terminal_message()
+        wakeups = []
+        next_case_started = threading.Event()
+        failures = []
+
+        def publish_terminal_then_launch():
+            try:
+                ack = worker.publish_progress_and_wait_for_ack(
+                    worker_root=worker_root,
+                    message=message,
+                    timeout=2.0,
+                    wakeup_sink=wakeups.append,
+                )
+                if ack.decision == "continue":
+                    next_case_started.set()
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=publish_terminal_then_launch)
+        thread.start()
+        observed = sharding.wait_for_progress(
+            worker_root=worker_root,
+            expected_lane="E1",
+            expected_seq=1,
+            timeout=2.0,
+        )
+        self.assertEqual(message, observed)
+        self.assertEqual(1, len(wakeups))
+        self.assertEqual(
+            {"lane", "seq", "sha256"},
+            set(wakeups[0]),
+        )
+        self.assertFalse(
+            next_case_started.wait(0.05),
+            "worker launched the next case before terminal ACK",
+        )
+
+        sharding.write_ack(worker_root, observed, "continue")
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], failures)
+        self.assertTrue(next_case_started.is_set())
+
+    def test_progress_types_have_exact_seal_hash_truth(self):
+        self.assertTrue(
+            all(
+                hasattr(sharding, name)
+                for name in (
+                    "ProgressMessage",
+                    "TokenUsage",
+                    "PROGRESS_FIELDS",
+                    "write_progress",
+                    "read_progress",
+                )
+            ),
+            "exact progress schema is absent",
+        )
+        run_root = self.root / "progress-types" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        worker_root = self._worker_root(run_root)
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == "E1"
+        )
+        terminals = []
+        case_paths = {}
+        for assignment in assignments:
+            paths, terminal = self._prepare_lane_terminal(
+                run_root, assignment
+            )
+            terminals.append(terminal)
+            case_paths[assignment.key] = paths
+        sharding.seal_shard(
+            worker_root=worker_root,
+            plan=self.plan,
+            lane="E1",
+            terminals=terminals,
+            manifests=self.manifests,
+            case_paths=case_paths,
+        )
+        shard = sharding.read_shard_seal(
+            worker_root=worker_root,
+            plan=self.plan,
+            lane="E1",
+            manifests=self.manifests,
+            case_paths=case_paths,
+        )
+        first = terminals[0]
+        first_attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=case_paths[first.key],
+            assignment=assignments[0],
+            attempt=1,
+            manifest_case=self._manifest_for_assignment(assignments[0]),
+        )
+        usage = sharding.TokenUsage(**self.usage)
+        common = {
+            "schema_version": 1,
+            "epoch_id": self.plan.epoch_id,
+            "run_kind": self.plan.run_kind,
+            "lane": "E1",
+        }
+        messages = (
+            sharding.ProgressMessage(
+                **common,
+                seq=1,
+                type="lane-ready",
+                case=None,
+                attempt=None,
+                status=None,
+                classification=None,
+                model_started=None,
+                usage=None,
+                attempt_terminal_sha256=None,
+                case_commit_sha256=None,
+                shard_commit_sha256=None,
+                tombstone_receipt_sha256=None,
+            ),
+            sharding.ProgressMessage(
+                **common,
+                seq=2,
+                type="case-started",
+                case=first.key,
+                attempt=1,
+                status=None,
+                classification=None,
+                model_started=None,
+                usage=None,
+                attempt_terminal_sha256=None,
+                case_commit_sha256=None,
+                shard_commit_sha256=None,
+                tombstone_receipt_sha256=None,
+            ),
+            sharding.ProgressMessage(
+                **common,
+                seq=3,
+                type="case-terminal",
+                case=first.key,
+                attempt=1,
+                status="success",
+                classification="success",
+                model_started=True,
+                usage=usage,
+                attempt_terminal_sha256=first_attempt.terminal_sha256,
+                case_commit_sha256=first.case_commit_sha256,
+                shard_commit_sha256=None,
+                tombstone_receipt_sha256=first.tombstone_receipt_sha256,
+            ),
+            sharding.ProgressMessage(
+                **common,
+                seq=4,
+                type="shard-terminal",
+                case=None,
+                attempt=None,
+                status="success",
+                classification=None,
+                model_started=None,
+                usage=None,
+                attempt_terminal_sha256=None,
+                case_commit_sha256=None,
+                shard_commit_sha256=shard.commit_sha256,
+                tombstone_receipt_sha256=None,
+            ),
+            sharding.ProgressMessage(
+                **common,
+                seq=5,
+                type="worker-stopped",
+                case=None,
+                attempt=None,
+                status=None,
+                classification=None,
+                model_started=None,
+                usage=None,
+                attempt_terminal_sha256=None,
+                case_commit_sha256=None,
+                shard_commit_sha256=None,
+                tombstone_receipt_sha256=None,
+            ),
+        )
+        expected_fields = {
+            "schema_version",
+            "epoch_id",
+            "run_kind",
+            "lane",
+            "seq",
+            "type",
+            "case",
+            "attempt",
+            "status",
+            "classification",
+            "model_started",
+            "usage",
+            "attempt_terminal_sha256",
+            "case_commit_sha256",
+            "shard_commit_sha256",
+            "tombstone_receipt_sha256",
+        }
+        self.assertEqual(expected_fields, sharding.PROGRESS_FIELDS)
+        self.assertEqual(
+            (
+                "lane-ready",
+                "case-started",
+                "case-terminal",
+                "shard-terminal",
+                "worker-stopped",
+            ),
+            get_args(sharding.ProgressType),
+        )
+        self.assertEqual(
+            ("continue", "stop-launches", "abort"),
+            get_args(sharding.AckDecision),
+        )
+        self.assertEqual(4096, sharding.MAX_PROGRESS_BYTES)
+        self.assertEqual(256, sharding.MAX_PROGRESS_STRING_CHARS)
+        self.assertEqual(2**63 - 1, sharding.MAX_TOKEN_COUNT)
+        self.assertEqual(
+            [
+                "schema_version",
+                "epoch_id",
+                "run_kind",
+                "lane",
+                "seq",
+                "type",
+                "case",
+                "attempt",
+                "status",
+                "classification",
+                "model_started",
+                "usage",
+                "attempt_terminal_sha256",
+                "case_commit_sha256",
+                "shard_commit_sha256",
+                "tombstone_receipt_sha256",
+            ],
+            [field.name for field in fields(sharding.ProgressMessage)],
+        )
+        self.assertEqual(
+            expected_fields,
+            {field.name for field in fields(sharding.ProgressMessage)},
+        )
+
+        for message in messages:
+            with self.subTest(progress_type=message.type):
+                path = sharding.write_progress(worker_root, message)
+                payload = json.loads(path.read_text(encoding="ascii"))
+                self.assertEqual(expected_fields, set(payload))
+                self.assertNotIn("prompt", path.read_text(encoding="ascii"))
+                self.assertEqual(
+                    message,
+                    sharding.read_progress(path, "E1", message.seq),
+                )
+                for field_name in (
+                    "attempt_terminal_sha256",
+                    "case_commit_sha256",
+                    "shard_commit_sha256",
+                    "tombstone_receipt_sha256",
+                ):
+                    expected = getattr(message, field_name)
+                    self.assertEqual(expected, payload[field_name])
+
+    def _lane_message(self, *, seq, progress_type, lane="E1"):
+        return sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane=lane,
+            seq=seq,
+            type=progress_type,
+            case=None,
+            attempt=None,
+            status=None,
+            classification=None,
+            model_started=None,
+            usage=None,
+            attempt_terminal_sha256=None,
+            case_commit_sha256=None,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=None,
+        )
+
+    def _failed_terminal_scenario(
+        self,
+        name,
+        *,
+        cleanup_passed,
+        canonical_binding,
+    ):
+        paths, receipt_sha256 = self._new_seal_scenario(
+            name, canonical_binding=canonical_binding
+        )
+        failure_text = f"{name} failed"
+        failure = {
+            "classification": "semantic",
+            "type": "SemanticFailure",
+            "chars": len(failure_text),
+            "sha256": hashlib.sha256(failure_text.encode()).hexdigest(),
+        }
+        self._write_scenario_attempt(
+            paths,
+            status="failed",
+            classification="semantic",
+            cleanup_passed=cleanup_passed,
+            failure=failure,
+        )
+        attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        run_root = paths.root.parent.parent
+        worker_root = self._worker_root(run_root)
+        message = sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane="E1",
+            seq=1,
+            type="case-terminal",
+            case=self.assignment.key,
+            attempt=1,
+            status="failed",
+            classification="semantic",
+            model_started=True,
+            usage=sharding.TokenUsage(**self.usage),
+            attempt_terminal_sha256=attempt.terminal_sha256,
+            case_commit_sha256=None,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=receipt_sha256,
+        )
+        return worker_root, message
+
+    def test_case_terminal_truth_table_drives_exact_ack_decisions(self):
+        self.assertTrue(
+            hasattr(sharding, "ProgressAckLedger"),
+            "stateful progress decisions are absent",
+        )
+        success_root = self._worker_root()
+        success = self._success_terminal_message()
+        evaluated_root, evaluated = self._failed_terminal_scenario(
+            "evaluated-failure",
+            cleanup_passed=True,
+            canonical_binding="expected",
+        )
+        no_receipt_root, no_receipt = self._failed_terminal_scenario(
+            "cleanup-failure-no-receipt",
+            cleanup_passed=False,
+            canonical_binding=None,
+        )
+        receipt_root, with_receipt = self._failed_terminal_scenario(
+            "cleanup-failure-with-receipt",
+            cleanup_passed=False,
+            canonical_binding="expected",
+        )
+        replaced_root, replaced = self._failed_terminal_scenario(
+            "cleanup-failure-replaced-receipt",
+            cleanup_passed=False,
+            canonical_binding="replaced",
+        )
+        missing_root, missing = self._failed_terminal_scenario(
+            "cleanup-failure-missing-receipt",
+            cleanup_passed=False,
+            canonical_binding="missing",
+        )
+        committed_run_root = self.root / "committed-failure" / "run"
+        committed_run_root.mkdir(parents=True, mode=0o700)
+        committed_run_root.chmod(0o700)
+        (committed_run_root / "cases").mkdir(mode=0o700)
+        committed_paths, committed_terminal = self._prepare_lane_terminal(
+            committed_run_root,
+            self.assignment,
+            status="failed",
+            cleanup_passed=True,
+            canonical_binding="expected",
+            seal_case_record=True,
+        )
+        committed_attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=committed_paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        committed = sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane="E1",
+            seq=1,
+            type="case-terminal",
+            case=self.assignment.key,
+            attempt=1,
+            status="failed",
+            classification="semantic",
+            model_started=True,
+            usage=sharding.TokenUsage(**self.usage),
+            attempt_terminal_sha256=committed_attempt.terminal_sha256,
+            case_commit_sha256=committed_terminal.case_commit_sha256,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=(
+                committed_terminal.tombstone_receipt_sha256
+            ),
+        )
+        committed_root = self._worker_root(committed_run_root)
+        scenarios = (
+            (success_root, success, "continue"),
+            (evaluated_root, evaluated, "abort"),
+            (committed_root, committed, "abort"),
+            (no_receipt_root, no_receipt, "abort"),
+            (receipt_root, with_receipt, "abort"),
+            (replaced_root, replaced, "abort"),
+            (missing_root, missing, "abort"),
+        )
+        for worker_root, message, expected in scenarios:
+            with self.subTest(condition=worker_root.parent.parent.name):
+                path = sharding.write_progress(worker_root, message)
+                observed = sharding.read_progress(path, "E1", 1)
+                ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+                self.assertEqual(expected, ledger.accept_progress(observed))
+
+        invalid = (
+            (evaluated_root, replace(evaluated, tombstone_receipt_sha256=None)),
+            (receipt_root, replace(with_receipt, tombstone_receipt_sha256=None)),
+            (
+                no_receipt_root,
+                replace(no_receipt, tombstone_receipt_sha256="f" * 64),
+            ),
+            (
+                success_root,
+                replace(success, case_commit_sha256=None),
+            ),
+            (
+                success_root,
+                replace(success, tombstone_receipt_sha256=None),
+            ),
+        )
+        for worker_root, message in invalid:
+            with self.subTest(invalid=message):
+                with self.assertRaises((TypeError, ValueError)):
+                    sharding.write_progress(worker_root, message)
+
+    def test_acked_usage_is_bounded_idempotent_and_stops_future_launches(self):
+        self.assertTrue(
+            hasattr(sharding, "ProgressAckLedger"),
+            "cumulative launch-ceiling accounting is absent",
+        )
+        first = self._success_terminal_message()
+        second_key = dict(sharding.FROZEN_LANE_CASES)["E1"][1]
+        second = replace(
+            first,
+            seq=2,
+            case=second_key,
+            usage=sharding.TokenUsage(
+                input_tokens=4,
+                cached_input_tokens=1,
+                output_tokens=2,
+                reasoning_output_tokens=1,
+                total_tokens=6,
+            ),
+        )
+        ledger = sharding.ProgressAckLedger(max_total_tokens=20)
+        self.assertEqual("continue", ledger.accept_progress(first))
+        self.assertEqual(15, ledger.total_tokens)
+        self.assertEqual("continue", ledger.accept_progress(first))
+        self.assertEqual(15, ledger.total_tokens)
+        with self.assertRaises(ValueError):
+            ledger.accept_progress(
+                replace(
+                    first,
+                    usage=sharding.TokenUsage(11, 2, 5, 1, 16),
+                )
+            )
+        self.assertEqual("stop-launches", ledger.accept_progress(second))
+        self.assertEqual(21, ledger.total_tokens)
+
+        e2_started = sharding.ProgressMessage(
+            **{
+                **asdict(self._lane_message(
+                    seq=1, progress_type="case-started", lane="E2"
+                )),
+                "case": dict(sharding.FROZEN_LANE_CASES)["E2"][0],
+                "attempt": 1,
+            }
+        )
+        self.assertEqual("stop-launches", ledger.accept_progress(e2_started))
+        self.assertEqual(21, ledger.total_tokens)
+        self.assertFalse(hasattr(ledger, "monetary_cost"))
+
+        for usage in (
+            sharding.TokenUsage(-1, 0, 1, 0, 0),
+            sharding.TokenUsage(sharding.MAX_TOKEN_COUNT + 1, 0, 0, 0, 0),
+            sharding.TokenUsage(1, 2, 1, 0, 2),
+            sharding.TokenUsage(1, 0, 1, 0, 3),
+        ):
+            with self.subTest(usage=usage):
+                with self.assertRaises((TypeError, ValueError)):
+                    sharding.ProgressAckLedger(
+                        max_total_tokens=None
+                    ).accept_progress(replace(first, usage=usage))
+        with self.assertRaises(ValueError):
+            sharding.ProgressAckLedger(max_total_tokens=-1)
+        large_ledger = sharding.ProgressAckLedger(
+            max_total_tokens=sharding.MAX_TOKEN_COUNT + 1
+        )
+        large_usage = sharding.TokenUsage(
+            sharding.MAX_TOKEN_COUNT,
+            0,
+            0,
+            0,
+            sharding.MAX_TOKEN_COUNT,
+        )
+        self.assertEqual(
+            "continue",
+            large_ledger.accept_progress(replace(first, usage=large_usage)),
+        )
+        self.assertEqual(
+            "stop-launches",
+            large_ledger.accept_progress(
+                replace(
+                    first,
+                    seq=2,
+                    case=second_key,
+                    usage=large_usage,
+                )
+            ),
+        )
+        self.assertEqual(
+            2 * sharding.MAX_TOKEN_COUNT,
+            large_ledger.total_tokens,
+        )
+
+    def test_duplicate_gap_reorder_truncation_oversize_and_prompt_are_rejected(self):
+        worker_root = self._worker_root()
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        path = sharding.write_progress(worker_root, ready)
+        original = path.read_bytes()
+        self.assertEqual(path, sharding.write_progress(worker_root, ready))
+        self.assertEqual(original, path.read_bytes())
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                worker_root,
+                self._lane_message(seq=1, progress_type="worker-stopped"),
+            )
+
+        ack_path = sharding.write_ack(worker_root, ready, "continue")
+        ack_bytes = ack_path.read_bytes()
+        ack_payload = json.loads(ack_bytes.decode("ascii"))
+        self.assertEqual(sharding.ACK_FIELDS, set(ack_payload))
+        self.assertEqual(
+            sharding.ACK_FIELDS,
+            {field.name for field in fields(sharding.Ack)},
+        )
+        self.assertEqual(
+            hashlib.sha256(original).hexdigest(),
+            ack_payload["message_sha256"],
+        )
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(ack_path.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(path.parent.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(ack_path.parent.stat().st_mode))
+        self.assertLessEqual(len(original), sharding.MAX_PROGRESS_BYTES)
+        self.assertLessEqual(len(ack_bytes), sharding.MAX_PROGRESS_BYTES)
+        self.assertEqual(
+            ack_path, sharding.write_ack(worker_root, ready, "continue")
+        )
+        self.assertEqual(ack_bytes, ack_path.read_bytes())
+        self.assertEqual(
+            "continue",
+            sharding.wait_for_ack(worker_root, ready, 0.1).decision,
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_ack(worker_root, ready, "abort")
+
+        def protocol_root(name):
+            run_root = self.root / name / "run"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            return self._worker_root(run_root)
+
+        truncated_root = protocol_root("truncated")
+        truncated = truncated_root / "progress"
+        truncated.mkdir(mode=0o700)
+        truncated_path = truncated / "000001.json"
+        truncated_path.write_bytes(b'{"schema_version":1')
+        truncated_path.chmod(0o600)
+        with self.assertRaises(ValueError):
+            sharding.read_progress(truncated_path, "E1", 1)
+
+        oversized_root = protocol_root("oversized")
+        oversized = oversized_root / "progress"
+        oversized.mkdir(mode=0o700)
+        oversized_path = oversized / "000001.json"
+        oversized_path.write_bytes(b"x" * (sharding.MAX_PROGRESS_BYTES + 1))
+        oversized_path.chmod(0o600)
+        with self.assertRaises(ValueError):
+            sharding.read_progress(oversized_path, "E1", 1)
+
+        prompt_root = protocol_root("prompt")
+        prompt_message = self._lane_message(seq=1, progress_type="lane-ready")
+        prompt_path = sharding.write_progress(prompt_root, prompt_message)
+        prompt_payload = json.loads(prompt_path.read_text(encoding="ascii"))
+        prompt_payload["prompt"] = "secret model prompt"
+        sharding._atomic_write_record(prompt_path, prompt_payload)
+        with self.assertRaises(ValueError):
+            sharding.read_progress(prompt_path, "E1", 1)
+
+        unsafe_root = protocol_root("unsafe-string")
+        unsafe_message = self._lane_message(seq=1, progress_type="lane-ready")
+        unsafe_payload = asdict(unsafe_message)
+        unsafe_payload.update(
+            {
+                "type": "case-started",
+                "case": {
+                    "mode": "forward",
+                    "ordinal": 1,
+                    "case_id": "p" * (sharding.MAX_PROGRESS_STRING_CHARS + 1),
+                },
+                "attempt": 1,
+            }
+        )
+        unsafe_progress_root = unsafe_root / "progress"
+        unsafe_progress_root.mkdir(mode=0o700)
+        unsafe_path = unsafe_progress_root / "000001.json"
+        sharding._atomic_write_record(unsafe_path, unsafe_payload)
+        with self.assertRaises(ValueError):
+            sharding.read_progress(unsafe_path, "E1", 1)
+
+        forged_ack_root = protocol_root("forged-ack")
+        forged_ready = self._lane_message(seq=1, progress_type="lane-ready")
+        sharding.write_progress(forged_ack_root, forged_ready)
+        forged_ack_dir = forged_ack_root / "acks"
+        forged_ack_dir.mkdir(mode=0o700)
+        forged_ack_path = forged_ack_dir / "000001.json"
+        forged_ack_payload = {
+            "schema_version": 1,
+            "epoch_id": self.plan.epoch_id,
+            "run_kind": self.plan.run_kind,
+            "lane": "E1",
+            "seq": 1,
+            "message_sha256": "f" * 64,
+            "decision": "continue",
+        }
+        sharding._atomic_write_record(forged_ack_path, forged_ack_payload)
+        with self.assertRaises(ValueError):
+            sharding.wait_for_ack(forged_ack_root, forged_ready, 0.1)
+
+        gap_root = protocol_root("gap")
+        sharding.write_progress(
+            gap_root,
+            self._lane_message(seq=2, progress_type="lane-ready"),
+        )
+        with self.assertRaises(ValueError):
+            sharding.wait_for_progress(
+                worker_root=gap_root,
+                expected_lane="E1",
+                expected_seq=1,
+                timeout=0.1,
+            )
+        with self.assertRaises(ValueError):
+            sharding.read_progress(
+                gap_root / "progress" / "000002.json",
+                "E1",
+                1,
+            )
+
+    def test_forged_and_cross_case_seal_hashes_are_rejected(self):
+        worker_root = self._worker_root()
+        first = self._success_terminal_message()
+        second_assignment = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == "E1"
+        )[1]
+        second_paths, second_terminal = self._prepare_lane_terminal(
+            self.run_root, second_assignment
+        )
+        second_attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=second_paths,
+            assignment=second_assignment,
+            attempt=1,
+            manifest_case=self._manifest_for_assignment(second_assignment),
+        )
+        cross_case = (
+            replace(
+                first,
+                attempt_terminal_sha256=second_attempt.terminal_sha256,
+            ),
+            replace(
+                first,
+                case_commit_sha256=second_terminal.case_commit_sha256,
+            ),
+            replace(
+                first,
+                tombstone_receipt_sha256=(
+                    second_terminal.tombstone_receipt_sha256
+                ),
+            ),
+        )
+        forged = tuple(
+            replace(first, **{field_name: "f" * 64})
+            for field_name in (
+                "attempt_terminal_sha256",
+                "case_commit_sha256",
+                "tombstone_receipt_sha256",
+            )
+        )
+        for message in (*cross_case, *forged):
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError):
+                    sharding.write_progress(worker_root, message)
+        sharding.write_progress(worker_root, first)
+
+        run_root = self.root / "forged-shard" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        shard_root = self._worker_root(run_root)
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == "E1"
+        )
+        terminals = []
+        case_paths = {}
+        for assignment in assignments:
+            paths, terminal = self._prepare_lane_terminal(
+                run_root, assignment
+            )
+            terminals.append(terminal)
+            case_paths[assignment.key] = paths
+        sharding.seal_shard(
+            worker_root=shard_root,
+            plan=self.plan,
+            lane="E1",
+            terminals=terminals,
+            manifests=self.manifests,
+            case_paths=case_paths,
+        )
+        shard = sharding.read_shard_seal(
+            worker_root=shard_root,
+            plan=self.plan,
+            lane="E1",
+            manifests=self.manifests,
+            case_paths=case_paths,
+        )
+        shard_message = sharding.ProgressMessage(
+            **{
+                **asdict(self._lane_message(
+                    seq=1, progress_type="shard-terminal"
+                )),
+                "status": "success",
+                "shard_commit_sha256": shard.commit_sha256,
+            }
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                shard_root,
+                replace(shard_message, shard_commit_sha256="f" * 64),
+            )
+        cross_run_root = self.root / "cross-shard" / "run"
+        cross_run_root.mkdir(parents=True, mode=0o700)
+        cross_run_root.chmod(0o700)
+        (cross_run_root / "cases").mkdir(mode=0o700)
+        cross_shard_root = self._worker_root(cross_run_root, lane="E3")
+        cross_assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == "E3"
+        )
+        cross_terminals = []
+        cross_paths = {}
+        for assignment in cross_assignments:
+            paths, terminal = self._prepare_lane_terminal(
+                cross_run_root, assignment
+            )
+            cross_terminals.append(terminal)
+            cross_paths[assignment.key] = paths
+        sharding.seal_shard(
+            worker_root=cross_shard_root,
+            plan=self.plan,
+            lane="E3",
+            terminals=cross_terminals,
+            manifests=self.manifests,
+            case_paths=cross_paths,
+        )
+        cross_shard = sharding.read_shard_seal(
+            worker_root=cross_shard_root,
+            plan=self.plan,
+            lane="E3",
+            manifests=self.manifests,
+            case_paths=cross_paths,
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                shard_root,
+                replace(
+                    shard_message,
+                    shard_commit_sha256=cross_shard.commit_sha256,
+                ),
+            )
+        sharding.write_progress(shard_root, shard_message)
+
+    def test_forged_durable_case_and_shard_commits_are_rejected(self):
+        worker_root = self._worker_root()
+        message = self._success_terminal_message()
+        case_commit_path = self.paths.sealed / "case-commit.json"
+        case_commit = json.loads(case_commit_path.read_text(encoding="ascii"))
+        case_commit["attempt_start_sha256"] = "f" * 64
+        forged_case_content = sharding._atomic_write_record(
+            case_commit_path, case_commit
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                worker_root,
+                replace(
+                    message,
+                    case_commit_sha256=hashlib.sha256(
+                        forged_case_content
+                    ).hexdigest(),
+                ),
+            )
+        case_commit["attempt_start_sha256"] = json.loads(
+            self.paths.attempts.joinpath("01", "terminal.json").read_text(
+                encoding="ascii"
+            )
+        )["start_sha256"]
+        case_commit["evidence_sha256"] = "f" * 64
+        forged_evidence_binding = sharding._atomic_write_record(
+            case_commit_path, case_commit
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_progress(
+                worker_root,
+                replace(
+                    message,
+                    case_commit_sha256=hashlib.sha256(
+                        forged_evidence_binding
+                    ).hexdigest(),
+                ),
+            )
+
+        run_root = self.root / "forged-durable-shard" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        shard_root = self._worker_root(run_root)
+        assignments = tuple(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.lane == "E1"
+        )
+        terminals = []
+        case_paths = {}
+        for assignment in assignments:
+            paths, terminal = self._prepare_lane_terminal(
+                run_root, assignment
+            )
+            terminals.append(terminal)
+            case_paths[assignment.key] = paths
+        shard_path = sharding.seal_shard(
+            worker_root=shard_root,
+            plan=self.plan,
+            lane="E1",
+            terminals=terminals,
+            manifests=self.manifests,
+            case_paths=case_paths,
+        )
+        shard_payload = json.loads(shard_path.read_text(encoding="ascii"))
+        shard_payload["terminals"][0]["attempt_terminal_sha256"] = "f" * 64
+        forged_shard_content = sharding._atomic_write_record(
+            shard_path, shard_payload
+        )
+        shard_message = sharding.ProgressMessage(
+            **{
+                **asdict(self._lane_message(
+                    seq=1, progress_type="shard-terminal"
+                )),
+                "status": "success",
+                "shard_commit_sha256": hashlib.sha256(
+                    forged_shard_content
+                ).hexdigest(),
+            }
+        )
+        with self.assertRaises(ValueError):
+            sharding.write_progress(shard_root, shard_message)
+
+    def test_case_started_ack_barrier_and_worker_exit_before_terminal_abort(self):
+        self.assertTrue(
+            hasattr(sharding, "ProgressAckLedger"),
+            "worker-exit protocol decision is absent",
+        )
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        worker_root = self._worker_root()
+        started = sharding.ProgressMessage(
+            **{
+                **asdict(self._lane_message(
+                    seq=1, progress_type="case-started"
+                )),
+                "case": self.assignment.key,
+                "attempt": 1,
+            }
+        )
+        model_started = threading.Event()
+        failures = []
+
+        def await_launch_permission():
+            try:
+                ack = worker.publish_progress_and_wait_for_ack(
+                    worker_root=worker_root,
+                    message=started,
+                    timeout=2.0,
+                    wakeup_sink=lambda _wakeup: None,
+                )
+                if ack.decision == "continue":
+                    model_started.set()
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=await_launch_permission)
+        thread.start()
+        observed = sharding.wait_for_progress(
+            worker_root=worker_root,
+            expected_lane="E1",
+            expected_seq=1,
+            timeout=2.0,
+        )
+        self.assertFalse(model_started.wait(0.05))
+        sharding.write_ack(worker_root, observed, "abort")
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], failures)
+        self.assertFalse(model_started.is_set())
+
+        ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        self.assertEqual("continue", ledger.accept_progress(started))
+        self.assertEqual("abort", ledger.worker_exited("E1"))
+        self.assertEqual(0, ledger.total_tokens)
+
+    def test_transport_and_progress_share_one_token_usage_type(self):
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        self.assertIs(
+            sharding.TokenUsage,
+            task9_eval.TokenUsage,
+            "transport and progress must use one bounded TokenUsage type",
+        )
 
 
 if __name__ == "__main__":

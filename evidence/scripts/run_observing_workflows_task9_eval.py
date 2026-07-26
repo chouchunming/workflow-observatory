@@ -55,6 +55,7 @@ from scripts.workflow_eval_sharding import (
     ResolvedTransportConfig,
     ResultWriterAuthority,
     ResultWriterLease,
+    TokenUsage,
     install_legacy_case_auth as install_case_auth,
     prepare_legacy_auth_bootstrap as prepare_auth_bootstrap,
     resolve_transport_config,
@@ -212,15 +213,6 @@ class CaseModelFailure(CaseTransportFailure):
 
 class DiscoverySweepAbort(RuntimeError):
     """A discovery sweep encountered a suite-integrity failure and must stop."""
-
-
-@dataclass(frozen=True)
-class TokenUsage:
-    input_tokens: int
-    cached_input_tokens: int
-    output_tokens: int
-    reasoning_output_tokens: int
-    total_tokens: int
 
 
 ZERO_TOKEN_USAGE = TokenUsage(0, 0, 0, 0, 0)

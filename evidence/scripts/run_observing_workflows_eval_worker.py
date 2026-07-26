@@ -27,11 +27,14 @@ from scripts.run_observing_workflows_task9_eval import (
     inventory_external_skill_paths,
 )
 from scripts.workflow_eval_sharding import (
+    Ack,
     CaseAssignment,
     CaseAuthOwnership,
     CasePaths,
     EpochPlan,
     InstalledCaseAuth,
+    MAX_PROGRESS_BYTES,
+    ProgressMessage,
     ResolvedTransportConfig,
     TombstoneReceipt,
     _DescriptorSlot,
@@ -48,6 +51,8 @@ from scripts.workflow_eval_sharding import (
     read_case_auth_ownership as _read_case_auth_ownership,
     read_tombstone_receipt,
     stage_marketplace_for_case,
+    wait_for_ack,
+    write_progress,
 )
 
 
@@ -110,6 +115,42 @@ def worker_exit_required(
     if not isinstance(error, BaseException):
         raise TypeError("error must be a BaseException")
     return factory.poisoned or is_indeterminate_descriptor_close(error)
+
+
+def publish_progress_and_wait_for_ack(
+    *,
+    worker_root: Path,
+    message: ProgressMessage,
+    timeout: float,
+    wakeup_sink: Callable[[dict[str, object]], None] | None = None,
+) -> Ack:
+    """Publish durable progress, emit a content-free wake-up, then block on ACK."""
+
+    if wakeup_sink is not None and not callable(wakeup_sink):
+        raise TypeError("wakeup_sink must be callable or None")
+    path = write_progress(worker_root, message)
+    _, content = _read_canonical_record(
+        path, "worker progress", byte_cap=MAX_PROGRESS_BYTES
+    )
+    wakeup = {
+        "lane": message.lane,
+        "seq": message.seq,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    if wakeup_sink is None:
+        sys.stdout.write(
+            json.dumps(
+                wakeup,
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+    else:
+        wakeup_sink(wakeup)
+    return wait_for_ack(worker_root, message, timeout)
 
 
 def _load_captured_evaluator(snapshot_root: Path) -> ModuleType:
