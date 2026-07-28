@@ -11022,6 +11022,124 @@ sharding.wait_for_ack(worker_root, message, 0.05)
         self.assertEqual(1, len(waiter_results))
         self.assertEqual("continue", waiter_results[0].decision)
 
+    def test_valid_progress_publication_window_is_serialized_from_waiter(self):
+        run_root = self.root / "serialized-valid-progress-publication" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        progress_directory = worker_root / "progress"
+        progress_directory.mkdir(mode=0o700)
+        pending = progress_directory / ".000001.json.pending"
+        final = progress_directory / "000001.json"
+
+        real_write_record = sharding._write_protocol_record_retained
+        real_lock_shared = sharding._lock_protocol_worker_shared
+        writer_in_publication_window = threading.Event()
+        waiter_attempted_shared_lock = threading.Event()
+        release_writer = threading.Event()
+        waiter_finished = threading.Event()
+        writer_results = []
+        writer_errors = []
+        waiter_results = []
+        waiter_errors = []
+
+        def pause_writer_with_pending_marker(
+            directory,
+            name,
+            payload,
+            *,
+            byte_cap,
+        ):
+            if (
+                directory.path == progress_directory
+                and threading.current_thread().name == "progress-writer"
+            ):
+                self.assertTrue(pending.is_file())
+                self.assertFalse(final.exists())
+                writer_in_publication_window.set()
+                if not release_writer.wait(2.0):
+                    raise AssertionError(
+                        "progress writer gate was not released"
+                    )
+            return real_write_record(
+                directory,
+                name,
+                payload,
+                byte_cap=byte_cap,
+            )
+
+        def signal_waiter_shared_lock_attempt(worker, *, deadline):
+            if threading.current_thread().name == "progress-waiter":
+                waiter_attempted_shared_lock.set()
+            return real_lock_shared(worker, deadline=deadline)
+
+        def invoke_writer():
+            try:
+                writer_results.append(
+                    sharding.write_progress(worker_root, ready)
+                )
+            except BaseException as error:
+                writer_errors.append(error)
+
+        def invoke_waiter():
+            try:
+                waiter_results.append(
+                    sharding.wait_for_progress(
+                        worker_root=worker_root,
+                        expected_lane="E1",
+                        expected_seq=1,
+                        timeout=1.0,
+                    )
+                )
+            except BaseException as error:
+                waiter_errors.append(error)
+            finally:
+                waiter_finished.set()
+
+        with mock.patch.object(
+            sharding,
+            "_write_protocol_record_retained",
+            side_effect=pause_writer_with_pending_marker,
+        ), mock.patch.object(
+            sharding,
+            "_lock_protocol_worker_shared",
+            side_effect=signal_waiter_shared_lock_attempt,
+        ):
+            writer = threading.Thread(
+                target=invoke_writer,
+                name="progress-writer",
+            )
+            waiter = threading.Thread(
+                target=invoke_waiter,
+                name="progress-waiter",
+            )
+            writer.start()
+            try:
+                self.assertTrue(writer_in_publication_window.wait(2.0))
+                waiter.start()
+                self.assertTrue(
+                    waiter_attempted_shared_lock.wait(2.0),
+                    "progress waiter never attempted the shared worker lock",
+                )
+                self.assertFalse(
+                    waiter_finished.is_set(),
+                    "progress waiter exposed a cooperating publisher's "
+                    "pending window",
+                )
+            finally:
+                release_writer.set()
+                if waiter.ident is not None:
+                    waiter.join(2.0)
+                writer.join(2.0)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual([], writer_errors)
+        self.assertEqual([final], writer_results)
+        self.assertEqual([], waiter_errors)
+        self.assertEqual([ready], waiter_results)
+
     def test_ack_prefix_validation_does_not_reenter_shared_worker_lock(self):
         run_root = self.root / "single-depth-ack-prefix" / "run"
         run_root.mkdir(parents=True, mode=0o700)
@@ -13468,7 +13586,7 @@ class CoordinatorStateTests(unittest.TestCase):
             if lease.active:
                 lease.close()
 
-    def test_retained_proof_transaction_never_deletes_replacement(self):
+    def test_retained_proof_retirement_never_deletes_replacement(self):
         proof_names = (
             "teardown.json",
             "stop-launches.json",
@@ -13488,6 +13606,14 @@ class CoordinatorStateTests(unittest.TestCase):
                     parent, f"{name} test parent"
                 )
                 parent_slot = sharding._DescriptorSlot(descriptor)
+                archive = self.root / f"retained-proof-archive-{index}"
+                archive.mkdir(mode=0o700)
+                archive_descriptor, _metadata = (
+                    sharding._open_private_directory(
+                        archive, f"{name} test archive"
+                    )
+                )
+                archive_slot = sharding._DescriptorSlot(archive_descriptor)
                 try:
                     proof = sharding._retain_verified_unlink_proof(
                         parent_slot=parent_slot,
@@ -13496,50 +13622,101 @@ class CoordinatorStateTests(unittest.TestCase):
                         label=f"{name} test proof",
                         byte_cap=4096,
                     )
-                    real_rename = sharding.os.rename
+                    real_rename = sharding._rename_exclusive_at
                     injected = False
 
                     def replace_before_rename(
-                        source,
-                        destination,
                         *,
-                        src_dir_fd=None,
-                        dst_dir_fd=None,
+                        source_slot,
+                        source_name,
+                        destination_slot,
+                        destination_name,
                     ):
                         nonlocal injected
-                        if not injected and source == name:
+                        if not injected and source_name == name:
                             injected = True
                             path.unlink()
                             path.write_bytes(replacement)
                             path.chmod(0o600)
                         return real_rename(
-                            source,
-                            destination,
-                            src_dir_fd=src_dir_fd,
-                            dst_dir_fd=dst_dir_fd,
+                            source_slot=source_slot,
+                            source_name=source_name,
+                            destination_slot=destination_slot,
+                            destination_name=destination_name,
                         )
 
                     with mock.patch.object(
-                        sharding.os,
-                        "rename",
+                        sharding,
+                        "_rename_exclusive_at",
                         side_effect=replace_before_rename,
                     ):
                         with self.assertRaisesRegex(
-                            ValueError, "changed before unlink"
+                            ValueError, "changed before retirement"
                         ):
-                            sharding._unlink_retained_proofs((proof,))
+                            sharding._retire_retained_proofs(
+                                (proof,),
+                                archive_slot=archive_slot,
+                            )
                     self.assertEqual(replacement, path.read_bytes())
                     self.assertEqual((name,), tuple(
                         entry.name for entry in parent.iterdir()
                     ))
+                    self.assertEqual((), tuple(archive.iterdir()))
                 finally:
                     sharding._retire_task_descriptors(
-                        [parent_slot],
+                        [archive_slot, parent_slot],
                         primary=None,
                         label="retained proof parent close failed",
                     )
 
-    def test_rearm_unlinks_only_retained_verified_proofs(self):
+    def test_retained_proof_retirement_has_no_final_unlink_window(self):
+        parent = self.root / "retained-proof-no-final-unlink"
+        archive = self.root / "retained-proof-no-final-unlink-archive"
+        parent.mkdir(mode=0o700)
+        archive.mkdir(mode=0o700)
+        path = parent / "teardown.json"
+        original = b'{"proof":"original"}'
+        path.write_bytes(original)
+        path.chmod(0o600)
+        parent_descriptor, _metadata = sharding._open_private_directory(
+            parent, "retained proof test parent"
+        )
+        archive_descriptor, _metadata = sharding._open_private_directory(
+            archive, "retained proof test archive"
+        )
+        parent_slot = sharding._DescriptorSlot(parent_descriptor)
+        archive_slot = sharding._DescriptorSlot(archive_descriptor)
+        try:
+            proof = sharding._retain_verified_unlink_proof(
+                parent_slot=parent_slot,
+                name=path.name,
+                expected_content=original,
+                label="retained proof",
+                byte_cap=4096,
+            )
+            with mock.patch.object(
+                sharding.os,
+                "unlink",
+                side_effect=AssertionError(
+                    "retirement must not have a final unlink race"
+                ),
+            ):
+                sharding._retire_retained_proofs(
+                    (proof,),
+                    archive_slot=archive_slot,
+                )
+            self.assertFalse(path.exists())
+            archived = tuple(archive.iterdir())
+            self.assertEqual(1, len(archived))
+            self.assertEqual(original, archived[0].read_bytes())
+        finally:
+            sharding._retire_task_descriptors(
+                [archive_slot, parent_slot],
+                primary=None,
+                label="retained proof test descriptors close failed",
+            )
+
+    def test_rearm_retires_only_retained_verified_proofs(self):
         from scripts import run_observing_workflows_eval_worker as worker
 
         (
@@ -13621,6 +13798,17 @@ class CoordinatorStateTests(unittest.TestCase):
             self.assertFalse(
                 (self.run_root / "coordinator/stop-launches.json").exists()
             )
+            retired = tuple(
+                (
+                    self.run_root / "coordinator/retired-proofs" / entry
+                ).read_bytes()
+                for entry in sorted(
+                    os.listdir(
+                        self.run_root / "coordinator/retired-proofs"
+                    )
+                )
+            )
+            self.assertEqual(4, len(retired))
             self.assertEqual(
                 ("bootstrap-ownership.json",),
                 tuple(sorted(

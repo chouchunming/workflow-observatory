@@ -1,5 +1,6 @@
 from dataclasses import asdict, dataclass, fields, replace
 from contextlib import ExitStack, contextmanager
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -104,6 +105,7 @@ MAX_PROTOCOL_PENDING_MARKERS = 19
 MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
 PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 0.2
 PROTOCOL_WORKER_LOCK_POLL_SECONDS = 0.01
+MAX_RETIRED_PROOF_RECORDS = 128
 MAX_SEAL_COUNTER = 1_000_000
 MAX_SEAL_ELAPSED_MILLISECONDS = 3_600_000
 MAX_SEAL_FAILURE_CHARS = 2**63 - 1
@@ -257,6 +259,64 @@ class _RetainedUnlinkProof:
     content: bytes
 
 
+def _rename_exclusive_at(
+    *,
+    source_slot: _DescriptorSlot,
+    source_name: str,
+    destination_slot: _DescriptorSlot,
+    destination_name: str,
+) -> None:
+    if (
+        type(source_slot) is not _DescriptorSlot
+        or type(destination_slot) is not _DescriptorSlot
+        or any(
+            type(name) is not str
+            or not name
+            or "/" in name
+            or name in {".", ".."}
+            for name in (source_name, destination_name)
+        )
+    ):
+        raise TypeError("exclusive rename arguments are invalid")
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = getattr(library, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        rename = getattr(library, "renameat2", None)
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:
+        rename = None
+        flags = 0
+    if rename is None:
+        raise RuntimeError(
+            "retained proof retirement requires no-clobber rename support"
+        )
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(
+        source_slot.descriptor,
+        os.fsencode(source_name),
+        destination_slot.descriptor,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+
+
 def _read_retained_unlink_content(
     proof: "_RetainedUnlinkProof",
     *,
@@ -294,7 +354,7 @@ def _read_retained_unlink_content(
         )
         or bytes(content) != proof.content
     ):
-        raise ValueError(f"{proof.label} changed before unlink")
+        raise ValueError(f"{proof.label} changed before retirement")
     return bytes(content)
 
 
@@ -397,17 +457,77 @@ def _retain_verified_unlink_proof(
     return proof
 
 
-def _unlink_retained_proofs(
+def _validate_retired_proof_archive(
+    archive_slot: _DescriptorSlot,
+    *,
+    additional_records: int,
+) -> tuple[str, ...]:
+    if (
+        type(archive_slot) is not _DescriptorSlot
+        or type(additional_records) is not int
+        or additional_records < 0
+        or additional_records > MAX_RETIRED_PROOF_RECORDS
+    ):
+        raise TypeError("retired proof archive arguments are invalid")
+    before = os.fstat(archive_slot.descriptor)
+    _validate_owned_entry(
+        before,
+        label="retired proof archive",
+        kind="directory",
+        mode=0o700,
+    )
+    inventory = tuple(sorted(os.listdir(archive_slot.descriptor)))
+    if len(inventory) + additional_records > MAX_RETIRED_PROOF_RECORDS:
+        raise ValueError("retired proof archive exceeds its record cap")
+    for name in inventory:
+        if (
+            type(name) is not str
+            or not re.fullmatch(r"[0-9a-f]{32}-.+", name)
+            or "/" in name
+        ):
+            raise ValueError("retired proof archive has an invalid record")
+        metadata = os.stat(
+            name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        _validate_owned_entry(
+            metadata,
+            label="retired proof record",
+            kind="file",
+            mode=0o600,
+        )
+        if metadata.st_size > 64 * 1024:
+            raise ValueError("retired proof record exceeds its byte cap")
+    after = os.fstat(archive_slot.descriptor)
+    if (
+        _stat_identity(before) != _stat_identity(after)
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or tuple(sorted(os.listdir(archive_slot.descriptor))) != inventory
+    ):
+        raise RuntimeError("retired proof archive changed while scanning")
+    return inventory
+
+
+def _retire_retained_proofs(
     proofs: Sequence[_RetainedUnlinkProof],
+    *,
+    archive_slot: _DescriptorSlot,
 ) -> None:
     frozen = tuple(proofs)
     if (
         not frozen
         or any(type(proof) is not _RetainedUnlinkProof for proof in frozen)
+        or type(archive_slot) is not _DescriptorSlot
         or len({(id(proof.parent_slot), proof.name) for proof in frozen})
         != len(frozen)
     ):
-        raise ValueError("retained unlink proofs are invalid")
+        raise ValueError("retained retirement proofs are invalid")
+    initial_inventory = _validate_retired_proof_archive(
+        archive_slot,
+        additional_records=len(frozen),
+    )
     staged: list[tuple[_RetainedUnlinkProof, str]] = []
     primary: BaseException | None = None
     try:
@@ -423,58 +543,61 @@ def _unlink_retained_proofs(
                 follow_symlinks=False,
             )
             if _stat_identity(named) != proof.identity:
-                raise ValueError(f"{proof.label} changed before unlink")
-            quarantine = (
-                f".{proof.name}.unlink-{os.getpid()}-"
-                f"{secrets.token_hex(16)}"
+                raise ValueError(f"{proof.label} changed before retirement")
+            archived_name = f"{secrets.token_hex(16)}-{proof.name}"
+            _rename_exclusive_at(
+                source_slot=proof.parent_slot,
+                source_name=proof.name,
+                destination_slot=archive_slot,
+                destination_name=archived_name,
             )
-            os.rename(
-                proof.name,
-                quarantine,
-                src_dir_fd=proof.parent_slot.descriptor,
-                dst_dir_fd=proof.parent_slot.descriptor,
-            )
-            staged.append((proof, quarantine))
-            quarantined = os.stat(
-                quarantine,
-                dir_fd=proof.parent_slot.descriptor,
+            staged.append((proof, archived_name))
+            archived = os.stat(
+                archived_name,
+                dir_fd=archive_slot.descriptor,
                 follow_symlinks=False,
             )
-            if _stat_identity(quarantined) != proof.identity:
-                raise ValueError(f"{proof.label} changed before unlink")
+            if _stat_identity(archived) != proof.identity:
+                raise ValueError(f"{proof.label} changed before retirement")
             _read_retained_unlink_content(
                 proof,
                 byte_cap=max(proof.size, 1),
                 require_original_ctime=False,
             )
-        for proof, quarantine in staged:
-            quarantined = os.stat(
-                quarantine,
-                dir_fd=proof.parent_slot.descriptor,
+        for proof, archived_name in staged:
+            archived = os.stat(
+                archived_name,
+                dir_fd=archive_slot.descriptor,
                 follow_symlinks=False,
             )
-            if _stat_identity(quarantined) != proof.identity:
-                raise ValueError(f"{proof.label} changed before unlink")
+            if _stat_identity(archived) != proof.identity:
+                raise ValueError(f"{proof.label} changed before retirement")
             _read_retained_unlink_content(
                 proof,
                 byte_cap=max(proof.size, 1),
                 require_original_ctime=False,
             )
-        for proof, quarantine in staged:
-            os.unlink(quarantine, dir_fd=proof.parent_slot.descriptor)
+        if set(_validate_retired_proof_archive(
+            archive_slot,
+            additional_records=0,
+        )) != set(initial_inventory) | {
+            archived_name for _proof, archived_name in staged
+        }:
+            raise RuntimeError("retired proof archive changed during retirement")
         for parent_slot in {
             id(proof.parent_slot): proof.parent_slot for proof in frozen
         }.values():
             os.fsync(parent_slot.descriptor)
+        os.fsync(archive_slot.descriptor)
     except BaseException as error:
         primary = error
         rollback_errors: list[BaseException] = []
-        for proof, quarantine in reversed(staged):
+        for proof, archived_name in reversed(staged):
             try:
                 try:
                     os.stat(
-                        quarantine,
-                        dir_fd=proof.parent_slot.descriptor,
+                        archived_name,
+                        dir_fd=archive_slot.descriptor,
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
@@ -486,11 +609,11 @@ def _unlink_retained_proofs(
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
-                    os.rename(
-                        quarantine,
-                        proof.name,
-                        src_dir_fd=proof.parent_slot.descriptor,
-                        dst_dir_fd=proof.parent_slot.descriptor,
+                    _rename_exclusive_at(
+                        source_slot=archive_slot,
+                        source_name=archived_name,
+                        destination_slot=proof.parent_slot,
+                        destination_name=proof.name,
                     )
             except BaseException as rollback_error:
                 rollback_errors.append(rollback_error)
@@ -501,6 +624,10 @@ def _unlink_retained_proofs(
                 os.fsync(parent_slot.descriptor)
             except BaseException as rollback_error:
                 rollback_errors.append(rollback_error)
+        try:
+            os.fsync(archive_slot.descriptor)
+        except BaseException as rollback_error:
+            rollback_errors.append(rollback_error)
         if rollback_errors:
             errors = [primary, *rollback_errors]
             group_type = (
@@ -509,13 +636,13 @@ def _unlink_retained_proofs(
                 else BaseExceptionGroup
             )
             primary = group_type(
-                "retained proof unlink and rollback failed",
+                "retained proof retirement and rollback failed",
                 errors,
             )
     _retire_task_descriptors(
         [proof.slot for proof in frozen],
         primary=primary,
-        label="retained proof unlink or descriptor close failed",
+        label="retained proof retirement or descriptor close failed",
     )
 
 
@@ -9371,87 +9498,60 @@ def wait_for_progress(
         with ExitStack() as retained:
             progress: _RecordChildDirectoryCapability | None = None
             while True:
-                if progress is None:
-                    try:
-                        progress = retained.enter_context(
-                            _open_protocol_record_directory(
-                                worker,
-                                "progress",
-                                label="progress directory",
-                                create=False,
+                with _shared_protocol_worker_lock(
+                    worker,
+                    operation_deadline=deadline,
+                ):
+                    if progress is None:
+                        try:
+                            progress = retained.enter_context(
+                                _open_protocol_record_directory(
+                                    worker,
+                                    "progress",
+                                    label="progress directory",
+                                    create=False,
+                                )
                             )
+                        except FileNotFoundError:
+                            worker._validate_live()
+                    sequences = (
+                        ()
+                        if progress is None
+                        else _protocol_sequence_inventory_retained(
+                            progress,
+                            label="progress",
+                            deadline=deadline,
                         )
-                    except FileNotFoundError:
-                        worker._validate_live()
-                sequences = (
-                    ()
-                    if progress is None
-                    else _protocol_sequence_inventory_retained(
-                        progress,
-                        label="progress",
-                        deadline=deadline,
                     )
-                )
-                _require_protocol_sequence_prefix(
-                    sequences,
-                    expected_seq=expected_seq,
-                    label="progress",
-                )
-                if progress is not None:
-                    for sequence in range(1, expected_seq):
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(
-                                "timed out waiting for durable progress"
+                    _require_protocol_sequence_prefix(
+                        sequences,
+                        expected_seq=expected_seq,
+                        label="progress",
+                    )
+                    if expected_seq in sequences:
+                        if progress is None:
+                            raise AssertionError(
+                                "progress inventory exists without a directory"
                             )
-                        _read_progress_retained(
+                        message = _read_progress_with_worker_lock_retained(
                             worker,
                             progress,
                             expected_lane=expected_lane,
-                            expected_seq=sequence,
-                            lock_deadline=deadline,
+                            expected_seq=expected_seq,
                         )
-                    if (
-                        _protocol_sequence_inventory_retained(
-                            progress,
-                            label="progress",
-                            deadline=deadline,
-                        )
-                        != sequences
-                    ):
-                        raise RuntimeError(
-                            "progress inventory changed while polling"
-                        )
-                if expected_seq in sequences:
-                    if progress is None:
-                        raise AssertionError(
-                            "progress inventory exists without a directory"
-                        )
-                    message = _read_progress_retained(
-                        worker,
-                        progress,
-                        expected_lane=expected_lane,
-                        expected_seq=expected_seq,
-                        lock_deadline=deadline,
-                    )
-                    if expected_sha256 is not None:
-                        content = canonical_config_bytes(
-                            _encode_progress_message(message)
-                        )
-                        if hashlib.sha256(content).hexdigest() != expected_sha256:
-                            raise ValueError("progress wake-up digest differs")
-                    if (
-                        _protocol_sequence_inventory_retained(
-                            progress,
-                            label="progress",
-                            deadline=deadline,
-                        )
-                        != sequences
-                    ):
-                        raise RuntimeError(
-                            "progress inventory changed while reading"
-                        )
-                    worker._validate_live()
-                    return message
+                        if expected_sha256 is not None:
+                            content = canonical_config_bytes(
+                                _encode_progress_message(message)
+                            )
+                            if (
+                                hashlib.sha256(content).hexdigest()
+                                != expected_sha256
+                            ):
+                                raise ValueError(
+                                    "progress wake-up digest differs"
+                                )
+                        worker._validate_live()
+                        return message
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("timed out waiting for durable progress")
@@ -13029,6 +13129,22 @@ def _rearm_bootstrap_before_resume(
             "resume cleanup directory open unexpectedly returned"
         )
     cleanup_slot = _DescriptorSlot(cleanup_descriptor)
+    retired_proofs = Path(coordinator_root) / "retired-proofs"
+    try:
+        _ensure_private_directory(retired_proofs)
+        retired_descriptor, _metadata = _open_private_directory(
+            retired_proofs, "resume retired proof archive"
+        )
+    except BaseException as error:
+        _retire_task_descriptors(
+            [cleanup_slot, coordinator_slot],
+            primary=error,
+            label="resume retired proof archive open or close failed",
+        )
+        raise AssertionError(
+            "resume retired proof archive open unexpectedly returned"
+        )
+    retired_slot = _DescriptorSlot(retired_descriptor)
     proofs: list[_RetainedUnlinkProof] = []
     primary: BaseException | None = None
     try:
@@ -13195,12 +13311,15 @@ def _rearm_bootstrap_before_resume(
                 raise ValueError(
                     "resume case Codex home still exists"
                 )
-        _unlink_retained_proofs(tuple(proofs))
+        _retire_retained_proofs(
+            tuple(proofs),
+            archive_slot=retired_slot,
+        )
     except BaseException as error:
         primary = error
     _retire_task_descriptors(
         [proof.slot for proof in proofs]
-        + [cleanup_slot, coordinator_slot],
+        + [retired_slot, cleanup_slot, coordinator_slot],
         primary=primary,
         label="resume proof reset or descriptor close failed",
     )
