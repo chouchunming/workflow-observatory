@@ -7769,17 +7769,8 @@ class AggregationGateTests(unittest.TestCase):
                 "observing_workflows_lifecycle_cases.json"
             ),
         }
-        self.repository = (self.root / "repository").resolve()
-        subprocess.run(
-            ["git", "init", "-q", str(self.repository)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        (self.repository / "baseline.txt").write_text(
-            "baseline\n", encoding="utf-8"
-        )
+        self.repository = self._new_repository("repository")
+
         self.usage = {
             "input_tokens": 10,
             "cached_input_tokens": 2,
@@ -7787,6 +7778,20 @@ class AggregationGateTests(unittest.TestCase):
             "reasoning_output_tokens": 1,
             "total_tokens": 15,
         }
+
+    def _new_repository(self, name):
+        repository = (self.root / name).resolve()
+        subprocess.run(
+            ["git", "init", "-q", str(repository)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        (repository / "baseline.txt").write_text(
+            "baseline\n", encoding="utf-8"
+        )
+        return repository
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -7878,13 +7883,27 @@ class AggregationGateTests(unittest.TestCase):
         )
         return hashlib.sha256(content).hexdigest()
 
-    def _build_valid_epoch(self, run_kind):
+    def _build_valid_epoch(
+        self,
+        run_kind,
+        *,
+        fixture_name=None,
+        repository=None,
+        fingerprints=None,
+    ):
+        fixture_name = run_kind if fixture_name is None else fixture_name
+        repository = self.repository if repository is None else repository
+        fingerprints = (
+            input_fingerprints(run_kind)
+            if fingerprints is None
+            else fingerprints
+        )
         plan = sharding.build_epoch_plan(
             run_kind=run_kind,
             manifests=self.manifests,
-            fingerprints=input_fingerprints(run_kind),
+            fingerprints=fingerprints,
         )
-        run_root = self.root / f"{run_kind}-run"
+        run_root = self.root / f"{fixture_name}-run"
         run_root.mkdir(mode=0o700)
         (run_root / "cases").mkdir(mode=0o700)
         (run_root / "workers").mkdir(mode=0o700)
@@ -7896,7 +7915,7 @@ class AggregationGateTests(unittest.TestCase):
         coordinator_cleanup = coordinator / "cleanup"
         coordinator_cleanup.mkdir(mode=0o700)
 
-        snapshot_root = self.root / f"{run_kind}-snapshot"
+        snapshot_root = self.root / f"{fixture_name}-snapshot"
         snapshot_root.mkdir(mode=0o555)
         snapshot_root.chmod(0o555)
 
@@ -8097,7 +8116,7 @@ class AggregationGateTests(unittest.TestCase):
             integrity_calls.append(home)
             return expected.copy()
 
-        guard = sharding.CoordinatorGuard.capture(self.repository)
+        guard = sharding.CoordinatorGuard.capture(repository)
         return {
             "plan": plan,
             "run_root": run_root,
@@ -8284,6 +8303,236 @@ class AggregationGateTests(unittest.TestCase):
             guard.verify_exact_result_delta(
                 {"../escape": "a" * 64}, "invalid expected path"
             )
+
+    def test_coherent_guard_and_validated_retargeting_is_rejected(self):
+        other_repository = self._new_repository("other-repository")
+        other_fingerprints = replace(
+            input_fingerprints("formal"), archive_sha256="e" * 64
+        )
+        first_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="retarget-first",
+            repository=self.repository,
+        )
+        first_arguments.pop("integrity_calls")
+        second_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="retarget-second",
+            repository=other_repository,
+            fingerprints=other_fingerprints,
+        )
+        second_arguments.pop("integrity_calls")
+        first = sharding.validate_epoch_for_aggregation(**first_arguments)
+        second = sharding.validate_epoch_for_aggregation(**second_arguments)
+        self.assertNotEqual(first.epoch_id, second.epoch_id)
+
+        guard_fields = (
+            "_repository_root",
+            "_repository_key",
+            "_baseline",
+            "_baseline_rows",
+            "_owner_pid",
+        )
+        original_guard_fields = {
+            field: getattr(first_arguments["guard"], field)
+            for field in guard_fields
+        }
+        for field in guard_fields:
+            setattr(
+                first_arguments["guard"],
+                field,
+                getattr(second_arguments["guard"], field),
+            )
+        with self.subTest(surface="guard-checkpoint"):
+            with self.assertRaises(RuntimeError):
+                first_arguments["guard"].checkpoint(
+                    "coherently retargeted guard"
+                )
+        for field, value in original_guard_fields.items():
+            setattr(first_arguments["guard"], field, value)
+
+        validated_fields = (
+            "_plan",
+            "_forward_bytes",
+            "_lifecycle_bytes",
+            "_manifest_bytes",
+            "_forward_sha256",
+            "_lifecycle_sha256",
+            "_manifest_sha256",
+            "_evidence_sha256",
+            "_teardown_receipt_sha256",
+            "_guard",
+            "_owner_pid",
+            "_claim_lock",
+            "_claim_state",
+            "_issued_capability",
+        )
+        for field in validated_fields:
+            setattr(first, field, getattr(second, field))
+        for surface, operation in (
+            ("property", lambda: first.epoch_id),
+            (
+                "aggregation",
+                lambda: sharding.aggregate_committed_cases(first),
+            ),
+            ("claim", first.claim_formal_commit),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(RuntimeError):
+                    operation()
+
+    def test_coherent_already_issued_commit_retargeting_is_rejected(self):
+        other_repository = self._new_repository("issued-other-repository")
+        other_fingerprints = replace(
+            input_fingerprints("formal"), archive_sha256="e" * 64
+        )
+        first_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="issued-first",
+            repository=self.repository,
+        )
+        first_arguments.pop("integrity_calls")
+        second_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="issued-second",
+            repository=other_repository,
+            fingerprints=other_fingerprints,
+        )
+        second_arguments.pop("integrity_calls")
+        first = sharding.validate_epoch_for_aggregation(**first_arguments)
+        second = sharding.validate_epoch_for_aggregation(**second_arguments)
+        first_commit = first.claim_formal_commit()
+        self.assertNotEqual(first_commit.epoch_id, second.epoch_id)
+        for field in (
+            "_plan",
+            "_forward_bytes",
+            "_lifecycle_bytes",
+            "_manifest_bytes",
+            "_forward_sha256",
+            "_lifecycle_sha256",
+            "_manifest_sha256",
+            "_evidence_sha256",
+            "_teardown_receipt_sha256",
+            "_guard",
+            "_owner_pid",
+        ):
+            setattr(first, field, getattr(second, field))
+        for surface, operation in (
+            ("property", lambda: first_commit.epoch_id),
+            ("consumed", lambda: first_commit.consumed),
+            ("consume", first_commit._consume),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(RuntimeError):
+                    operation()
+
+    def test_persist_preflight_retryability_ends_at_writer_entry(self):
+        other_repository = self._new_repository("preflight-other-repository")
+        other_guard = sharding.CoordinatorGuard.capture(other_repository)
+        destinations = {
+            "forward": self.repository / "results/forward.json",
+            "lifecycle": self.repository / "results/lifecycle.json",
+        }
+        lease = sharding.ResultWriterLease.acquire(
+            self.repository,
+            role="serial-coordinator",
+            run_kind="formal",
+        )
+        try:
+            authority = lease.authority()
+
+            def fresh_commit(label):
+                arguments = self._build_valid_epoch(
+                    "formal", fixture_name=label
+                )
+                arguments.pop("integrity_calls")
+                validated = sharding.validate_epoch_for_aggregation(
+                    **arguments
+                )
+                return arguments, validated.claim_formal_commit()
+
+            for preflight in (
+                "bad-authority",
+                "mismatched-guard",
+                "bad-destinations",
+                "bad-checkpoint",
+            ):
+                with self.subTest(preflight=preflight):
+                    arguments, commit = fresh_commit(preflight)
+                    if preflight == "bad-authority":
+                        invalid_authority = object()
+                        invalid_guard = arguments["guard"]
+                        invalid_destinations = destinations
+                        expected_error = TypeError
+                    elif preflight == "mismatched-guard":
+                        invalid_authority = authority
+                        invalid_guard = other_guard
+                        invalid_destinations = destinations
+                        expected_error = TypeError
+                    elif preflight == "bad-destinations":
+                        invalid_authority = authority
+                        invalid_guard = arguments["guard"]
+                        invalid_destinations = {
+                            "forward": self.root / "outside-forward.json",
+                            "lifecycle": self.root / "outside-lifecycle.json",
+                        }
+                        expected_error = ValueError
+                    else:
+                        invalid_authority = authority
+                        invalid_guard = arguments["guard"]
+                        invalid_destinations = destinations
+                        expected_error = AssertionError
+                    baseline = self.repository / "baseline.txt"
+                    if preflight == "bad-checkpoint":
+                        baseline.write_text("mutated\n", encoding="utf-8")
+                    try:
+                        with self.assertRaises(expected_error):
+                            sharding.persist_validated_epoch(
+                                commit,
+                                authority=invalid_authority,
+                                destinations=invalid_destinations,
+                                guard=invalid_guard,
+                            )
+                    finally:
+                        if preflight == "bad-checkpoint":
+                            baseline.write_text(
+                                "baseline\n", encoding="utf-8"
+                            )
+                    self.assertFalse(commit.consumed)
+
+            arguments, commit = fresh_commit("writer-failure")
+            from scripts import run_observing_workflows_task9_eval as evaluator
+
+            with mock.patch.object(
+                evaluator,
+                "persist_result_pair",
+                side_effect=OSError("writer entered"),
+            ) as persist_spy:
+                with self.assertRaisesRegex(OSError, "writer entered"):
+                    sharding.persist_validated_epoch(
+                        commit,
+                        authority=authority,
+                        destinations=destinations,
+                        guard=arguments["guard"],
+                    )
+            persist_spy.assert_called_once()
+            self.assertTrue(commit.consumed)
+
+            with mock.patch.object(
+                evaluator,
+                "persist_result_pair",
+                side_effect=AssertionError("writer must not be re-entered"),
+            ) as repeat_spy:
+                with self.assertRaises(RuntimeError):
+                    sharding.persist_validated_epoch(
+                        commit,
+                        authority=authority,
+                        destinations=destinations,
+                        guard=arguments["guard"],
+                    )
+            repeat_spy.assert_not_called()
+        finally:
+            lease.close()
 
 
 class ProgressProtocolTests(unittest.TestCase):
