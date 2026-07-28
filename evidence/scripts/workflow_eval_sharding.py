@@ -14591,8 +14591,11 @@ def run_parallel_evaluation(
                     )
                 )
             if (
-                not replay_requires_cleanup
-                and resume_ledger is not None
+                resume_ledger is not None
+                and not any(
+                    active is not None
+                    for active in resume_ledger.active_cases.values()
+                )
             ):
                 machine._seed_resume_protocol(ledger=resume_ledger)
             if replay_requires_cleanup:

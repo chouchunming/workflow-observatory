@@ -13445,6 +13445,10 @@ class CoordinatorStateTests(unittest.TestCase):
         ledger = sharding.ProgressAckLedger(max_total_tokens=0)
         message = self._lane_message("E1", progress_type="lane-ready")
         self.assertEqual("stop-launches", ledger.accept_progress(message))
+        stopped = self._lane_message(
+            "E1", seq=2, progress_type="worker-stopped"
+        )
+        self.assertEqual("stop-launches", ledger.accept_progress(stopped))
         lease = sharding.RunCoordinatorLease.acquire(
             run_root=self.run_root,
             epoch_id=self.plan.epoch_id,
@@ -13459,6 +13463,7 @@ class CoordinatorStateTests(unittest.TestCase):
             machine._seed_resume_protocol(ledger=ledger)
             self.assertIs(machine._ledger, ledger)
             self.assertTrue(machine.stop_launches)
+            self.assertIn("E1", machine._ledger.exited)
         finally:
             if lease.active:
                 lease.close()
