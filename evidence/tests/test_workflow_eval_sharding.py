@@ -7759,6 +7759,533 @@ finally:
                 )
 
 
+class AggregationGateTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.repository = (self.root / "repository").resolve()
+        subprocess.run(
+            ["git", "init", "-q", str(self.repository)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        (self.repository / "baseline.txt").write_text(
+            "baseline\n", encoding="utf-8"
+        )
+        self.usage = {
+            "input_tokens": 10,
+            "cached_input_tokens": 2,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 1,
+            "total_tokens": 15,
+        }
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _worker_root(run_root, lane):
+        if lane == "APP":
+            return run_root / "app-server"
+        return run_root / "workers" / lane
+
+    @staticmethod
+    def _result_for_manifest(mode, manifest_case):
+        if mode == "forward":
+            decisions = [
+                {
+                    **decision,
+                    "task_type": (
+                        manifest_case["task_type"]
+                        if decision["triggered"]
+                        else None
+                    ),
+                    "workflow_variant": (
+                        manifest_case["workflow_variant"]
+                        if decision["triggered"]
+                        else None
+                    ),
+                }
+                for decision in manifest_case["expected_decisions"]
+            ]
+            return {
+                "id": manifest_case["id"],
+                "decisions": decisions,
+                "record_checkpoints": manifest_case[
+                    "expected_record_checkpoints"
+                ],
+                "run_count": manifest_case["expected_run_count"],
+                "draft_count": 0,
+                "final_statuses": manifest_case["expected_final_statuses"],
+            }
+        return {
+            "id": manifest_case["id"],
+            "record_checkpoints": manifest_case[
+                "expected_record_checkpoints"
+            ],
+            "run_count": manifest_case["expected_run_count"],
+            "draft_count": manifest_case["expected_draft_count"],
+            "final_statuses": manifest_case["expected_final_statuses"],
+            "failure_disclosed": manifest_case[
+                "expect_failure_disclosure"
+            ],
+            "selected_command": manifest_case[
+                "expected_selected_command"
+            ],
+        }
+
+    def _write_case_tombstone(self, plan, assignment, paths):
+        root_stat = paths.root.stat()
+        home_stat = paths.codex_home.stat()
+        ownership = sharding.CaseAuthOwnership(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+        )
+        ownership_bytes = sharding._atomic_write_record(
+            paths.cleanup / "ownership.json", asdict(ownership)
+        )
+        receipt = sharding.TombstoneReceipt(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="worker",
+        )
+        content = sharding._atomic_write_record(
+            paths.cleanup / "tombstone.json", asdict(receipt)
+        )
+        return hashlib.sha256(content).hexdigest()
+
+    def _build_valid_epoch(self, run_kind):
+        plan = sharding.build_epoch_plan(
+            run_kind=run_kind,
+            manifests=self.manifests,
+            fingerprints=input_fingerprints(run_kind),
+        )
+        run_root = self.root / f"{run_kind}-run"
+        run_root.mkdir(mode=0o700)
+        (run_root / "cases").mkdir(mode=0o700)
+        (run_root / "workers").mkdir(mode=0o700)
+        for lane in ("E1", "E2", "E3"):
+            (run_root / "workers" / lane).mkdir(mode=0o700)
+        (run_root / "app-server").mkdir(mode=0o700)
+        coordinator = run_root / "coordinator"
+        coordinator.mkdir(mode=0o700)
+        coordinator_cleanup = coordinator / "cleanup"
+        coordinator_cleanup.mkdir(mode=0o700)
+
+        snapshot_root = self.root / f"{run_kind}-snapshot"
+        snapshot_root.mkdir(mode=0o555)
+        snapshot_root.chmod(0o555)
+
+        case_paths = {}
+        terminals = {lane: [] for lane in ("E1", "E2", "E3", "APP")}
+        integrity_counts = {}
+        tombstone_hashes = []
+        for assignment in plan.assignments:
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.root.mkdir(mode=0o700)
+            for directory in (
+                paths.cleanup,
+                paths.codex_home,
+                paths.store,
+                paths.audit,
+                paths.payload,
+                paths.output,
+                paths.staging,
+                paths.home,
+                paths.tmp,
+                paths.config,
+                paths.cache,
+            ):
+                directory.mkdir(mode=0o700)
+            cli = (
+                paths.staging
+                / "marketplace/plugins/workflow-observer/scripts/"
+                "workflow_observer_cli.py"
+            )
+            cli.parent.mkdir(parents=True, mode=0o700)
+            cli.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            cli.chmod(0o700)
+
+            tombstone_sha256 = self._write_case_tombstone(
+                plan, assignment, paths
+            )
+            manifest_case = self.manifests[assignment.key.mode][
+                assignment.key.ordinal - 1
+            ]
+            result = self._result_for_manifest(
+                assignment.key.mode, manifest_case
+            )
+            store_count = (
+                result["run_count"]
+                if type(result["run_count"]) is int
+                else 0
+            )
+            integrity_counts[paths.home] = {
+                "records": store_count,
+                "invalidated": 0,
+            }
+            sharding.write_attempt_start(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+            )
+            sharding.write_attempt_terminal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+                status="success",
+                classification="success",
+                model_started=True,
+                cleanup_passed=True,
+                usage=self.usage,
+                failure=None,
+            )
+            sharding.seal_case(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                result=result,
+                evidence={
+                    "status": "success",
+                    "classification": "success",
+                    "model_started": True,
+                    "elapsed_milliseconds": 25,
+                    "usage": self.usage,
+                    "failure": None,
+                    "store_record_count": store_count,
+                    "store_invalidated_count": 0,
+                    "audit_event_count": 0,
+                    "payload_file_count": 0,
+                    "output_file_count": 0,
+                    "process_cleanup_passed": True,
+                    "credential_cleanup_passed": True,
+                },
+                manifest_case=manifest_case,
+            )
+            attempt_seal = sharding.read_attempt_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+            )
+            case_seal = sharding.read_case_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+            terminals[assignment.lane].append(
+                sharding.ShardTerminal(
+                    key=assignment.key,
+                    run_kind=plan.run_kind,
+                    status="success",
+                    classification="success",
+                    attempt_terminal_sha256=attempt_seal.terminal_sha256,
+                    case_commit_sha256=case_seal.commit_sha256,
+                    tombstone_receipt_sha256=tombstone_sha256,
+                    failure=None,
+                )
+            )
+            paths.codex_home.rmdir()
+            case_paths[assignment.key] = paths
+            tombstone_hashes.append((assignment.key, tombstone_sha256))
+
+        shard_paths = {}
+        for lane in ("E1", "E2", "E3", "APP"):
+            lane_paths = {
+                assignment.key: case_paths[assignment.key]
+                for assignment in plan.assignments
+                if assignment.lane == lane
+            }
+            shard_paths[lane] = sharding.seal_shard(
+                worker_root=self._worker_root(run_root, lane),
+                plan=plan,
+                lane=lane,
+                terminals=terminals[lane],
+                manifests=self.manifests,
+                case_paths=lane_paths,
+            )
+
+        bootstrap = coordinator / "auth-bootstrap"
+        bootstrap.mkdir(mode=0o700)
+        bootstrap_stat = bootstrap.stat()
+        bootstrap_ownership = sharding.BootstrapOwnership(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            bootstrap_device=bootstrap_stat.st_dev,
+            bootstrap_inode=bootstrap_stat.st_ino,
+        )
+        bootstrap_ownership_bytes = sharding._atomic_write_record(
+            coordinator_cleanup / "bootstrap-ownership.json",
+            asdict(bootstrap_ownership),
+        )
+        bootstrap_receipt = sharding.BootstrapTombstoneReceipt(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            ownership_sha256=hashlib.sha256(
+                bootstrap_ownership_bytes
+            ).hexdigest(),
+            bootstrap_device=bootstrap_stat.st_dev,
+            bootstrap_inode=bootstrap_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="coordinator",
+        )
+        bootstrap_receipt_bytes = sharding._atomic_write_record(
+            coordinator_cleanup / "bootstrap-tombstone.json",
+            asdict(bootstrap_receipt),
+        )
+        bootstrap.rmdir()
+        teardown_path = coordinator / "teardown.json"
+        sharding._atomic_write_record(
+            teardown_path,
+            asdict(
+                sharding.TeardownReceipt(
+                    schema_version=1,
+                    epoch_id=plan.epoch_id,
+                    run_kind=plan.run_kind,
+                    tombstone_receipts=tuple(tombstone_hashes),
+                    bootstrap_tombstone_receipt_sha256=hashlib.sha256(
+                        bootstrap_receipt_bytes
+                    ).hexdigest(),
+                    codex_homes_absent=True,
+                    bootstrap_absent=True,
+                )
+            ),
+        )
+
+        integrity_calls = []
+
+        def integrity_runner(command, environment, *, expected_records):
+            home = Path(environment["WORKFLOW_OBSERVATORY_HOME"])
+            expected = integrity_counts[home]
+            self.assertEqual(expected["records"], expected_records)
+            self.assertEqual("integrity", command[-1])
+            integrity_calls.append(home)
+            return expected.copy()
+
+        guard = sharding.CoordinatorGuard.capture(self.repository)
+        return {
+            "plan": plan,
+            "run_root": run_root,
+            "snapshot_root": snapshot_root,
+            "manifests": self.manifests,
+            "shard_paths": shard_paths,
+            "case_paths": case_paths,
+            "integrity_runner": integrity_runner,
+            "integrity_calls": integrity_calls,
+            "guard": guard,
+            "current_fingerprints": plan.fingerprints,
+            "teardown_receipt": teardown_path,
+        }
+
+    def test_unvalidated_rows_cannot_aggregate_or_persist(self):
+        self.assertEqual(
+            ["run_kind", "forward_rows", "lifecycle_rows", "evidence_sha256"],
+            [field.name for field in fields(sharding.Aggregate)],
+        )
+        self.assertEqual(
+            ["fingerprint", "entries"],
+            [field.name for field in fields(sharding.ProductionSnapshot)],
+        )
+        with self.assertRaises(TypeError):
+            sharding.aggregate_committed_cases({"forward": [], "lifecycle": []})
+        with self.assertRaises(TypeError):
+            sharding.persist_validated_epoch(
+                {},
+                authority=object(),
+                destinations={},
+                guard=object(),
+            )
+
+        arguments = self._build_valid_epoch("formal")
+        arguments.pop("integrity_calls")
+        missing = dict(arguments["case_paths"])
+        missing.pop(arguments["plan"].assignments[0].key)
+        arguments["case_paths"] = missing
+        with self.assertRaises((TypeError, ValueError)):
+            sharding.validate_epoch_for_aggregation(**arguments)
+
+    def test_discovery_and_reused_formal_capability_cannot_persist(self):
+        discovery_arguments = self._build_valid_epoch("discovery")
+        discovery_integrity_calls = discovery_arguments.pop("integrity_calls")
+        discovery = sharding.validate_epoch_for_aggregation(
+            **discovery_arguments
+        )
+        discovery_aggregate = sharding.aggregate_committed_cases(discovery)
+        self.assertEqual("discovery", discovery_aggregate.run_kind)
+        self.assertEqual(
+            [case["id"] for case in self.manifests["forward"]],
+            [row["id"] for row in discovery_aggregate.forward_rows],
+        )
+        self.assertEqual(
+            [case["id"] for case in self.manifests["lifecycle"]],
+            [row["id"] for row in discovery_aggregate.lifecycle_rows],
+        )
+        self.assertEqual(28, len(discovery_integrity_calls))
+        with self.assertRaises((TypeError, ValueError, RuntimeError)):
+            discovery.claim_formal_commit()
+        with self.assertRaises(TypeError):
+            sharding.persist_validated_epoch(
+                discovery,
+                authority=object(),
+                destinations={},
+                guard=discovery_arguments["guard"],
+            )
+
+        formal_arguments = self._build_valid_epoch("formal")
+        formal_arguments.pop("integrity_calls")
+        formal = sharding.validate_epoch_for_aggregation(**formal_arguments)
+        commit = formal.claim_formal_commit()
+        self.assertEqual(formal.epoch_id, commit.epoch_id)
+        self.assertEqual("formal", commit.run_kind)
+        self.assertFalse(commit.consumed)
+        with self.assertRaises(RuntimeError):
+            formal.claim_formal_commit()
+        destinations = {
+            "forward": self.repository / "results/forward.json",
+            "lifecycle": self.repository / "results/lifecycle.json",
+        }
+        lease = sharding.ResultWriterLease.acquire(
+            self.repository,
+            role="serial-coordinator",
+            run_kind="formal",
+        )
+        try:
+            authority = lease.authority()
+            pointer = sharding.persist_validated_epoch(
+                commit,
+                authority=authority,
+                destinations=destinations,
+                guard=formal_arguments["guard"],
+            )
+            self.assertTrue(pointer.is_file())
+            self.assertTrue(commit.consumed)
+
+            from scripts import run_observing_workflows_task9_eval as evaluator
+
+            with mock.patch.object(
+                evaluator,
+                "persist_result_pair",
+                side_effect=AssertionError("writer must not be entered"),
+            ) as persist_spy:
+                with self.assertRaises(RuntimeError):
+                    sharding.persist_validated_epoch(
+                        commit,
+                        authority=authority,
+                        destinations=destinations,
+                        guard=formal_arguments["guard"],
+                    )
+            persist_spy.assert_not_called()
+        finally:
+            lease.close()
+
+    def test_capabilities_require_nominal_provenance_and_bound_teardown(self):
+        arguments = self._build_valid_epoch("formal")
+        arguments.pop("integrity_calls")
+        validated = sharding.validate_epoch_for_aggregation(**arguments)
+
+        fabricated = object.__new__(sharding.ValidatedEpoch)
+        fabricated.__dict__.update(validated.__dict__)
+        with self.assertRaises((TypeError, RuntimeError)):
+            sharding.aggregate_committed_cases(fabricated)
+
+        original_forward = validated._forward_bytes
+        validated._forward_bytes = b"[]"
+        with self.assertRaises(RuntimeError):
+            sharding.aggregate_committed_cases(validated)
+        validated._forward_bytes = original_forward
+
+        class ValidatedSubclass(sharding.ValidatedEpoch):
+            pass
+
+        with self.assertRaises(TypeError):
+            sharding.aggregate_committed_cases(
+                object.__new__(ValidatedSubclass)
+            )
+
+        teardown_path = arguments["teardown_receipt"]
+        teardown = json.loads(teardown_path.read_text(encoding="ascii"))
+        teardown["tombstone_receipts"][0][1] = "f" * 64
+        sharding._atomic_write_record(teardown_path, teardown)
+        with self.assertRaises(ValueError):
+            sharding.validate_epoch_for_aggregation(**arguments)
+
+        teardown_path.unlink()
+        with self.assertRaises(ValueError):
+            sharding.validate_epoch_for_aggregation(**arguments)
+
+    def test_coordinator_guard_requires_zero_or_exact_result_delta(self):
+        guard = sharding.CoordinatorGuard.capture(self.repository)
+        self.assertEqual(guard.baseline, guard.checkpoint("unchanged"))
+
+        baseline = self.repository / "baseline.txt"
+        baseline.write_text("mutated\n", encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            guard.checkpoint("unexpected mutation")
+        baseline.write_text("baseline\n", encoding="utf-8")
+        self.assertEqual(
+            guard.baseline,
+            guard.verify_exact_result_delta({}, "restored baseline"),
+        )
+
+        result = self.repository / "results" / "committed.json"
+        result.parent.mkdir(mode=0o700)
+        content = b"committed\n"
+        result.write_bytes(content)
+        result.chmod(0o600)
+        expected = {
+            "results/committed.json": hashlib.sha256(content).hexdigest()
+        }
+        snapshot = guard.verify_exact_result_delta(
+            expected, "allowed result"
+        )
+        self.assertNotEqual(guard.baseline.fingerprint, snapshot.fingerprint)
+
+        unexpected = self.repository / "unexpected.txt"
+        unexpected.write_text("unexpected\n", encoding="utf-8")
+        unexpected.chmod(0o600)
+        with self.assertRaises(AssertionError):
+            guard.verify_exact_result_delta(expected, "unexpected result")
+        with self.assertRaises(ValueError):
+            guard.verify_exact_result_delta(
+                {"../escape": "a" * 64}, "invalid expected path"
+            )
+
+
 class ProgressProtocolTests(unittest.TestCase):
     setUp = SealTests.setUp
     tearDown = SealTests.tearDown

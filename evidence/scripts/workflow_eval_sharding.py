@@ -12,10 +12,12 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import tomllib
+import weakref
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 
@@ -2078,6 +2080,268 @@ class TeardownReceipt:
     bootstrap_absent: Literal[True]
 
 
+@dataclass(frozen=True)
+class Aggregate:
+    run_kind: RunKind
+    forward_rows: tuple[dict[str, object], ...]
+    lifecycle_rows: tuple[dict[str, object], ...]
+    evidence_sha256: str
+
+
+@dataclass(frozen=True)
+class ProductionSnapshot:
+    fingerprint: str
+    entries: tuple[tuple[str, str], ...]
+
+
+_COORDINATOR_GUARD_TOKEN = object()
+_VALIDATED_EPOCH_TOKEN = object()
+_FORMAL_COMMIT_TOKEN = object()
+_COORDINATOR_GUARD_REGISTRY = weakref.WeakValueDictionary()
+_VALIDATED_EPOCH_REGISTRY = weakref.WeakValueDictionary()
+_FORMAL_COMMIT_REGISTRY = weakref.WeakValueDictionary()
+
+
+class CoordinatorGuard:
+    def __init__(
+        self,
+        token: object,
+        *,
+        repository_root: Path,
+        repository_key: str,
+        baseline: ProductionSnapshot,
+        baseline_rows: tuple[tuple[str, str, int, int, str], ...],
+    ) -> None:
+        if token is not _COORDINATOR_GUARD_TOKEN:
+            raise TypeError("CoordinatorGuard cannot be constructed directly")
+        self._repository_root = repository_root
+        self._repository_key = repository_key
+        self._baseline = baseline
+        self._baseline_rows = baseline_rows
+        self._owner_pid = os.getpid()
+        _COORDINATOR_GUARD_REGISTRY[id(self)] = self
+
+    @classmethod
+    def capture(cls, repository_root: Path) -> "CoordinatorGuard":
+        if cls is not CoordinatorGuard:
+            raise TypeError("CoordinatorGuard subclasses are unsupported")
+        canonical, _ = _canonical_git_repository_root(repository_root)
+        rows = _capture_production_rows(canonical)
+        snapshot = _production_snapshot_from_rows(rows)
+        return cls(
+            _COORDINATOR_GUARD_TOKEN,
+            repository_root=canonical,
+            repository_key=hashlib.sha256(os.fsencode(canonical)).hexdigest(),
+            baseline=snapshot,
+            baseline_rows=rows,
+        )
+
+    def _validate_nominal(self) -> None:
+        if type(self) is not CoordinatorGuard:
+            raise TypeError("CoordinatorGuard must be exact")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("CoordinatorGuard belongs to another process")
+        if (
+            _COORDINATOR_GUARD_REGISTRY.get(id(self)) is not self
+            or type(self._baseline) is not ProductionSnapshot
+            or not _is_sha256(self._baseline.fingerprint)
+        ):
+            raise RuntimeError("CoordinatorGuard baseline binding changed")
+
+    @property
+    def baseline(self) -> ProductionSnapshot:
+        self._validate_nominal()
+        return self._baseline
+
+    def checkpoint(self, reason: str) -> ProductionSnapshot:
+        self._validate_nominal()
+        _require_guard_reason(reason)
+        rows = _capture_production_rows(self._repository_root)
+        if rows != self._baseline_rows:
+            raise AssertionError(f"production changed at coordinator checkpoint: {reason}")
+        return _production_snapshot_from_rows(rows)
+
+    def verify_exact_result_delta(
+        self, expected: dict[str, str], reason: str
+    ) -> ProductionSnapshot:
+        self._validate_nominal()
+        _require_guard_reason(reason)
+        frozen_expected = _validate_expected_result_delta(expected)
+        current_rows = _capture_production_rows(self._repository_root)
+        allowed = {row[0]: row for row in self._baseline_rows}
+        current = {row[0]: row for row in current_rows}
+        for relative, expected_sha256 in frozen_expected.items():
+            path = PurePosixPath(relative)
+            parent = path.parent
+            while parent != PurePosixPath("."):
+                parent_text = parent.as_posix()
+                if parent_text not in allowed:
+                    observed_parent = current.get(parent_text)
+                    if (
+                        observed_parent is None
+                        or observed_parent[1:] != ("directory", 0o700, 0, "")
+                    ):
+                        raise AssertionError(
+                            f"unexpected result parent at coordinator checkpoint: {reason}"
+                        )
+                    allowed[parent_text] = observed_parent
+                parent = parent.parent
+            observed = current.get(relative)
+            if (
+                observed is None
+                or observed[1] != "file"
+                or observed[2] != 0o600
+                or observed[4] != expected_sha256
+            ):
+                raise AssertionError(
+                    f"result delta hash or mode differs at coordinator checkpoint: {reason}"
+                )
+            allowed[relative] = observed
+        if tuple(sorted(allowed.values())) != current_rows:
+            raise AssertionError(
+                f"unexpected production delta at coordinator checkpoint: {reason}"
+            )
+        return _production_snapshot_from_rows(current_rows)
+
+
+class ValidatedEpoch:
+    def __init__(
+        self,
+        token: object,
+        *,
+        plan: EpochPlan,
+        forward_bytes: bytes,
+        lifecycle_bytes: bytes,
+        manifest_bytes: tuple[bytes, bytes],
+        evidence_sha256: str,
+        teardown_receipt_sha256: str,
+        guard: CoordinatorGuard,
+    ) -> None:
+        if token is not _VALIDATED_EPOCH_TOKEN:
+            raise TypeError("ValidatedEpoch cannot be constructed directly")
+        self._plan = plan
+        self._forward_bytes = forward_bytes
+        self._lifecycle_bytes = lifecycle_bytes
+        self._manifest_bytes = manifest_bytes
+        self._forward_sha256 = hashlib.sha256(forward_bytes).hexdigest()
+        self._lifecycle_sha256 = hashlib.sha256(lifecycle_bytes).hexdigest()
+        self._manifest_sha256 = tuple(
+            hashlib.sha256(content).hexdigest() for content in manifest_bytes
+        )
+        self._evidence_sha256 = evidence_sha256
+        self._teardown_receipt_sha256 = teardown_receipt_sha256
+        self._guard = guard
+        self._owner_pid = os.getpid()
+        self._claim_lock = threading.Lock()
+        self._claim_state = "validated"
+        self._issued_capability: FormalCommitCapability | None = None
+        _VALIDATED_EPOCH_REGISTRY[id(self)] = self
+
+    def _validate_nominal(self) -> None:
+        if type(self) is not ValidatedEpoch:
+            raise TypeError("ValidatedEpoch must be exact")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("ValidatedEpoch belongs to another process")
+        if (
+            _VALIDATED_EPOCH_REGISTRY.get(id(self)) is not self
+            or type(self._plan) is not EpochPlan
+            or self._plan.run_kind not in ("discovery", "formal")
+            or hashlib.sha256(self._forward_bytes).hexdigest()
+            != self._forward_sha256
+            or hashlib.sha256(self._lifecycle_bytes).hexdigest()
+            != self._lifecycle_sha256
+            or tuple(
+                hashlib.sha256(content).hexdigest()
+                for content in self._manifest_bytes
+            )
+            != self._manifest_sha256
+            or not _is_sha256(self._evidence_sha256)
+            or not _is_sha256(self._teardown_receipt_sha256)
+            or type(self._guard) is not CoordinatorGuard
+        ):
+            raise RuntimeError("ValidatedEpoch provenance binding changed")
+        self._guard._validate_nominal()
+
+    @property
+    def run_kind(self) -> RunKind:
+        self._validate_nominal()
+        return self._plan.run_kind
+
+    @property
+    def epoch_id(self) -> str:
+        self._validate_nominal()
+        return self._plan.epoch_id
+
+    @property
+    def teardown_receipt_sha256(self) -> str:
+        self._validate_nominal()
+        return self._teardown_receipt_sha256
+
+    def claim_formal_commit(self) -> "FormalCommitCapability":
+        self._validate_nominal()
+        with self._claim_lock:
+            if self._plan.run_kind != "formal":
+                raise RuntimeError("only a formal validated epoch can claim commit")
+            if self._claim_state != "validated":
+                raise RuntimeError("formal commit capability was already claimed")
+            capability = FormalCommitCapability(
+                _FORMAL_COMMIT_TOKEN, validated=self
+            )
+            self._issued_capability = capability
+            self._claim_state = "issued"
+            return capability
+
+
+class FormalCommitCapability:
+    def __init__(self, token: object, *, validated: ValidatedEpoch) -> None:
+        if token is not _FORMAL_COMMIT_TOKEN or type(validated) is not ValidatedEpoch:
+            raise TypeError("FormalCommitCapability cannot be constructed directly")
+        self._validated = validated
+        self._owner_pid = os.getpid()
+        self._consume_lock = threading.Lock()
+        self._consumed = False
+        _FORMAL_COMMIT_REGISTRY[id(self)] = self
+
+    def _validate_nominal(self) -> None:
+        if type(self) is not FormalCommitCapability:
+            raise TypeError("FormalCommitCapability must be exact")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("FormalCommitCapability belongs to another process")
+        if _FORMAL_COMMIT_REGISTRY.get(id(self)) is not self:
+            raise RuntimeError("FormalCommitCapability was not module-issued")
+        self._validated._validate_nominal()
+        if (
+            self._validated._plan.run_kind != "formal"
+            or self._validated._issued_capability is not self
+            or self._validated._claim_state != "issued"
+        ):
+            raise RuntimeError("FormalCommitCapability provenance binding changed")
+
+    @property
+    def epoch_id(self) -> str:
+        self._validate_nominal()
+        return self._validated._plan.epoch_id
+
+    @property
+    def run_kind(self) -> Literal["formal"]:
+        self._validate_nominal()
+        return "formal"
+
+    @property
+    def consumed(self) -> bool:
+        self._validate_nominal()
+        with self._consume_lock:
+            return self._consumed
+
+    def _consume(self) -> ValidatedEpoch:
+        self._validate_nominal()
+        with self._consume_lock:
+            if self._consumed:
+                raise RuntimeError("formal commit capability was already consumed")
+            self._consumed = True
+            return self._validated
+
+
 def _open_regular_file(path: Path, label: str) -> tuple[int, os.stat_result]:
     flags = (
         os.O_RDONLY
@@ -2512,7 +2776,7 @@ def _atomic_write_record(path: Path, payload: Mapping[str, Any]) -> bytes:
     return content
 
 
-def _read_canonical_record_at(
+def _read_regular_bytes_at(
     *,
     parent_slot: _DescriptorSlot,
     parent_path: Path,
@@ -2520,7 +2784,7 @@ def _read_canonical_record_at(
     name: str,
     label: str,
     byte_cap: int,
-) -> tuple[dict[str, object], bytes]:
+) -> bytes:
     if type(name) is not str or not name or "/" in name or name in (".", ".."):
         raise ValueError(f"{label} name is invalid")
     if type(byte_cap) is not int or byte_cap <= 0:
@@ -2595,13 +2859,33 @@ def _read_canonical_record_at(
         or len(content) != before.st_size
     ):
         raise ValueError(f"{label} changed while reading")
+    return bytes(content)
+
+
+def _read_canonical_record_at(
+    *,
+    parent_slot: _DescriptorSlot,
+    parent_path: Path,
+    parent_before: os.stat_result,
+    name: str,
+    label: str,
+    byte_cap: int,
+) -> tuple[dict[str, object], bytes]:
+    content = _read_regular_bytes_at(
+        parent_slot=parent_slot,
+        parent_path=parent_path,
+        parent_before=parent_before,
+        name=name,
+        label=label,
+        byte_cap=byte_cap,
+    )
     try:
-        decoded = json.loads(bytes(content).decode("ascii"))
+        decoded = json.loads(content.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError(f"{label} is not canonical ASCII JSON") from None
-    if not isinstance(decoded, dict) or canonical_config_bytes(decoded) != bytes(content):
+    if not isinstance(decoded, dict) or canonical_config_bytes(decoded) != content:
         raise ValueError(f"{label} is not canonical ASCII JSON")
-    return decoded, bytes(content)
+    return decoded, content
 
 
 def _read_canonical_record(
@@ -4687,6 +4971,28 @@ def _read_canonical_record_retained(
     )
     directory._validate_live()
     return result
+
+
+def _read_regular_bytes_retained(
+    directory: _RecordDirectoryCapability,
+    name: str,
+    label: str,
+    *,
+    byte_cap: int,
+) -> bytes:
+    directory._validate_live()
+    parent_slot = directory._retained[-1].slot
+    parent_before = os.fstat(parent_slot.descriptor)
+    content = _read_regular_bytes_at(
+        parent_slot=parent_slot,
+        parent_path=directory.path,
+        parent_before=parent_before,
+        name=name,
+        label=label,
+        byte_cap=byte_cap,
+    )
+    directory._validate_live()
+    return content
 
 
 def _publish_immutable_json_retained(
@@ -8882,3 +9188,899 @@ def build_epoch_plan(
     )
     _register_progress_epoch_context(plan=plan, manifests=manifests)
     return plan
+
+
+def _require_guard_reason(reason: str) -> None:
+    if type(reason) is not str or not reason or len(reason) > 256:
+        raise ValueError("coordinator checkpoint reason must be a nonempty exact string")
+
+
+def _capture_directory_rows(
+    root: Path,
+) -> tuple[tuple[str, str, int, int, str], ...]:
+    from scripts import run_observing_workflows_task9_eval as evaluator
+
+    slot, _ = _open_absolute_directory_anchor(
+        root, "snapshot root", trusted_parent=False
+    )
+    rows: tuple[tuple[str, str, int, int, str], ...] | None = None
+    primary: BaseException | None = None
+    try:
+        metadata = os.fstat(slot.descriptor)
+        rows = (
+            (
+                ".",
+                "directory",
+                stat.S_IMODE(metadata.st_mode),
+                0,
+                "",
+            ),
+            *evaluator._fingerprint_repository_directory_at(slot.descriptor),
+        )
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [slot],
+        primary=primary,
+        label="snapshot capture or descriptor close failed",
+    )
+    if rows is None:
+        raise AssertionError("snapshot capture produced no rows")
+    return rows
+
+
+def _capture_production_rows(
+    repository_root: Path,
+) -> tuple[tuple[str, str, int, int, str], ...]:
+    canonical, _ = _canonical_git_repository_root(repository_root)
+    return _capture_directory_rows(canonical)
+
+
+def _production_snapshot_from_rows(
+    rows: tuple[tuple[str, str, int, int, str], ...],
+) -> ProductionSnapshot:
+    entries = tuple(
+        (
+            row[0],
+            hashlib.sha256(
+                canonical_config_bytes(
+                    {
+                        "kind": row[1],
+                        "mode": row[2],
+                        "size": row[3],
+                        "sha256": row[4],
+                    }
+                )
+            ).hexdigest(),
+        )
+        for row in rows
+    )
+    return ProductionSnapshot(
+        fingerprint=hashlib.sha256(
+            canonical_config_bytes({"entries": entries})
+        ).hexdigest(),
+        entries=entries,
+    )
+
+
+def _validate_expected_result_delta(expected: dict[str, str]) -> dict[str, str]:
+    if type(expected) is not dict:
+        raise TypeError("expected result delta must be an exact dict")
+    items = tuple(expected.items())
+    frozen: dict[str, str] = {}
+    for relative, digest in items:
+        if type(relative) is not str or type(digest) is not str:
+            raise TypeError("expected result delta entries must be exact strings")
+        path = PurePosixPath(relative)
+        if (
+            not relative
+            or path.is_absolute()
+            or path.as_posix() != relative
+            or relative in {".", ".."}
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or not _is_sha256(digest)
+        ):
+            raise ValueError("expected result delta entry is invalid")
+        frozen[relative] = digest
+    if len(frozen) != len(items):
+        raise ValueError("expected result delta contains duplicate paths")
+    return frozen
+
+
+def _require_exact_path(path: Path, label: str) -> Path:
+    concrete_path_type = type(Path("."))
+    if type(path) is not concrete_path_type or not path.is_absolute():
+        raise TypeError(f"{label} must be an exact absolute Path")
+    if path != path.resolve(strict=False):
+        raise ValueError(f"{label} must use its canonical spelling")
+    return path
+
+
+def _validate_snapshot_root(snapshot_root: Path) -> tuple[
+    tuple[str, str, int, int, str], ...
+]:
+    root = _require_exact_path(snapshot_root, "snapshot_root")
+    try:
+        metadata = root.lstat()
+    except OSError:
+        raise ValueError("snapshot_root is unavailable") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise ValueError("snapshot_root must be an owned mode-0555 directory")
+    return _capture_directory_rows(root)
+
+
+def _validate_epoch_inputs(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    snapshot_root: Path,
+    manifests: dict[str, list[dict]],
+    current_fingerprints: InputFingerprints,
+) -> tuple[
+    Path,
+    tuple[bytes, bytes],
+    dict[EvalMode, list[dict[str, object]]],
+    tuple[tuple[str, str, int, int, str], ...],
+]:
+    if type(plan) is not EpochPlan:
+        raise TypeError("plan must be an exact EpochPlan")
+    if plan.run_kind not in ("discovery", "formal"):
+        raise ValueError("only discovery or formal epochs can be aggregated")
+    if type(current_fingerprints) is not InputFingerprints:
+        raise TypeError(
+            "current_fingerprints must be exact InputFingerprints"
+        )
+    if (
+        not _fingerprints_are_complete(plan.fingerprints)
+        or not _fingerprints_are_complete(current_fingerprints)
+        or current_fingerprints != plan.fingerprints
+        or plan.epoch_id != plan.fingerprints.epoch_id
+        or plan.run_kind != plan.fingerprints.run_kind
+    ):
+        raise ValueError("epoch input fingerprints differ")
+    root = _require_exact_path(run_root, "run_root")
+    descriptor, metadata = _open_private_directory(root, "run root")
+    _retire_task_descriptors(
+        [_DescriptorSlot(descriptor)],
+        primary=None,
+        label="run root validation or descriptor close failed",
+    )
+    if root.resolve(strict=True) != root or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise ValueError("run_root must be a canonical private directory")
+    manifest_snapshot = _capture_resume_manifest_snapshot(manifests)
+    if (
+        hashlib.sha256(manifest_snapshot[0]).hexdigest()
+        != current_fingerprints.forward_manifest_sha256
+        or hashlib.sha256(manifest_snapshot[1]).hexdigest()
+        != current_fingerprints.lifecycle_manifest_sha256
+    ):
+        raise ValueError("manifest capture differs from input fingerprints")
+    frozen_manifests = _decode_resume_manifest_snapshot(manifest_snapshot)
+    rebuilt = build_epoch_plan(
+        run_kind=plan.run_kind,
+        manifests=frozen_manifests,
+        fingerprints=current_fingerprints,
+    )
+    if rebuilt != plan:
+        raise ValueError("epoch plan differs from captured manifests")
+    snapshot_rows = _validate_snapshot_root(snapshot_root)
+    return root, manifest_snapshot, frozen_manifests, snapshot_rows
+
+
+def _freeze_shard_paths(
+    shard_paths: dict[LaneName, Path], *, run_root: Path
+) -> dict[LaneName, Path]:
+    if type(shard_paths) is not dict:
+        raise TypeError("shard_paths must be an exact dict")
+    items = tuple(shard_paths.items())
+    if (
+        any(type(lane) is not str for lane, _path in items)
+        or {lane for lane, _path in items} != {"E1", "E2", "E3", "APP"}
+        or len(items) != 4
+    ):
+        raise ValueError("shard_paths must contain the exact four lanes")
+    frozen = dict(items)
+    for lane in ("E1", "E2", "E3", "APP"):
+        path = _require_exact_path(frozen[lane], f"{lane} shard path")
+        worker_root = (
+            run_root / "app-server"
+            if lane == "APP"
+            else run_root / "workers" / lane
+        )
+        if path != worker_root / "sealed" / "shard-commit.json":
+            raise ValueError("shard path differs from the frozen lane path")
+    return frozen
+
+
+def _freeze_case_paths(
+    case_paths: dict[CaseKey, CasePaths],
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+) -> dict[CaseKey, CasePaths]:
+    if type(case_paths) is not dict:
+        raise TypeError("case_paths must be an exact dict")
+    items = tuple(case_paths.items())
+    expected_keys = tuple(assignment.key for assignment in plan.assignments)
+    if (
+        len(items) != len(expected_keys)
+        or any(type(key) is not CaseKey for key, _paths in items)
+        or {key for key, _paths in items} != set(expected_keys)
+    ):
+        raise ValueError("case_paths must contain every planned case exactly once")
+    frozen = dict(items)
+    for assignment in plan.assignments:
+        paths = frozen[assignment.key]
+        if type(paths) is not CasePaths:
+            raise TypeError("case_paths values must be exact CasePaths")
+        if paths != paths_for_case(run_root, assignment):
+            raise ValueError("case_paths differ from the frozen epoch layout")
+    return frozen
+
+
+def _read_successful_shards(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    shard_paths: dict[LaneName, Path],
+    case_paths: dict[CaseKey, CasePaths],
+) -> dict[CaseKey, ShardTerminal]:
+    terminals: dict[CaseKey, ShardTerminal] = {}
+    shard_hashes: set[str] = set()
+    for lane in ("E1", "E2", "E3", "APP"):
+        lane_assignments = tuple(
+            assignment for assignment in plan.assignments if assignment.lane == lane
+        )
+        lane_paths = {
+            assignment.key: case_paths[assignment.key]
+            for assignment in lane_assignments
+        }
+        seal = read_shard_seal(
+            worker_root=shard_paths[lane].parent.parent,
+            plan=plan,
+            lane=lane,
+            manifests=manifests,
+            case_paths=lane_paths,
+        )
+        if (
+            seal.status != "success"
+            or tuple(terminal.key for terminal in seal.terminals)
+            != tuple(assignment.key for assignment in lane_assignments)
+            or any(
+                terminal.run_kind != plan.run_kind
+                or terminal.status != "success"
+                or terminal.classification != "success"
+                for terminal in seal.terminals
+            )
+        ):
+            raise ValueError("shard is not a complete all-green commit")
+        if seal.commit_sha256 in shard_hashes:
+            raise ValueError("shard commit hashes must be unique")
+        shard_hashes.add(seal.commit_sha256)
+        for terminal in seal.terminals:
+            if terminal.key in terminals:
+                raise ValueError("case appears in more than one shard")
+            terminals[terminal.key] = terminal
+    if len(shard_hashes) != 4 or len(terminals) != 28:
+        raise ValueError("shard commits do not cover the complete epoch")
+    return terminals
+
+
+def _validate_attempt_truth(
+    *,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    paths: CasePaths,
+    manifest_case: dict[str, object],
+    case_seal: CaseSeal,
+    shard_terminal: ShardTerminal,
+) -> None:
+    attempt_paths = scan_attempts(
+        paths, plan=plan, manifest_case=manifest_case
+    )
+    if len(attempt_paths) not in (1, 2):
+        raise ValueError("validated case must contain one or two sealed attempts")
+    attempts = tuple(
+        read_attempt_seal(
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=attempt_number,
+            manifest_case=manifest_case,
+        )
+        for attempt_number in range(1, len(attempt_paths) + 1)
+    )
+    final = attempts[-1]
+    if (
+        final.terminal.get("status") != "success"
+        or final.terminal.get("classification") != "success"
+        or final.terminal.get("cleanup_passed") is not True
+        or final.terminal_sha256 != shard_terminal.attempt_terminal_sha256
+        or final.terminal_sha256 != case_seal.commit.get(
+            "attempt_terminal_sha256"
+        )
+        or case_seal.commit.get("attempt") != len(attempts)
+    ):
+        raise ValueError("final attempt truth differs from case or shard commit")
+    if sum(
+        attempt.terminal.get("model_started") is True for attempt in attempts
+    ) != 1:
+        raise ValueError("validated case must have exactly one model-started attempt")
+    if len(attempts) == 2:
+        first = attempts[0].terminal
+        decision = decide_retry(
+            classification=first.get("classification"),
+            attempt=1,
+            model_started=first.get("model_started"),
+            cleanup_passed=first.get("cleanup_passed"),
+            fingerprints_unchanged=True,
+        )
+        if (
+            first.get("status") != "failed"
+            or not decision.retry
+            or decision.next_attempt != 2
+        ):
+            raise ValueError("two-attempt case lacks a proved retryable first attempt")
+
+
+def _validate_case_inventory_count(
+    paths: CasePaths, component: str, expected: object
+) -> None:
+    if type(expected) is not int or expected < 0:
+        raise ValueError(f"{component} count is invalid")
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=(component,),
+        create=False,
+        label=f"case {component} directory",
+    )
+    with directory:
+        inventory = directory.inventory()
+        parent_fd = directory._retained[-1].slot.descriptor
+        for name in inventory:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _validate_owned_entry(
+                metadata,
+                label=f"case {component} entry",
+                kind="file",
+                mode=0o600,
+            )
+        if len(inventory) != expected:
+            raise ValueError(f"case {component} count differs from sealed evidence")
+
+
+def _validate_case_audit(paths: CasePaths, expected: object) -> None:
+    if type(expected) is not int or expected < 0:
+        raise ValueError("audit event count is invalid")
+    directory = _open_case_record_directory(
+        paths=paths,
+        components=("audit",),
+        create=False,
+        label="case audit directory",
+    )
+    with directory:
+        inventory = directory.inventory()
+        if expected == 0:
+            if inventory:
+                raise ValueError("case audit inventory differs from sealed evidence")
+            return
+        if inventory != ("payload-audit.jsonl",):
+            raise ValueError("case audit inventory is invalid")
+        content = _read_regular_bytes_retained(
+            directory,
+            "payload-audit.jsonl",
+            "case payload audit",
+            byte_cap=4 * 1024 * 1024,
+        )
+        try:
+            rows = [
+                json.loads(line)
+                for line in content.decode("utf-8").splitlines()
+            ]
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("case payload audit is invalid JSON lines") from None
+        if len(rows) != expected or any(type(row) is not dict for row in rows):
+            raise ValueError("case audit event count differs from sealed evidence")
+
+
+def _integrity_environment(paths: CasePaths) -> dict[str, str]:
+    cli = (
+        paths.staging
+        / "marketplace/plugins/workflow-observer/scripts/"
+        "workflow_observer_cli.py"
+    )
+    return {
+        "HOME": str(paths.home),
+        "CODEX_HOME": str(paths.codex_home),
+        "TMPDIR": str(paths.tmp),
+        "XDG_CONFIG_HOME": str(paths.config),
+        "XDG_CACHE_HOME": str(paths.cache),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "WORKFLOW_OBSERVATORY_HOME": str(paths.home),
+        "OBSERVATION_PAYLOAD_TMPDIR": str(paths.payload),
+        "OBSERVATION_AUDIT_LOG": str(paths.audit / "payload-audit.jsonl"),
+        "OBSERVATION_EVAL": "1",
+        "OBSERVATION_CLI_PATH": str(cli),
+    }
+
+
+def _validate_case_integrity(
+    *,
+    paths: CasePaths,
+    evidence: dict[str, object],
+    integrity_runner: Callable[..., dict],
+) -> None:
+    store = _open_case_record_directory(
+        paths=paths,
+        components=("store",),
+        create=False,
+        label="case store directory",
+    )
+    with store:
+        inventory = store.inventory()
+        environment = _integrity_environment(paths)
+        command = (
+            sys.executable,
+            environment["OBSERVATION_CLI_PATH"],
+            "integrity",
+        )
+        result = integrity_runner(
+            command,
+            environment,
+            expected_records=evidence["store_record_count"],
+        )
+        if store.inventory() != inventory:
+            raise RuntimeError("case store changed during integrity validation")
+    if (
+        type(result) is not dict
+        or set(result) != {"records", "invalidated"}
+        or any(type(result[field]) is not int or result[field] < 0 for field in result)
+        or result["records"] != evidence["store_record_count"]
+        or result["invalidated"] != evidence["store_invalidated_count"]
+    ):
+        raise ValueError("case integrity result differs from sealed evidence")
+
+
+def _decode_bootstrap_tombstone(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+) -> tuple[BootstrapTombstoneReceipt, str]:
+    cleanup = run_root / "coordinator" / "cleanup"
+    ownership_payload, ownership_bytes = _read_canonical_record(
+        cleanup / "bootstrap-ownership.json",
+        "bootstrap ownership",
+    )
+    _require_exact_fields(
+        ownership_payload, BootstrapOwnership, "bootstrap ownership"
+    )
+    ownership = BootstrapOwnership(**ownership_payload)
+    receipt_payload, receipt_bytes = _read_canonical_record(
+        cleanup / "bootstrap-tombstone.json",
+        "bootstrap tombstone",
+    )
+    _require_exact_fields(
+        receipt_payload, BootstrapTombstoneReceipt, "bootstrap tombstone"
+    )
+    receipt = BootstrapTombstoneReceipt(**receipt_payload)
+    if (
+        type(ownership.schema_version) is not int
+        or ownership.schema_version != 1
+        or ownership.epoch_id != plan.epoch_id
+        or ownership.run_kind != plan.run_kind
+        or type(ownership.bootstrap_device) is not int
+        or ownership.bootstrap_device < 0
+        or type(ownership.bootstrap_inode) is not int
+        or ownership.bootstrap_inode < 0
+        or type(receipt.schema_version) is not int
+        or receipt.schema_version != 1
+        or type(receipt.epoch_id) is not str
+        or receipt.epoch_id != plan.epoch_id
+        or type(receipt.run_kind) is not str
+        or receipt.run_kind != plan.run_kind
+        or type(receipt.ownership_sha256) is not str
+        or receipt.ownership_sha256
+        != hashlib.sha256(ownership_bytes).hexdigest()
+        or type(receipt.bootstrap_device) is not int
+        or receipt.bootstrap_device != ownership.bootstrap_device
+        or type(receipt.bootstrap_inode) is not int
+        or receipt.bootstrap_inode != ownership.bootstrap_inode
+        or receipt.scrubbed is not True
+        or receipt.empty is not True
+        or receipt.canonical_binding != "expected"
+        or receipt.producer not in ("coordinator", "coordinator-recovery")
+    ):
+        raise ValueError("bootstrap tombstone is stale or invalid")
+    return receipt, hashlib.sha256(receipt_bytes).hexdigest()
+
+
+def _validate_teardown_receipt(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    teardown_receipt: Path,
+    expected_tombstones: tuple[tuple[CaseKey, str], ...],
+    case_paths: dict[CaseKey, CasePaths],
+) -> str:
+    path = _require_exact_path(teardown_receipt, "teardown_receipt")
+    if path != run_root / "coordinator" / "teardown.json":
+        raise ValueError("teardown receipt path differs from the coordinator path")
+    payload, content = _read_canonical_record(
+        path, "coordinator teardown receipt", byte_cap=64 * 1024
+    )
+    _require_exact_fields(payload, TeardownReceipt, "coordinator teardown receipt")
+    encoded_tombstones = payload.get("tombstone_receipts")
+    if type(encoded_tombstones) is not list:
+        raise ValueError("teardown tombstone receipts must be an exact list")
+    decoded_tombstones: list[tuple[CaseKey, str]] = []
+    for item in encoded_tombstones:
+        if type(item) is not list or len(item) != 2:
+            raise ValueError("teardown tombstone binding is invalid")
+        key = _decode_case_key(item[0], "teardown tombstone case")
+        digest = item[1]
+        if type(digest) is not str or not _is_sha256(digest):
+            raise ValueError("teardown tombstone hash is invalid")
+        decoded_tombstones.append((key, digest))
+    _, bootstrap_sha256 = _decode_bootstrap_tombstone(
+        plan=plan, run_root=run_root
+    )
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or type(payload.get("epoch_id")) is not str
+        or payload.get("epoch_id") != plan.epoch_id
+        or type(payload.get("run_kind")) is not str
+        or payload.get("run_kind") != plan.run_kind
+        or tuple(decoded_tombstones) != expected_tombstones
+        or len({key for key, _digest in decoded_tombstones}) != 28
+        or len({digest for _key, digest in decoded_tombstones}) != 28
+        or payload.get("bootstrap_tombstone_receipt_sha256")
+        != bootstrap_sha256
+        or payload.get("codex_homes_absent") is not True
+        or payload.get("bootstrap_absent") is not True
+    ):
+        raise ValueError("coordinator teardown receipt is stale or incomplete")
+    for paths in case_paths.values():
+        try:
+            paths.codex_home.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("case Codex-home tombstone still exists")
+    try:
+        (run_root / "coordinator" / "auth-bootstrap").lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("coordinator auth bootstrap still exists")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _encode_epoch_rows(rows: Sequence[dict[str, object]]) -> bytes:
+    return json.dumps(
+        list(rows),
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def _decode_epoch_rows(content: bytes) -> tuple[dict[str, object], ...]:
+    rows = json.loads(content.decode("ascii"))
+    if type(rows) is not list or any(type(row) is not dict for row in rows):
+        raise RuntimeError("validated epoch row binding changed")
+    return tuple(rows)
+
+
+def validate_epoch_for_aggregation(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    snapshot_root: Path,
+    manifests: dict[str, list[dict]],
+    shard_paths: dict[LaneName, Path],
+    case_paths: dict[CaseKey, CasePaths],
+    integrity_runner: Callable[..., dict],
+    guard: CoordinatorGuard,
+    current_fingerprints: InputFingerprints,
+    teardown_receipt: Path,
+) -> ValidatedEpoch:
+    if type(guard) is not CoordinatorGuard:
+        raise TypeError("guard must be an exact CoordinatorGuard")
+    guard._validate_nominal()
+    if not callable(integrity_runner):
+        raise TypeError("integrity_runner must be callable")
+    (
+        bound_run_root,
+        manifest_snapshot,
+        frozen_manifests,
+        snapshot_rows,
+    ) = _validate_epoch_inputs(
+        plan=plan,
+        run_root=run_root,
+        snapshot_root=snapshot_root,
+        manifests=manifests,
+        current_fingerprints=current_fingerprints,
+    )
+    frozen_shards = _freeze_shard_paths(
+        shard_paths, run_root=bound_run_root
+    )
+    frozen_cases = _freeze_case_paths(
+        case_paths, plan=plan, run_root=bound_run_root
+    )
+    shard_terminals = _read_successful_shards(
+        plan=plan,
+        run_root=bound_run_root,
+        manifests=frozen_manifests,
+        shard_paths=frozen_shards,
+        case_paths=frozen_cases,
+    )
+
+    forward_rows: list[dict[str, object]] = []
+    lifecycle_rows: list[dict[str, object]] = []
+    sealed: list[tuple[CaseAssignment, CaseSeal, dict[str, object]]] = []
+    commit_hashes: set[str] = set()
+    attempt_hashes: set[str] = set()
+    tombstone_hashes: set[str] = set()
+    for assignment in plan.assignments:
+        paths = frozen_cases[assignment.key]
+        manifest_case = frozen_manifests[assignment.key.mode][
+            assignment.key.ordinal - 1
+        ]
+        seal = read_case_seal(
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            manifest_case=manifest_case,
+        )
+        terminal = shard_terminals[assignment.key]
+        if (
+            seal.result is None
+            or seal.commit.get("status") != "success"
+            or seal.evidence.get("status") != "success"
+            or seal.evidence.get("classification") != "success"
+            or seal.evidence.get("process_cleanup_passed") is not True
+            or seal.evidence.get("credential_cleanup_passed") is not True
+            or terminal.case_commit_sha256 != seal.commit_sha256
+            or terminal.tombstone_receipt_sha256
+            != seal.tombstone_receipt_sha256
+        ):
+            raise ValueError("case is not a complete all-green commit")
+        _validate_attempt_truth(
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+            manifest_case=manifest_case,
+            case_seal=seal,
+            shard_terminal=terminal,
+        )
+        attempt_sha256 = seal.commit["attempt_terminal_sha256"]
+        tombstone_sha256 = seal.tombstone_receipt_sha256
+        if (
+            seal.commit_sha256 in commit_hashes
+            or attempt_sha256 in attempt_hashes
+            or tombstone_sha256 in tombstone_hashes
+        ):
+            raise ValueError("case seal dependencies must be unique")
+        commit_hashes.add(seal.commit_sha256)
+        attempt_hashes.add(attempt_sha256)
+        tombstone_hashes.add(tombstone_sha256)
+        target = (
+            forward_rows
+            if assignment.key.mode == "forward"
+            else lifecycle_rows
+        )
+        target.append(dict(seal.result))
+        sealed.append((assignment, seal, manifest_case))
+    if (
+        len(commit_hashes) != 28
+        or len(attempt_hashes) != 28
+        or len(tombstone_hashes) != 28
+        or sum(assignment.route == "exec" for assignment in plan.assignments) != 24
+        or sum(
+            assignment.route == "app-server" for assignment in plan.assignments
+        )
+        != 4
+    ):
+        raise ValueError("validated case seals or route table are incomplete")
+
+    for _assignment, seal, _manifest_case in sealed:
+        paths = frozen_cases[_assignment.key]
+        _validate_case_integrity(
+            paths=paths,
+            evidence=seal.evidence,
+            integrity_runner=integrity_runner,
+        )
+        _validate_case_inventory_count(
+            paths, "payload", seal.evidence["payload_file_count"]
+        )
+        _validate_case_inventory_count(
+            paths, "output", seal.evidence["output_file_count"]
+        )
+        _validate_case_audit(paths, seal.evidence["audit_event_count"])
+
+    from scripts import run_observing_workflows_task9_eval as evaluator
+
+    results = {"forward": forward_rows, "lifecycle": lifecycle_rows}
+    evaluator._validate_committed_result_semantics(results, frozen_manifests)
+    expected_tombstones = tuple(
+        (
+            assignment.key,
+            shard_terminals[assignment.key].tombstone_receipt_sha256,
+        )
+        for assignment in plan.assignments
+    )
+    teardown_sha256 = _validate_teardown_receipt(
+        plan=plan,
+        run_root=bound_run_root,
+        teardown_receipt=teardown_receipt,
+        expected_tombstones=expected_tombstones,
+        case_paths=frozen_cases,
+    )
+    for assignment, _seal, manifest_case in sealed:
+        read_case_seal(
+            plan=plan,
+            paths=frozen_cases[assignment.key],
+            assignment=assignment,
+            manifest_case=manifest_case,
+        )
+    if (
+        [row["id"] for row in forward_rows]
+        != [row["id"] for row in frozen_manifests["forward"]]
+        or [row["id"] for row in lifecycle_rows]
+        != [row["id"] for row in frozen_manifests["lifecycle"]]
+        or len(forward_rows) != 20
+        or len(lifecycle_rows) != 8
+        or _capture_directory_rows(snapshot_root) != snapshot_rows
+    ):
+        raise ValueError("validated epoch order or captured snapshot changed")
+    guard.verify_exact_result_delta(
+        {}, "validated epoch requires zero production delta"
+    )
+    forward_bytes = _encode_epoch_rows(forward_rows)
+    lifecycle_bytes = _encode_epoch_rows(lifecycle_rows)
+    evidence_sha256 = hashlib.sha256(
+        canonical_config_bytes(
+            {
+                "epoch_id": plan.epoch_id,
+                "run_kind": plan.run_kind,
+                "case_commit_sha256": tuple(
+                    seal.commit_sha256 for _assignment, seal, _manifest in sealed
+                ),
+                "teardown_receipt_sha256": teardown_sha256,
+                "forward_sha256": hashlib.sha256(forward_bytes).hexdigest(),
+                "lifecycle_sha256": hashlib.sha256(lifecycle_bytes).hexdigest(),
+            }
+        )
+    ).hexdigest()
+    return ValidatedEpoch(
+        _VALIDATED_EPOCH_TOKEN,
+        plan=plan,
+        forward_bytes=forward_bytes,
+        lifecycle_bytes=lifecycle_bytes,
+        manifest_bytes=manifest_snapshot,
+        evidence_sha256=evidence_sha256,
+        teardown_receipt_sha256=teardown_sha256,
+        guard=guard,
+    )
+
+
+def aggregate_committed_cases(validated: ValidatedEpoch) -> Aggregate:
+    if type(validated) is not ValidatedEpoch:
+        raise TypeError("aggregate requires an exact ValidatedEpoch")
+    validated._validate_nominal()
+    return Aggregate(
+        run_kind=validated._plan.run_kind,
+        forward_rows=_decode_epoch_rows(validated._forward_bytes),
+        lifecycle_rows=_decode_epoch_rows(validated._lifecycle_bytes),
+        evidence_sha256=validated._evidence_sha256,
+    )
+
+
+def _expected_persisted_result_delta(
+    *,
+    repository_root: Path,
+    destinations: dict[str, Path],
+    results: dict[str, list[dict]],
+) -> dict[str, str]:
+    from scripts import run_observing_workflows_task9_eval as evaluator
+
+    parent = destinations["forward"].parent
+    relative_parent = parent.relative_to(repository_root)
+    contents = {
+        mode: evaluator._json_bytes(results[mode])
+        for mode in ("forward", "lifecycle")
+    }
+    digests = {
+        mode: hashlib.sha256(contents[mode]).hexdigest()
+        for mode in ("forward", "lifecycle")
+    }
+    generation = hashlib.sha256(
+        (digests["forward"] + digests["lifecycle"]).encode("ascii")
+    ).hexdigest()[:24]
+    names = {
+        mode: f"{generation}-{mode}.json"
+        for mode in ("forward", "lifecycle")
+    }
+    generation_root = relative_parent / evaluator.RESULT_GENERATION_DIRECTORY
+    expected = {
+        (generation_root / names[mode]).as_posix(): digests[mode]
+        for mode in ("forward", "lifecycle")
+    }
+    pointer_value = {
+        "schema_version": 1,
+        "generation": generation,
+        "files": {
+            mode: {
+                "path": (
+                    f"{evaluator.RESULT_GENERATION_DIRECTORY}/{names[mode]}"
+                ),
+                "sha256": digests[mode],
+            }
+            for mode in ("forward", "lifecycle")
+        },
+    }
+    pointer_content = evaluator._json_bytes(pointer_value)
+    expected[
+        (relative_parent / evaluator.RESULT_COMMIT_FILENAME).as_posix()
+    ] = hashlib.sha256(pointer_content).hexdigest()
+    return expected
+
+
+def persist_validated_epoch(
+    commit: FormalCommitCapability,
+    *,
+    authority: ResultWriterAuthority,
+    destinations: dict[str, Path],
+    guard: CoordinatorGuard,
+) -> Path:
+    if type(commit) is not FormalCommitCapability:
+        raise TypeError("persist requires an exact FormalCommitCapability")
+    validated = commit._consume()
+    if type(authority) is not ResultWriterAuthority:
+        raise TypeError("persist requires an exact ResultWriterAuthority")
+    if type(guard) is not CoordinatorGuard or guard is not validated._guard:
+        raise TypeError("persist requires the validated epoch CoordinatorGuard")
+    authority._validate_live()
+    guard._validate_nominal()
+    if (
+        authority.run_kind != "formal"
+        or authority.repository_key != guard._repository_key
+    ):
+        raise ValueError("result writer authority differs from validated epoch")
+    frozen_destinations = _validate_result_destinations(
+        destinations, repository_root=guard._repository_root
+    )
+    guard.checkpoint("before validated epoch persistence")
+    aggregate = aggregate_committed_cases(validated)
+    results = {
+        "forward": list(aggregate.forward_rows),
+        "lifecycle": list(aggregate.lifecycle_rows),
+    }
+    manifests = _decode_resume_manifest_snapshot(validated._manifest_bytes)
+    from scripts import run_observing_workflows_task9_eval as evaluator
+
+    pointer = evaluator.persist_result_pair(
+        frozen_destinations,
+        results,
+        manifests,
+        authority=authority,
+    )
+    readback = evaluator.resolve_committed_result_pair(pointer, manifests)
+    if readback != results:
+        raise AssertionError("validated epoch result readback differs")
+    expected_delta = _expected_persisted_result_delta(
+        repository_root=guard._repository_root,
+        destinations=frozen_destinations,
+        results=results,
+    )
+    guard.verify_exact_result_delta(
+        expected_delta, "after validated epoch persistence"
+    )
+    return pointer
