@@ -9158,6 +9158,7 @@ def wait_for_ack(
         )
         worker._validate_live()
         with ExitStack() as retained:
+            progress: _RecordChildDirectoryCapability | None = None
             acks: _RecordChildDirectoryCapability | None = None
             while True:
                 if acks is None:
@@ -9201,12 +9202,22 @@ def wait_for_ack(
                                 raise TimeoutError(
                                     "timed out waiting for progress ACK"
                                 )
-                            prior_progress = read_progress(
-                                bound_worker
-                                / "progress"
-                                / f"{sequence:06d}.json",
-                                message.lane,
-                                sequence,
+                            if progress is None:
+                                progress = retained.enter_context(
+                                    _open_protocol_record_directory(
+                                        worker,
+                                        "progress",
+                                        label="progress directory",
+                                        create=False,
+                                    )
+                                )
+                            prior_progress = (
+                                _read_progress_with_worker_lock_retained(
+                                    worker,
+                                    progress,
+                                    expected_lane=message.lane,
+                                    expected_seq=sequence,
+                                )
                             )
                             worker._validate_live()
                             _read_ack_for_progress_with_worker_lock_retained(

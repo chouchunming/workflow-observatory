@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import asdict, fields, FrozenInstanceError, replace
 import errno
 import hashlib
@@ -10638,8 +10639,10 @@ sharding.wait_for_ack(worker_root, message, 0.05)
 
         real_open_directory = sharding._open_protocol_record_directory
         real_write_record = sharding._write_protocol_record_retained
+        real_lock_shared = sharding._lock_protocol_worker_shared
         waiter_at_ack_inventory = threading.Event()
         writer_in_publication_window = threading.Event()
+        waiter_attempted_shared_lock = threading.Event()
         release_waiter = threading.Event()
         release_writer = threading.Event()
         waiter_finished = threading.Event()
@@ -10690,6 +10693,14 @@ sharding.wait_for_ack(worker_root, message, 0.05)
                 byte_cap=byte_cap,
             )
 
+        def signal_waiter_shared_lock_attempt(worker, *, deadline):
+            if (
+                threading.current_thread().name == "ack-waiter"
+                and writer_in_publication_window.is_set()
+            ):
+                waiter_attempted_shared_lock.set()
+            return real_lock_shared(worker, deadline=deadline)
+
         def invoke_writer():
             try:
                 writer_results.append(
@@ -10717,6 +10728,10 @@ sharding.wait_for_ack(worker_root, message, 0.05)
             sharding,
             "_write_protocol_record_retained",
             side_effect=pause_writer_with_pending_marker,
+        ), mock.patch.object(
+            sharding,
+            "_lock_protocol_worker_shared",
+            side_effect=signal_waiter_shared_lock_attempt,
         ):
             waiter = threading.Thread(
                 target=invoke_waiter,
@@ -10732,9 +10747,11 @@ sharding.wait_for_ack(worker_root, message, 0.05)
                 writer.start()
                 self.assertTrue(writer_in_publication_window.wait(2.0))
                 release_waiter.set()
-                waiter_finished_during_publication = waiter_finished.wait(
-                    0.05
+                self.assertTrue(
+                    waiter_attempted_shared_lock.wait(2.0),
+                    "ACK waiter never attempted the shared worker lock",
                 )
+                waiter_finished_during_publication = waiter_finished.is_set()
             finally:
                 release_waiter.set()
                 release_writer.set()
@@ -10753,6 +10770,78 @@ sharding.wait_for_ack(worker_root, message, 0.05)
         self.assertEqual([], waiter_errors)
         self.assertEqual(1, len(waiter_results))
         self.assertEqual("continue", waiter_results[0].decision)
+
+    def test_ack_prefix_validation_does_not_reenter_shared_worker_lock(self):
+        run_root = self.root / "single-depth-ack-prefix" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        first = self._lane_message(seq=1, progress_type="lane-ready")
+        second = self._lane_message(seq=2, progress_type="worker-stopped")
+        sharding.write_progress(worker_root, first)
+        sharding.write_ack(worker_root, first, "continue")
+        sharding.write_progress(worker_root, second)
+        sharding.write_ack(worker_root, second, "abort")
+        worker_identity = (
+            worker_root.stat().st_dev,
+            worker_root.stat().st_ino,
+        )
+
+        real_shared_lock = sharding._shared_protocol_worker_lock
+        real_read_ack = (
+            sharding._read_ack_for_progress_with_worker_lock_retained
+        )
+        lock_depths = {}
+        lock_identities = []
+        validated_ack_sequences = []
+        maximum_lock_depth = 0
+
+        @contextmanager
+        def track_shared_lock(worker, *, operation_deadline):
+            nonlocal maximum_lock_depth
+            descriptor = worker._retained[-1].slot.descriptor
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            lock_identities.append(identity)
+            with real_shared_lock(
+                worker,
+                operation_deadline=operation_deadline,
+            ):
+                depth = lock_depths.get(identity, 0) + 1
+                lock_depths[identity] = depth
+                maximum_lock_depth = max(maximum_lock_depth, depth)
+                try:
+                    yield
+                finally:
+                    lock_depths[identity] -= 1
+
+        def track_ack_prefix(worker, acks, message):
+            validated_ack_sequences.append(message.seq)
+            return real_read_ack(worker, acks, message)
+
+        with mock.patch.object(
+            sharding,
+            "_shared_protocol_worker_lock",
+            new=track_shared_lock,
+        ), mock.patch.object(
+            sharding,
+            "_read_ack_for_progress_with_worker_lock_retained",
+            side_effect=track_ack_prefix,
+        ):
+            ack = sharding.wait_for_ack(worker_root, second, 1.0)
+
+        self.assertEqual("abort", ack.decision)
+        self.assertEqual([1, 2], validated_ack_sequences)
+        self.assertEqual({worker_identity}, set(lock_identities))
+        self.assertEqual(
+            {},
+            {
+                key: value
+                for key, value in lock_depths.items()
+                if value
+            },
+        )
+        self.assertEqual(1, maximum_lock_depth)
 
     def test_noncooperating_ack_inventory_mutation_remains_fail_closed(self):
         run_root = self.root / "noncooperating-ack-mutation" / "run"
