@@ -12527,13 +12527,19 @@ def _production_integrity_runner(
     )
     if completed.returncode != 0:
         raise RuntimeError("captured integrity command failed")
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        raise ValueError("captured integrity command returned invalid JSON") from None
-    if type(payload) is not dict:
-        raise ValueError("captured integrity command returned invalid result")
-    return payload
+    match = re.fullmatch(
+        r"healthy records=([0-9]+) invalidated=([0-9]+)\n?",
+        completed.stdout,
+    )
+    if match is None or completed.stderr:
+        raise ValueError("captured integrity command returned malformed output")
+    result = {
+        "records": int(match.group(1)),
+        "invalidated": int(match.group(2)),
+    }
+    if result["records"] != expected_records:
+        raise ValueError("captured integrity record count differs")
+    return result
 
 
 def production_coordinator_dependencies(
@@ -13305,7 +13311,7 @@ def _launch_parallel_workers(
         try:
             process = subprocess.Popen(
                 command,
-                cwd=snapshot_root / "evidence",
+                cwd=Path(__file__).resolve().parents[1],
                 env=_parallel_worker_environment(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

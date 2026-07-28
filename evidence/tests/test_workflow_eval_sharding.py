@@ -13713,6 +13713,156 @@ class CoordinatorStateTests(unittest.TestCase):
         self.assertEqual(["argv"], list(signature.parameters))
         self.assertIsNone(signature.parameters["argv"].default)
 
+    def test_default_worker_launcher_reaches_durable_lane_ready(self):
+        repository = Path(__file__).resolve().parents[2]
+        coordinator_root = self.run_root / "coordinator"
+        coordinator_root.mkdir(parents=True, mode=0o700)
+        self.run_root.chmod(0o700)
+        snapshot_root = coordinator_root / "captured-snapshot"
+        _archive, capture_digests, _inventory, _inventory_bytes = (
+            sharding._verified_parallel_archive_inputs(repository)
+        )
+        sharding._materialize_parallel_snapshot(
+            repository_root=repository,
+            snapshot_root=snapshot_root,
+            expected_digests=capture_digests,
+        )
+        self.codex_executable.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 9.9.9'\n",
+            encoding="utf-8",
+        )
+        self.codex_executable.chmod(0o700)
+        transport_config = sharding.resolve_transport_config(
+            codex_executable=self.codex_executable,
+            source_codex_home=self.source_codex_home,
+            requested_model="test-model",
+            requested_reasoning_effort="medium",
+        )
+        plan = sharding.build_epoch_plan(
+            run_kind="discovery",
+            manifests=self.manifests,
+            fingerprints=replace(
+                input_fingerprints("discovery"),
+                transport_config_sha256=hashlib.sha256(
+                    sharding.transport_config_bytes(transport_config)
+                ).hexdigest(),
+            ),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(plan),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "transport-config.json",
+            asdict(transport_config),
+        )
+        for worker_root in (
+            self.run_root / "workers/E1",
+            self.run_root / "workers/E2",
+            self.run_root / "workers/E3",
+            self.run_root / "app-server",
+        ):
+            worker_root.mkdir(parents=True, mode=0o700)
+            worker_root.parent.chmod(0o700)
+        machine, _guard = self._new_machine(plan=plan)
+        dependencies = sharding.production_coordinator_dependencies(
+            snapshot_root=snapshot_root
+        )
+        resume = sharding.ResumePlan(
+            run_kind=self.plan.run_kind,
+            reusable=(),
+            pending=tuple(
+                assignment.key for assignment in plan.assignments
+            ),
+            invalid=(),
+        )
+        try:
+            sharding._launch_parallel_workers(
+                machine=machine,
+                plan=plan,
+                options=self._options(),
+                snapshot_root=snapshot_root,
+                dependencies=dependencies,
+                resume=resume,
+            )
+            ready = sharding.wait_for_progress(
+                worker_root=self.run_root / "workers/E1",
+                expected_lane="E1",
+                expected_seq=1,
+                timeout=5.0,
+            )
+            self.assertEqual("lane-ready", ready.type)
+            command = tuple(
+                dependencies.worker_command_factory(
+                    "E1",
+                    plan,
+                    self._options(),
+                    snapshot_root,
+                )
+            )
+            self.assertEqual(
+                (
+                    sys.executable,
+                    "-m",
+                    "scripts.run_observing_workflows_eval_worker",
+                ),
+                command[:3],
+            )
+        finally:
+            if machine.phase in ("preflight", "running", "cancelling"):
+                machine.cancel("production launcher boundary test complete")
+            for process in machine._workers.values():
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_production_integrity_runner_parses_exact_healthy_output(self):
+        completed = subprocess.CompletedProcess(
+            args=("integrity",),
+            returncode=0,
+            stdout="healthy records=7 invalidated=2\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            sharding.subprocess, "run", return_value=completed
+        ):
+            self.assertEqual(
+                {"records": 7, "invalidated": 2},
+                sharding._production_integrity_runner(
+                    ("integrity",), {}, expected_records=7
+                ),
+            )
+
+    def test_production_integrity_runner_rejects_bad_process_or_output(self):
+        cases = (
+            (1, "", "failed\n", 7),
+            (0, "healthy records=7 invalidated=2\n", "warning\n", 7),
+            (0, '{"records":7,"invalidated":2}\n', "", 7),
+            (0, "healthy records=6 invalidated=2\n", "", 7),
+            (0, "healthy records=7 invalidated=-1\n", "", 7),
+            (0, "healthy records=7 invalidated=2\nextra\n", "", 7),
+        )
+        for returncode, stdout, stderr, expected_records in cases:
+            with self.subTest(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ), mock.patch.object(
+                sharding.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=("integrity",),
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                ),
+            ), self.assertRaises((RuntimeError, ValueError)):
+                sharding._production_integrity_runner(
+                    ("integrity",),
+                    {},
+                    expected_records=expected_records,
+                )
+
     def test_resume_protocol_and_stop_marker_boundaries_are_durable(self):
         from scripts import run_observing_workflows_eval_worker as worker
 

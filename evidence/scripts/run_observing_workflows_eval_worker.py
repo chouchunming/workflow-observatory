@@ -54,6 +54,7 @@ from scripts.workflow_eval_sharding import (
     _decode_case_key,
     _decode_resume_plan_record,
     _read_canonical_record,
+    _register_progress_epoch_context,
     _require_exact_fields,
     _retire_descriptor_capability,
     _tombstone_receipt_from_payload as _receipt_from_payload,
@@ -1784,6 +1785,7 @@ def _run_worker_impl(
         != plan.fingerprints.lifecycle_manifest_sha256
     ):
         raise ValueError("captured worker manifests differ from the epoch plan")
+    _register_progress_epoch_context(plan=plan, manifests=manifests)
     lane_assignments = tuple(
         assignment for assignment in plan.assignments if assignment.lane == lane
     )
