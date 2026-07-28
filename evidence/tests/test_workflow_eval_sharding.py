@@ -2654,7 +2654,9 @@ class RuntimeIsolationTests(unittest.TestCase):
                     transport_runner=mock.Mock(),
                 )
             factory = Factory()
-            with self.assertRaises(ForeignProcessSurvival):
+            with self.assertRaises(
+                worker._CapturedEvaluatorFailure
+            ) as raised:
                 driver(
                     assignment=assignment,
                     manifest_case={"id": "shared-id"},
@@ -2662,6 +2664,15 @@ class RuntimeIsolationTests(unittest.TestCase):
                     runtime_factory=factory,
                     event_sink=lambda *_: None,
                 )
+            self.assertEqual(
+                "surviving-process",
+                worker._classify_worker_failure(
+                    raised.exception, model_started=False
+                ),
+            )
+            self.assertTrue(
+                worker.worker_exit_required(raised.exception, factory)
+            )
 
         self.assertEqual([], factory.cleaned)
 
@@ -9070,7 +9081,7 @@ class ProgressProtocolTests(unittest.TestCase):
             get_args(sharding.ProgressType),
         )
         self.assertEqual(
-            ("continue", "stop-launches", "abort"),
+            ("continue", "retry", "stop-launches", "abort"),
             get_args(sharding.AckDecision),
         )
         self.assertEqual(4096, sharding.MAX_PROGRESS_BYTES)
@@ -9764,6 +9775,25 @@ class ProgressProtocolTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     sharding.write_progress(worker_root, message)
 
+    def test_durable_nonretryable_failure_ack_remains_abort(self):
+        worker_root, terminal = self._failed_terminal_scenario(
+            "durable-nonretryable-failure",
+            cleanup_passed=True,
+            canonical_binding="expected",
+        )
+        terminal = replace(terminal, seq=2)
+        started = self._case_started_for_terminal(terminal, seq=1)
+        ledger = sharding.ProgressAckLedger(max_total_tokens=None)
+        self.assertEqual("continue", ledger.accept_progress(started))
+        self.assertEqual(
+            "abort",
+            ledger.accept_durable_progress(
+                worker_root=worker_root,
+                message=terminal,
+            ),
+        )
+        self.assertTrue(ledger.aborted)
+
     def test_failed_terminal_accepts_only_authoritative_precommit_case_artifacts(self):
         for fault_point, expected_inventory in (
             ("after-result-replace", ("case-result.json",)),
@@ -10044,7 +10074,7 @@ class ProgressProtocolTests(unittest.TestCase):
         )
 
     def test_protocol_inventory_caps_crash_temps_and_checks_deadline_while_scanning(self):
-        self.assertEqual(19, sharding.MAX_PROTOCOL_RECORDS)
+        self.assertEqual(35, sharding.MAX_PROTOCOL_RECORDS)
         self.assertEqual(19, sharding.MAX_PROTOCOL_CRASH_TEMPS)
         run_root = self.root / "bounded-inventory" / "run"
         run_root.mkdir(parents=True, mode=0o700)
@@ -13862,6 +13892,448 @@ class CoordinatorStateTests(unittest.TestCase):
                     {},
                     expected_records=expected_records,
                 )
+
+    def test_captured_failure_facts_ignore_foreign_class_identity(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from types import ModuleType
+
+        evaluator = ModuleType("_task12_foreign_evaluator")
+        exec(
+            """
+class CaseCleanupFailure(RuntimeError):
+    pass
+
+class ProcessSurvivalCleanupFailure(CaseCleanupFailure):
+    pass
+
+class CaseInfrastructureFailure(RuntimeError):
+    pass
+
+class CaseTransportFailure(RuntimeError):
+    def __init__(self, message, *, classification, retryable):
+        super().__init__(message)
+        self.classification = classification
+        self.retryable = retryable
+
+def _contains_process_survival_failure(error):
+    if isinstance(error, ProcessSurvivalCleanupFailure):
+        return True
+    return any(
+        _contains_process_survival_failure(child)
+        for child in getattr(error, "exceptions", ())
+    )
+""",
+            evaluator.__dict__,
+        )
+        assignment = self.plan.assignments[0]
+        manifest_case = self.manifests["forward"][0]
+        self.run_root.mkdir(mode=0o700)
+        paths = sharding.paths_for_case(self.run_root, assignment)
+
+        class Factory:
+            poisoned = False
+
+            def cleanup_case(self, _paths):
+                raise AssertionError("foreign pre-runtime failure was cleaned")
+
+        factory = Factory()
+        cases = (
+            (
+                ExceptionGroup(
+                    "nested captured model failure",
+                    [
+                        RuntimeError("outer context"),
+                        evaluator.CaseTransportFailure(
+                            "model rejected request",
+                            classification="model",
+                            retryable=False,
+                        ),
+                    ],
+                ),
+                "model",
+                False,
+            ),
+            (
+                evaluator.CaseInfrastructureFailure(
+                    "transport could not start"
+                ),
+                "pre-model-infrastructure",
+                False,
+            ),
+            (
+                evaluator.CaseCleanupFailure("cleanup failed"),
+                "cleanup",
+                False,
+            ),
+            (
+                ExceptionGroup(
+                    "nested process survival",
+                    [
+                        RuntimeError("cleanup context"),
+                        evaluator.ProcessSurvivalCleanupFailure(
+                            "process still exists"
+                        ),
+                    ],
+                ),
+                "surviving-process",
+                True,
+            ),
+        )
+        for foreign_error, expected, exit_required in cases:
+            with self.subTest(classification=expected):
+                def fail_case(**_kwargs):
+                    raise foreign_error
+
+                evaluator._run_case = fail_case
+                driver = worker._ProductionCaseDriver(
+                    evaluator=evaluator,
+                    transport_config=mock.sentinel.transport_config,
+                    transport_runner=mock.sentinel.transport_runner,
+                )
+                with self.assertRaises(BaseException) as raised:
+                    driver(
+                        assignment=assignment,
+                        manifest_case=manifest_case,
+                        paths=paths,
+                        runtime_factory=factory,
+                        event_sink=mock.sentinel.event_sink,
+                    )
+                normalized = raised.exception
+                self.assertEqual(
+                    expected,
+                    worker._classify_worker_failure(
+                        normalized, model_started=False
+                    ),
+                )
+                self.assertIs(
+                    exit_required,
+                    worker.worker_exit_required(normalized, factory),
+                )
+
+    @staticmethod
+    def _write_retry_test_tombstone(
+        *,
+        plan,
+        assignment,
+        paths,
+    ):
+        paths.codex_home.mkdir(mode=0o700)
+        root_stat = paths.root.stat()
+        home_stat = paths.codex_home.stat()
+        ownership = sharding.CaseAuthOwnership(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+        )
+        ownership_bytes = sharding._atomic_write_record(
+            paths.cleanup / "ownership.json", asdict(ownership)
+        )
+        receipt = sharding.TombstoneReceipt(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="worker",
+        )
+        sharding._atomic_write_record(
+            paths.cleanup / "tombstone.json", asdict(receipt)
+        )
+        paths.codex_home.rmdir()
+
+    def test_one_lane_retries_once_through_durable_coordinator_ack(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        self.run_root.mkdir(mode=0o700)
+        coordinator_root = self.run_root / "coordinator"
+        coordinator_root.mkdir(mode=0o700)
+        snapshot_root = coordinator_root / "captured-snapshot"
+        fixture_root = snapshot_root / "evidence/tests/skill_evals"
+        fixture_root.mkdir(parents=True, mode=0o700)
+        for name in (
+            "observing_workflows_cases.json",
+            "observing_workflows_lifecycle_cases.json",
+        ):
+            shutil.copy2(FIXTURES / name, fixture_root / name)
+
+        self.codex_executable.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 9.9.9'\n",
+            encoding="utf-8",
+        )
+        self.codex_executable.chmod(0o700)
+        transport_config = sharding.resolve_transport_config(
+            codex_executable=self.codex_executable,
+            source_codex_home=self.source_codex_home,
+            requested_model="test-model",
+            requested_reasoning_effort="medium",
+        )
+        epoch_id = hashlib.sha256(
+            (
+                "task-12-one-lane-retry\0"
+                + str(self.root)
+            ).encode("utf-8")
+        ).hexdigest()
+        assignment = self.plan.assignments[0]
+        plan = sharding.EpochPlan(
+            schema_version=1,
+            epoch_id=epoch_id,
+            run_kind=self.plan.run_kind,
+            fingerprints=replace(
+                self.plan.fingerprints,
+                epoch_id=epoch_id,
+                transport_config_sha256=hashlib.sha256(
+                    sharding.transport_config_bytes(transport_config)
+                ).hexdigest(),
+            ),
+            assignments=(assignment,),
+        )
+        sharding._register_progress_epoch_context(
+            plan=plan, manifests=self.manifests
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(plan),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "transport-config.json",
+            asdict(transport_config),
+        )
+
+        class Factory:
+            poisoned = False
+
+            def __init__(self):
+                self.closed = False
+
+            def __call__(self, **_kwargs):
+                raise AssertionError("test case driver owns the fake runtime")
+
+            def close(self):
+                self.closed = True
+
+        runtime_factory = Factory()
+        attempts = []
+        usage = sharding.TokenUsage(
+            input_tokens=10,
+            cached_input_tokens=2,
+            output_tokens=5,
+            reasoning_output_tokens=1,
+            total_tokens=15,
+        )
+        result = {
+            "id": assignment.key.case_id,
+            "decisions": [
+                {
+                    "after_turn": 1,
+                    "triggered": True,
+                    "task_type": "feature",
+                    "workflow_variant": "implementation-basic",
+                }
+            ],
+            "record_checkpoints": [
+                {
+                    "after_turn": 1,
+                    "records": [
+                        {
+                            "role": "run-1",
+                            "status": "success",
+                            "start_mode": "planned",
+                            "superseded_by_role": None,
+                        }
+                    ],
+                }
+            ],
+            "run_count": 1,
+            "draft_count": 0,
+            "final_statuses": ["success"],
+        }
+
+        def case_driver(
+            *,
+            assignment,
+            manifest_case,
+            paths,
+            runtime_factory,
+            event_sink,
+        ):
+            attempts.append(len(attempts) + 1)
+            for directory in (
+                paths.store,
+                paths.audit,
+                paths.payload,
+                paths.output,
+            ):
+                directory.mkdir(mode=0o700)
+            self._write_retry_test_tombstone(
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+            if len(attempts) == 1:
+                raise task9_eval.CaseInfrastructureFailure(
+                    "injected pre-model infrastructure failure"
+                )
+            event_sink("model-started", 4100, 4100)
+            return worker.DrivenCase(
+                result=result,
+                execution=task9_eval.CaseExecution(
+                    terminal_status="completed",
+                    final_text="done",
+                    command_executions=(),
+                    observation_command_diagnostics=(),
+                    usage=usage,
+                ),
+            )
+
+        dependencies = sharding.WorkerDependencies(
+            runtime_factory=runtime_factory,
+            case_driver=case_driver,
+        )
+        machine, _guard = self._new_machine(plan=plan)
+        worker_root = self.run_root / "workers/E1"
+        worker_root.mkdir(parents=True, mode=0o700)
+        worker_root.parent.chmod(0o700)
+
+        class Process:
+            pid = os.getpid()
+            pgid = os.getpgrp()
+            returncode = 0
+            _coordinator_readers = ()
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        process = Process()
+        process.worker_root = worker_root
+        machine.register_worker("E1", process)
+        resume = sharding.ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=(assignment.key,),
+            invalid=(),
+        )
+        worker_result = []
+        worker_errors = []
+
+        def run_lane():
+            try:
+                worker_result.append(
+                    worker._run_worker_impl(
+                        lane="E1",
+                        plan=plan,
+                        run_root=self.run_root,
+                        snapshot_root=snapshot_root,
+                        resume=resume,
+                        dependencies=dependencies,
+                    )
+                )
+            except BaseException as error:
+                worker_errors.append(error)
+
+        thread = threading.Thread(target=run_lane)
+        thread.start()
+        decisions = []
+        sequence = 1
+        try:
+            while True:
+                try:
+                    message = sharding.wait_for_progress(
+                        worker_root=worker_root,
+                        expected_lane="E1",
+                        expected_seq=sequence,
+                        timeout=5.0,
+                    )
+                except RuntimeError as error:
+                    if "inventory changed" in str(error):
+                        continue
+                    raise
+                except ValueError as error:
+                    if str(error) == "progress publication is pending":
+                        continue
+                    raise
+                except TimeoutError:
+                    if worker_errors:
+                        raise worker_errors[0]
+                    raise
+                decision = machine.accept_progress(message)
+                decisions.append((message.type, message.attempt, decision))
+                sequence += 1
+                if decision == "abort":
+                    while message.type != "worker-stopped":
+                        try:
+                            message = sharding.wait_for_progress(
+                                worker_root=worker_root,
+                                expected_lane="E1",
+                                expected_seq=sequence,
+                                timeout=5.0,
+                            )
+                        except RuntimeError as error:
+                            if "inventory changed" in str(error):
+                                continue
+                            raise
+                        except ValueError as error:
+                            if str(error) == "progress publication is pending":
+                                continue
+                            raise
+                        sharding.write_ack(worker_root, message, "abort")
+                        sequence += 1
+                    break
+                if message.type == "worker-stopped":
+                    break
+        finally:
+            thread.join(5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], worker_errors)
+        self.assertEqual([1, 2], attempts)
+        self.assertIn(("case-terminal", 1, "retry"), decisions)
+        self.assertNotIn("abort", [decision for _, _, decision in decisions])
+        self.assertEqual(1, len(worker_result))
+        shard = sharding.read_shard_seal(
+            worker_root=worker_root,
+            plan=plan,
+            lane="E1",
+            manifests=self.manifests,
+            case_paths={
+                assignment.key: sharding.paths_for_case(
+                    self.run_root, assignment
+                )
+            },
+        )
+        self.assertEqual("success", shard.status)
+        self.assertEqual((assignment.key,), tuple(
+            terminal.key for terminal in shard.terminals
+        ))
+        self.assertEqual(
+            (1, 2),
+            tuple(
+                int(attempt.root.name)
+                for attempt in sharding.scan_attempts(
+                    sharding.paths_for_case(self.run_root, assignment),
+                    plan=plan,
+                    manifest_case=self.manifests["forward"][0],
+                )
+            ),
+        )
+        self.assertTrue(runtime_factory.closed)
+        self.assertFalse(
+            (coordinator_root / "stop-launches.json").exists()
+        )
 
     def test_resume_protocol_and_stop_marker_boundaries_are_durable(self):
         from scripts import run_observing_workflows_eval_worker as worker

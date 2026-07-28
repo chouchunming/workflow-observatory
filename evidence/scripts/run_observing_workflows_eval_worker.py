@@ -110,6 +110,94 @@ class DrivenCase:
     execution: CaseExecution
 
 
+@dataclass(frozen=True)
+class _CapturedFailureFact:
+    kind: str
+    classification: str | None
+    retryable: bool | None
+
+
+class _CapturedEvaluatorFailure(RuntimeError):
+    def __init__(self, facts: tuple[_CapturedFailureFact, ...]) -> None:
+        if not facts or any(
+            type(fact) is not _CapturedFailureFact for fact in facts
+        ):
+            raise TypeError("captured failure facts must be nonempty and exact")
+        self.facts = facts
+        super().__init__("captured evaluator failure")
+
+
+def _captured_exception_type(
+    evaluator: ModuleType, name: str
+) -> type[BaseException] | None:
+    candidate = getattr(evaluator, name, None)
+    if (
+        isinstance(candidate, type)
+        and issubclass(candidate, BaseException)
+    ):
+        return candidate
+    return None
+
+
+def _normalize_captured_failure(
+    *,
+    evaluator: ModuleType,
+    error: BaseException,
+    survival_hint: bool,
+) -> _CapturedEvaluatorFailure:
+    survival_type = _captured_exception_type(
+        evaluator, "ProcessSurvivalCleanupFailure"
+    )
+    cleanup_type = _captured_exception_type(
+        evaluator, "CaseCleanupFailure"
+    )
+    transport_type = _captured_exception_type(
+        evaluator, "CaseTransportFailure"
+    )
+    infrastructure_type = _captured_exception_type(
+        evaluator, "CaseInfrastructureFailure"
+    )
+    facts: list[_CapturedFailureFact] = []
+
+    def visit(current: BaseException) -> None:
+        nested = getattr(current, "exceptions", ())
+        if isinstance(nested, (tuple, list)) and nested:
+            for child in nested:
+                if isinstance(child, BaseException):
+                    visit(child)
+            return
+        if survival_type is not None and isinstance(current, survival_type):
+            facts.append(_CapturedFailureFact("survival", None, False))
+        elif cleanup_type is not None and isinstance(current, cleanup_type):
+            facts.append(_CapturedFailureFact("cleanup", None, False))
+        elif transport_type is not None and isinstance(current, transport_type):
+            classification = getattr(current, "classification", None)
+            retryable = getattr(current, "retryable", None)
+            facts.append(
+                _CapturedFailureFact(
+                    "transport",
+                    classification if type(classification) is str else None,
+                    retryable if type(retryable) is bool else None,
+                )
+            )
+        elif (
+            infrastructure_type is not None
+            and isinstance(current, infrastructure_type)
+        ):
+            facts.append(_CapturedFailureFact("infrastructure", None, True))
+        elif isinstance(current, TimeoutError):
+            facts.append(_CapturedFailureFact("timeout", "timeout", False))
+        elif isinstance(current, AssertionError):
+            facts.append(_CapturedFailureFact("semantic", "semantic", False))
+        else:
+            facts.append(_CapturedFailureFact("unknown", None, None))
+
+    visit(error)
+    if survival_hint and not any(fact.kind == "survival" for fact in facts):
+        facts.append(_CapturedFailureFact("survival", None, False))
+    return _CapturedEvaluatorFailure(tuple(facts))
+
+
 class CaseTransport(Protocol):
     def __call__(
         self,
@@ -139,7 +227,16 @@ def worker_exit_required(
 ) -> bool:
     if not isinstance(error, BaseException):
         raise TypeError("error must be a BaseException")
-    return factory.poisoned or is_indeterminate_descriptor_close(error)
+    captured_survival = any(
+        isinstance(leaf, _CapturedEvaluatorFailure)
+        and any(fact.kind == "survival" for fact in leaf.facts)
+        for leaf in _worker_failure_leaves(error)
+    )
+    return (
+        factory.poisoned
+        or captured_survival
+        or is_indeterminate_descriptor_close(error)
+    )
 
 
 def publish_progress_and_wait_for_ack(
@@ -331,6 +428,11 @@ class _ProductionCaseDriver:
                     captured_survival = True
                 if type(captured_survival) is not bool:
                     captured_survival = True
+            primary = _normalize_captured_failure(
+                evaluator=self._evaluator,
+                error=primary,
+                survival_hint=captured_survival,
+            )
             if (
                 captured_survival
                 or _contains_process_survival_failure(primary)
@@ -1450,13 +1552,41 @@ def _classify_worker_failure(
     error: BaseException, *, model_started: bool
 ) -> str:
     leaves = _worker_failure_leaves(error)
+    captured_facts = tuple(
+        fact
+        for leaf in leaves
+        if isinstance(leaf, _CapturedEvaluatorFailure)
+        for fact in leaf.facts
+    )
+    if any(fact.kind == "survival" for fact in captured_facts):
+        return "surviving-process"
     if any(
         isinstance(leaf, ProcessSurvivalCleanupFailure)
         for leaf in leaves
     ):
         return "surviving-process"
+    if any(fact.kind == "cleanup" for fact in captured_facts):
+        return "cleanup"
     if any(isinstance(leaf, CaseCleanupFailure) for leaf in leaves):
         return "cleanup"
+    for fact in captured_facts:
+        if fact.kind != "transport":
+            continue
+        classification = fact.classification
+        if (
+            fact.retryable is False
+            and classification == "pre-model-infrastructure"
+        ):
+            return "protocol"
+        if classification in (
+            "model",
+            "pre-model-infrastructure",
+            "timeout",
+            "protocol",
+            "post-start-transport",
+        ):
+            return classification
+        return "protocol"
     for leaf in leaves:
         if isinstance(leaf, CaseTransportFailure):
             classification = leaf.classification
@@ -1475,6 +1605,14 @@ def _classify_worker_failure(
             return "protocol"
     if any(isinstance(leaf, TimeoutError) for leaf in leaves):
         return "timeout"
+    if any(fact.kind == "timeout" for fact in captured_facts):
+        return "timeout"
+    if any(fact.kind == "infrastructure" for fact in captured_facts):
+        return (
+            "post-start-transport"
+            if model_started
+            else "pre-model-infrastructure"
+        )
     if any(isinstance(leaf, CaseInfrastructureFailure) for leaf in leaves):
         return (
             "post-start-transport"
@@ -1482,6 +1620,8 @@ def _classify_worker_failure(
             else "pre-model-infrastructure"
         )
     if any(isinstance(leaf, AssertionError) for leaf in leaves):
+        return "semantic"
+    if any(fact.kind == "semantic" for fact in captured_facts):
         return "semantic"
     return "protocol" if model_started else "pre-model-infrastructure"
 
@@ -1858,6 +1998,7 @@ def _run_worker_impl(
         if ack.decision != "continue":
             assignments = ()
 
+        stop_assignments = False
         for assignment in assignments:
             manifest_case = manifests[assignment.key.mode][
                 assignment.key.ordinal - 1
@@ -1869,88 +2010,104 @@ def _run_worker_impl(
             _secure_directory(paths.root, anchor=root)
             _secure_directory(paths.cleanup, anchor=root)
             _secure_directory(paths.attempts, anchor=root)
-            prior_attempts = scan_attempts(
-                paths, plan=plan, manifest_case=manifest_case
-            )
-            attempt = len(prior_attempts) + 1
-            if attempt not in (1, 2):
-                raise ValueError("pending case exhausted its attempt budget")
-            if attempt == 2:
-                prior = read_attempt_seal(
-                    plan=plan,
-                    paths=paths,
-                    assignment=assignment,
-                    attempt=1,
-                    manifest_case=manifest_case,
+            while True:
+                prior_attempts = scan_attempts(
+                    paths, plan=plan, manifest_case=manifest_case
                 )
-                terminal = prior.terminal
-                retry = decide_retry(
-                    classification=terminal["classification"],
-                    attempt=1,
-                    model_started=terminal["model_started"],
-                    cleanup_passed=terminal["cleanup_passed"],
-                    fingerprints_unchanged=True,
-                )
-                if (
-                    not retry.retry
-                    or retry.next_attempt != 2
-                    or retry.action != "reuse"
-                ):
+                attempt = len(prior_attempts) + 1
+                if attempt not in (1, 2):
                     raise ValueError(
-                        "pending attempt two lacks retry authority"
+                        "pending case exhausted its attempt budget"
                     )
-            write_attempt_start(
-                plan=plan,
-                paths=paths,
-                assignment=assignment,
-                attempt=attempt,
-                manifest_case=manifest_case,
-            )
-            started = _worker_message(
-                plan=plan,
-                lane=lane,
-                seq=sequence,
-                progress_type="case-started",
-                case=assignment.key,
-                attempt=attempt,
-            )
-            ack = publish_progress_and_wait_for_ack(
-                worker_root=worker_root,
-                message=started,
-                timeout=300.0,
-            )
-            sequence += 1
-            if ack.decision != "continue":
-                break
-            if attempt == 2:
-                _reset_case_for_retry(
+                if attempt == 2:
+                    prior = read_attempt_seal(
+                        plan=plan,
+                        paths=paths,
+                        assignment=assignment,
+                        attempt=1,
+                        manifest_case=manifest_case,
+                    )
+                    prior_terminal = prior.terminal
+                    prior_retry = decide_retry(
+                        classification=prior_terminal["classification"],
+                        attempt=1,
+                        model_started=prior_terminal["model_started"],
+                        cleanup_passed=prior_terminal["cleanup_passed"],
+                        fingerprints_unchanged=True,
+                    )
+                    if (
+                        not prior_retry.retry
+                        or prior_retry.next_attempt != 2
+                        or prior_retry.action != "reuse"
+                    ):
+                        raise ValueError(
+                            "pending attempt two lacks retry authority"
+                        )
+                write_attempt_start(
                     plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    attempt=attempt,
+                    manifest_case=manifest_case,
+                )
+                started = _worker_message(
+                    plan=plan,
+                    lane=lane,
+                    seq=sequence,
+                    progress_type="case-started",
+                    case=assignment.key,
+                    attempt=attempt,
+                )
+                ack = publish_progress_and_wait_for_ack(
+                    worker_root=worker_root,
+                    message=started,
+                    timeout=300.0,
+                )
+                sequence += 1
+                if ack.decision != "continue":
+                    stop_assignments = True
+                    break
+                if attempt == 2:
+                    _reset_case_for_retry(
+                        plan=plan,
+                        assignment=assignment,
+                        manifest_case=manifest_case,
+                        paths=paths,
+                    )
+
+                terminal, progress, retry = _drive_worker_attempt(
+                    plan=plan,
+                    lane=lane,
+                    sequence=sequence,
                     assignment=assignment,
                     manifest_case=manifest_case,
                     paths=paths,
+                    attempt=attempt,
+                    runtime_factory=runtime_factory,
+                    case_driver=bound_dependencies.case_driver,
                 )
-
-            terminal, progress, retry = _drive_worker_attempt(
-                plan=plan,
-                lane=lane,
-                sequence=sequence,
-                assignment=assignment,
-                manifest_case=manifest_case,
-                paths=paths,
-                attempt=attempt,
-                runtime_factory=runtime_factory,
-                case_driver=bound_dependencies.case_driver,
-            )
-            ack = publish_progress_and_wait_for_ack(
-                worker_root=worker_root,
-                message=progress,
-                timeout=300.0,
-            )
-            sequence += 1
-            terminals.append(terminal)
-            if ack.decision != "continue":
+                ack = publish_progress_and_wait_for_ack(
+                    worker_root=worker_root,
+                    message=progress,
+                    timeout=300.0,
+                )
+                sequence += 1
+                if terminal.status == "failed" and retry.retry:
+                    if ack.decision == "retry":
+                        continue
+                    if ack.decision == "continue":
+                        raise ValueError(
+                            "retryable failure received continue ACK"
+                        )
+                elif ack.decision == "retry":
+                    raise ValueError(
+                        "non-retryable terminal received retry ACK"
+                    )
+                terminals.append(terminal)
+                if ack.decision != "continue":
+                    stop_assignments = True
                 break
-            if terminal.status == "failed":
+            if stop_assignments:
                 break
 
         shard_path = worker_root

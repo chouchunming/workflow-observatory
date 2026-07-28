@@ -77,7 +77,7 @@ ProgressType = Literal[
     "shard-terminal",
     "worker-stopped",
 ]
-AckDecision = Literal["continue", "stop-launches", "abort"]
+AckDecision = Literal["continue", "retry", "stop-launches", "abort"]
 CoordinatorPhase = Literal[
     "preflight",
     "running",
@@ -98,7 +98,7 @@ MAX_SHARD_COMMIT_BYTES = 64 * 1024
 MAX_PROGRESS_BYTES = 4096
 MAX_PROGRESS_STRING_CHARS = 256
 MAX_TOKEN_COUNT = 2**63 - 1
-MAX_PROTOCOL_RECORDS = 19
+MAX_PROTOCOL_RECORDS = 35
 MAX_PROTOCOL_CRASH_TEMPS = 19
 MAX_PROTOCOL_PENDING_MARKERS = 19
 MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
@@ -7190,7 +7190,7 @@ _PROGRESS_TYPES = {
     "shard-terminal",
     "worker-stopped",
 }
-_ACK_DECISIONS = {"continue", "stop-launches", "abort"}
+_ACK_DECISIONS = {"continue", "retry", "stop-launches", "abort"}
 _PROTOCOL_IDENTITY_FIELDS = frozenset(
     {"schema_version", "epoch_id", "run_kind"}
 )
@@ -7573,16 +7573,59 @@ def _read_progress_attempt(
 ) -> tuple[AttemptSeal, CasePaths]:
     if message.case is None or message.attempt is None:
         raise AssertionError("case-terminal progress lacks a case binding")
-    attempt_seal = _find_attempt_for_shard_terminal(
+    attempt_seal = read_attempt_seal(
         plan=plan,
-        assignment=assignment,
         paths=paths,
+        assignment=assignment,
+        attempt=message.attempt,
         manifest_case=manifest_case,
-        expected_sha256=message.attempt_terminal_sha256,
     )
+    attempts = _open_case_record_directory(
+        paths=paths,
+        components=("attempts",),
+        create=False,
+        label="progress attempt root",
+    )
+    with attempts:
+        inventory = attempts.inventory()
+        if inventory not in (("01",), ("01", "02")):
+            raise ValueError("progress attempt inventory is invalid")
+        if inventory == ("01", "02"):
+            second = _open_record_child_directory(
+                attempts,
+                "02",
+                label="progress attempt two",
+            )
+            with second:
+                second_inventory = second.inventory()
+                retry = decide_retry(
+                    classification=attempt_seal.terminal["classification"],
+                    attempt=attempt_seal.terminal["attempt"],
+                    model_started=attempt_seal.terminal["model_started"],
+                    cleanup_passed=attempt_seal.terminal["cleanup_passed"],
+                    fingerprints_unchanged=True,
+                )
+                retry_history = (
+                    message.attempt == 1
+                    and message.status == "failed"
+                    and retry.retry
+                )
+                if (
+                    not retry_history
+                    and second_inventory != ("start.json", "terminal.json")
+                ):
+                    raise ValueError(
+                        "progress attempt two inventory is invalid"
+                    )
+            if attempts.inventory() != inventory:
+                raise RuntimeError(
+                    "progress attempt inventory changed while reading"
+                )
     terminal = attempt_seal.terminal
     if (
-        terminal.get("attempt") != message.attempt
+        attempt_seal.terminal_sha256
+        != message.attempt_terminal_sha256
+        or terminal.get("attempt") != message.attempt
         or terminal.get("status") != message.status
         or terminal.get("classification") != message.classification
         or terminal.get("model_started") != message.model_started
@@ -7616,6 +7659,24 @@ def _validate_progress_case_commit(
     paths: CasePaths,
     attempt_seal: AttemptSeal,
 ) -> None:
+    retry = decide_retry(
+        classification=attempt_seal.terminal["classification"],
+        attempt=attempt_seal.terminal["attempt"],
+        model_started=attempt_seal.terminal["model_started"],
+        cleanup_passed=attempt_seal.terminal["cleanup_passed"],
+        fingerprints_unchanged=True,
+    )
+    retry_backup = paths.root / "cleanup-attempt-1"
+    if (
+        message.case_commit_sha256 is None
+        and message.status == "failed"
+        and message.attempt == 1
+        and retry.retry
+        and _entry_exists_no_follow(
+            retry_backup, "retry cleanup proof"
+        )
+    ):
+        return
     record = _read_optional_protocol_record(
         paths.sealed / "case-commit.json",
         "progress case commit",
@@ -7623,7 +7684,23 @@ def _validate_progress_case_commit(
     )
     if message.case_commit_sha256 is None:
         if record is not None:
-            raise ValueError("case-terminal progress omitted a durable case commit")
+            later = read_case_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+            if not (
+                message.status == "failed"
+                and message.attempt == 1
+                and retry.retry
+                and later.commit.get("attempt") == 2
+                and later.commit.get("status") == "success"
+            ):
+                raise ValueError(
+                    "case-terminal progress omitted a durable case commit"
+                )
+            return
         try:
             paths.sealed.lstat()
         except FileNotFoundError:
@@ -7733,6 +7810,32 @@ def _validate_progress_case_commit(
         raise ValueError("case-terminal progress case commit binding differs")
 
 
+def _read_retry_tombstone_receipt(
+    *,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    paths: CasePaths,
+) -> VerifiedTombstoneReceipt:
+    case = _open_case_record_directory(
+        paths=paths,
+        components=(),
+        create=False,
+        label="retry case directory",
+    )
+    with case:
+        backup = _open_record_child_directory(
+            case,
+            "cleanup-attempt-1",
+            label="retry cleanup proof",
+        )
+        with backup:
+            return _read_verified_tombstone_receipt_retained(
+                directory=backup,
+                plan=plan,
+                assignment=assignment,
+            )
+
+
 def _validate_progress_tombstone(
     *,
     message: ProgressMessage,
@@ -7741,11 +7844,31 @@ def _validate_progress_tombstone(
     assignment: CaseAssignment,
     paths: CasePaths,
 ) -> None:
-    verified = _read_optional_verified_tombstone_receipt(
-        plan=plan,
-        assignment=assignment,
-        paths=paths,
-    )
+    retry_backup = paths.root / "cleanup-attempt-1"
+    try:
+        retry_backup.lstat()
+    except FileNotFoundError:
+        verified = _read_optional_verified_tombstone_receipt(
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+        )
+    except OSError:
+        raise ValueError("retry cleanup proof is unavailable") from None
+    else:
+        verified = (
+            _read_retry_tombstone_receipt(
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+            if message.attempt == 1
+            else _read_optional_verified_tombstone_receipt(
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+        )
     if message.tombstone_receipt_sha256 is None:
         if terminal.get("cleanup_passed") is True:
             raise ValueError("clean case-terminal progress omitted its receipt")
@@ -7846,6 +7969,39 @@ def _validate_progress_durable(worker_root: Path, message: ProgressMessage) -> N
             manifests=manifests,
             run_root=run_root,
         )
+
+
+def _retry_decision_for_progress(
+    *,
+    worker_root: Path,
+    message: ProgressMessage,
+) -> RetryDecision | None:
+    if message.type != "case-terminal" or message.status != "failed":
+        return None
+    _validate_progress_durable(worker_root, message)
+    _, run_root = _protocol_worker_context(worker_root, message.lane)
+    plan, manifests = _resolve_progress_epoch_context(message)
+    assignment, manifest_case, paths = _resolve_progress_case_context(
+        run_root=run_root,
+        message=message,
+        plan=plan,
+        manifests=manifests,
+    )
+    attempt_seal, _ = _read_progress_attempt(
+        message=message,
+        plan=plan,
+        assignment=assignment,
+        manifest_case=manifest_case,
+        paths=paths,
+    )
+    terminal = attempt_seal.terminal
+    return decide_retry(
+        classification=terminal["classification"],
+        attempt=terminal["attempt"],
+        model_started=terminal["model_started"],
+        cleanup_passed=terminal["cleanup_passed"],
+        fingerprints_unchanged=True,
+    )
 
 
 def _protocol_identity_payload(
@@ -9382,6 +9538,7 @@ class _ProgressAckLedgerState:
     last_sequence: dict[LaneName, int]
     accepted: dict[tuple[LaneName, int], tuple[str, AckDecision]]
     active_cases: dict[LaneName, tuple[CaseKey, int] | None]
+    pending_retries: dict[LaneName, tuple[CaseKey, int] | None]
     completed_attempts: frozenset[tuple[CaseKey, int]]
     epoch_id: str | None
     run_kind: RunKind | None
@@ -9412,6 +9569,9 @@ class ProgressAckLedger:
             active_cases={
                 lane: None for lane in ("E1", "E2", "E3", "APP")
             },
+            pending_retries={
+                lane: None for lane in ("E1", "E2", "E3", "APP")
+            },
             completed_attempts=frozenset(),
             epoch_id=None,
             run_kind=None,
@@ -9440,11 +9600,40 @@ class ProgressAckLedger:
         with self._state_lock:
             return self._state.aborted
 
-    def accept_progress(self, message: ProgressMessage) -> AckDecision:
+    def accept_progress(
+        self,
+        message: ProgressMessage,
+        *,
+        retry_decision: RetryDecision | None = None,
+    ) -> AckDecision:
         with self._state_lock:
             self._require_outermost_transition_locked()
             payload = _encode_progress_message(message)
-            return self._accept_progress_locked(message, payload)
+            if (
+                retry_decision is not None
+                and type(retry_decision) is not RetryDecision
+            ):
+                raise TypeError("retry decision must be exact or null")
+            if retry_decision is None:
+                return self._accept_progress_locked(message, payload)
+            return self._accept_progress_locked(
+                message, payload, retry_decision
+            )
+
+    def accept_durable_progress(
+        self,
+        *,
+        worker_root: Path,
+        message: ProgressMessage,
+    ) -> AckDecision:
+        retry_decision = _retry_decision_for_progress(
+            worker_root=worker_root,
+            message=message,
+        )
+        return self.accept_progress(
+            message,
+            retry_decision=retry_decision,
+        )
 
     def _require_outermost_transition_locked(self) -> None:
         recursion_count = getattr(self._state_lock, "_recursion_count", None)
@@ -9457,6 +9646,7 @@ class ProgressAckLedger:
         self,
         message: ProgressMessage,
         payload: dict[str, object],
+        retry_decision: RetryDecision | None = None,
     ) -> AckDecision:
         state = self._state
         if state.epoch_id is not None and (
@@ -9481,6 +9671,7 @@ class ProgressAckLedger:
             raise ValueError("progress arrived after worker exit")
 
         active = state.active_cases[message.lane]
+        pending_retry = state.pending_retries[message.lane]
         case_attempt: tuple[CaseKey, int] | None = None
         if message.type in ("case-started", "case-terminal"):
             if message.case is None or message.attempt is None:
@@ -9491,6 +9682,10 @@ class ProgressAckLedger:
         if message.type == "case-started":
             if active is not None:
                 raise ValueError("worker started a case before its prior terminal")
+            if pending_retry is not None and case_attempt != pending_retry:
+                raise ValueError("worker retry differs from its ACK authority")
+            if pending_retry is None and message.attempt == 2:
+                raise ValueError("attempt two lacks retry ACK authority")
         if message.type == "case-terminal":
             if active is None:
                 raise ValueError("case terminal lacks launch authority")
@@ -9512,13 +9707,23 @@ class ProgressAckLedger:
         if aborted:
             decision = "abort"
         elif message.type == "case-terminal" and message.status == "failed":
-            aborted = True
-            decision = "abort"
+            if (
+                retry_decision is not None
+                and retry_decision.retry
+                and retry_decision.next_attempt == 2
+                and retry_decision.action == "reuse"
+                and not reaches_ceiling
+            ):
+                decision = "retry"
+            else:
+                aborted = True
+                decision = "abort"
         elif message.type == "shard-terminal" and message.status == "failed":
             aborted = True
             decision = "abort"
         elif message.type == "worker-stopped" and (
             state.active_cases[message.lane] is not None
+            or state.pending_retries[message.lane] is not None
         ):
             aborted = True
             decision = "abort"
@@ -9528,6 +9733,7 @@ class ProgressAckLedger:
             decision = "continue"
 
         active_cases = dict(state.active_cases)
+        pending_retries = dict(state.pending_retries)
         completed_attempts = set(state.completed_attempts)
         exited = set(state.exited)
         if message.type == "case-started" and decision == "continue":
@@ -9537,11 +9743,17 @@ class ProgressAckLedger:
                 message.case,
                 message.attempt,
             )
+            pending_retries[message.lane] = None
         elif message.type == "case-terminal":
             if case_attempt is None:
                 raise AssertionError("case terminal lacks its completed identity")
             completed_attempts.add(case_attempt)
             active_cases[message.lane] = None
+            pending_retries[message.lane] = (
+                (message.case, 2)
+                if decision == "retry" and message.case is not None
+                else None
+            )
         elif message.type == "worker-stopped":
             exited.add(message.lane)
 
@@ -9554,6 +9766,7 @@ class ProgressAckLedger:
             last_sequence=last_sequence,
             accepted=accepted,
             active_cases=active_cases,
+            pending_retries=pending_retries,
             completed_attempts=frozenset(completed_attempts),
             epoch_id=(
                 message.epoch_id if state.epoch_id is None else state.epoch_id
@@ -9582,6 +9795,7 @@ class ProgressAckLedger:
                 last_sequence=state.last_sequence,
                 accepted=state.accepted,
                 active_cases=active_cases,
+                pending_retries=state.pending_retries,
                 completed_attempts=state.completed_attempts,
                 epoch_id=state.epoch_id,
                 run_kind=state.run_kind,
@@ -10837,6 +11051,9 @@ class CoordinatorStateMachine:
             active_cases={
                 lane: None for lane in ("E1", "E2", "E3", "APP")
             },
+            pending_retries={
+                lane: None for lane in ("E1", "E2", "E3", "APP")
+            },
             completed_attempts=set(completed_attempts),
             exited=set(),
             accepted={},
@@ -10980,10 +11197,6 @@ class CoordinatorStateMachine:
                 or message.lane not in self._workers
             ):
                 raise ValueError("progress differs from the coordinator epoch")
-            decision = self._ledger.accept_progress(message)
-            self._guard.checkpoint(
-                f"before ACK {message.lane} sequence {message.seq}"
-            )
             process = self._workers[message.lane]
             worker_root = getattr(process, "worker_root", None)
             if worker_root is None:
@@ -10994,6 +11207,17 @@ class CoordinatorStateMachine:
                     / "workers"
                     / message.lane
                 )
+            decision = (
+                self._ledger.accept_durable_progress(
+                    worker_root=Path(worker_root),
+                    message=message,
+                )
+                if type(self._ledger) is ProgressAckLedger
+                else self._ledger.accept_progress(message)
+            )
+            self._guard.checkpoint(
+                f"before ACK {message.lane} sequence {message.seq}"
+            )
             write_ack(Path(worker_root), message, decision)
             if decision in ("stop-launches", "abort"):
                 self._stop_launches = True
