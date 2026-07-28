@@ -10624,6 +10624,218 @@ sharding.wait_for_ack(worker_root, message, 0.05)
                     "pending|timed out|ValueError",
                 )
 
+    def test_valid_ack_publication_window_is_serialized_from_waiter(self):
+        run_root = self.root / "serialized-valid-ack-publication" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        sharding.write_progress(worker_root, ready)
+        ack_directory = worker_root / "acks"
+        ack_directory.mkdir(mode=0o700)
+        pending = ack_directory / ".000001.json.pending"
+        final = ack_directory / "000001.json"
+
+        real_open_directory = sharding._open_protocol_record_directory
+        real_write_record = sharding._write_protocol_record_retained
+        waiter_at_ack_inventory = threading.Event()
+        writer_in_publication_window = threading.Event()
+        release_waiter = threading.Event()
+        release_writer = threading.Event()
+        waiter_finished = threading.Event()
+        writer_results = []
+        writer_errors = []
+        waiter_results = []
+        waiter_errors = []
+
+        def pause_waiter_before_ack_inventory(
+            worker,
+            directory_name,
+            **kwargs,
+        ):
+            capability = real_open_directory(
+                worker,
+                directory_name,
+                **kwargs,
+            )
+            if (
+                directory_name == "acks"
+                and threading.current_thread().name == "ack-waiter"
+            ):
+                waiter_at_ack_inventory.set()
+                if not release_waiter.wait(2.0):
+                    raise AssertionError("ACK waiter gate was not released")
+            return capability
+
+        def pause_writer_with_pending_marker(
+            directory,
+            name,
+            payload,
+            *,
+            byte_cap,
+        ):
+            if (
+                directory.path == ack_directory
+                and threading.current_thread().name == "ack-writer"
+            ):
+                self.assertTrue(pending.is_file())
+                self.assertFalse(final.exists())
+                writer_in_publication_window.set()
+                if not release_writer.wait(2.0):
+                    raise AssertionError("ACK writer gate was not released")
+            return real_write_record(
+                directory,
+                name,
+                payload,
+                byte_cap=byte_cap,
+            )
+
+        def invoke_writer():
+            try:
+                writer_results.append(
+                    sharding.write_ack(worker_root, ready, "continue")
+                )
+            except BaseException as error:
+                writer_errors.append(error)
+
+        def invoke_waiter():
+            try:
+                waiter_results.append(
+                    sharding.wait_for_ack(worker_root, ready, 1.0)
+                )
+            except BaseException as error:
+                waiter_errors.append(error)
+            finally:
+                waiter_finished.set()
+
+        waiter_finished_during_publication = None
+        with mock.patch.object(
+            sharding,
+            "_open_protocol_record_directory",
+            side_effect=pause_waiter_before_ack_inventory,
+        ), mock.patch.object(
+            sharding,
+            "_write_protocol_record_retained",
+            side_effect=pause_writer_with_pending_marker,
+        ):
+            waiter = threading.Thread(
+                target=invoke_waiter,
+                name="ack-waiter",
+            )
+            writer = threading.Thread(
+                target=invoke_writer,
+                name="ack-writer",
+            )
+            waiter.start()
+            try:
+                self.assertTrue(waiter_at_ack_inventory.wait(2.0))
+                writer.start()
+                self.assertTrue(writer_in_publication_window.wait(2.0))
+                release_waiter.set()
+                waiter_finished_during_publication = waiter_finished.wait(
+                    0.05
+                )
+            finally:
+                release_waiter.set()
+                release_writer.set()
+                if writer.ident is not None:
+                    writer.join(2.0)
+                waiter.join(2.0)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertFalse(
+            waiter_finished_during_publication,
+            "ACK waiter exposed a cooperating publisher's pending window",
+        )
+        self.assertEqual([], writer_errors)
+        self.assertEqual([final], writer_results)
+        self.assertEqual([], waiter_errors)
+        self.assertEqual(1, len(waiter_results))
+        self.assertEqual("continue", waiter_results[0].decision)
+
+    def test_noncooperating_ack_inventory_mutation_remains_fail_closed(self):
+        run_root = self.root / "noncooperating-ack-mutation" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        sharding.write_progress(worker_root, ready)
+        sharding.write_ack(worker_root, ready, "continue")
+        ack_directory = worker_root / "acks"
+        ack_identity = (
+            ack_directory.stat().st_dev,
+            ack_directory.stat().st_ino,
+        )
+
+        real_scandir = sharding.os.scandir
+        inventory_exhausted = threading.Event()
+        release_inventory = threading.Event()
+        reader_errors = []
+
+        class PausedScandir:
+            def __init__(self, entries):
+                self.entries = entries
+
+            def __enter__(self):
+                self.entries.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.entries.__exit__(*args)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self.entries)
+                except StopIteration:
+                    inventory_exhausted.set()
+                    if not release_inventory.wait(2.0):
+                        raise AssertionError(
+                            "ACK inventory gate was not released"
+                        )
+                    raise
+
+        def pause_ack_inventory(path):
+            entries = real_scandir(path)
+            if isinstance(path, int):
+                metadata = os.fstat(path)
+                if (metadata.st_dev, metadata.st_ino) == ack_identity:
+                    return PausedScandir(entries)
+            return entries
+
+        def invoke_reader():
+            try:
+                sharding.wait_for_ack(worker_root, ready, 1.0)
+            except BaseException as error:
+                reader_errors.append(error)
+
+        with mock.patch.object(
+            sharding.os,
+            "scandir",
+            side_effect=pause_ack_inventory,
+        ):
+            reader = threading.Thread(target=invoke_reader)
+            reader.start()
+            try:
+                self.assertTrue(inventory_exhausted.wait(2.0))
+                foreign = ack_directory / "noncooperating-entry"
+                foreign.write_bytes(b"")
+                foreign.chmod(0o600)
+            finally:
+                release_inventory.set()
+                reader.join(2.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(1, len(reader_errors))
+        self.assertIsInstance(reader_errors[0], RuntimeError)
+        self.assertEqual(
+            "ACK inventory changed while scanning",
+            str(reader_errors[0]),
+        )
+
     def test_post_commit_failures_restore_pending_before_writer_raises(self):
         ready = self._lane_message(seq=1, progress_type="lane-ready")
 

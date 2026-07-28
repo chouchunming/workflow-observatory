@@ -9004,40 +9004,52 @@ def _read_ack_for_progress_retained(
         worker,
         operation_deadline=lock_deadline,
     ):
-        expected_name = f"{message.seq:06d}.json"
-        _require_protocol_record_committed_retained(
-            acks,
-            expected_name,
-            label="ACK",
-        )
-        expected_hash = _durable_progress_hash_retained(
+        return _read_ack_for_progress_with_worker_lock_retained(
             worker,
+            acks,
             message,
-            worker_lock_held=True,
         )
-        worker._validate_live()
-        payload, _ = _read_canonical_record_retained(
-            acks,
-            expected_name,
-            "ack",
-            byte_cap=MAX_PROGRESS_BYTES,
-        )
-        ack = _decode_ack(payload)
-        if (
-            ack.epoch_id != message.epoch_id
-            or ack.run_kind != message.run_kind
-            or ack.lane != message.lane
-            or ack.seq != message.seq
-            or ack.message_sha256 != expected_hash
-        ):
-            raise ValueError("ACK differs from durable progress")
-        _require_protocol_record_committed_retained(
-            acks,
-            expected_name,
-            label="ACK",
-        )
-        acks._validate_live()
-        return ack
+
+
+def _read_ack_for_progress_with_worker_lock_retained(
+    worker: _RecordDirectoryCapability,
+    acks: _RecordChildDirectoryCapability,
+    message: ProgressMessage,
+) -> Ack:
+    expected_name = f"{message.seq:06d}.json"
+    _require_protocol_record_committed_retained(
+        acks,
+        expected_name,
+        label="ACK",
+    )
+    expected_hash = _durable_progress_hash_retained(
+        worker,
+        message,
+        worker_lock_held=True,
+    )
+    worker._validate_live()
+    payload, _ = _read_canonical_record_retained(
+        acks,
+        expected_name,
+        "ack",
+        byte_cap=MAX_PROGRESS_BYTES,
+    )
+    ack = _decode_ack(payload)
+    if (
+        ack.epoch_id != message.epoch_id
+        or ack.run_kind != message.run_kind
+        or ack.lane != message.lane
+        or ack.seq != message.seq
+        or ack.message_sha256 != expected_hash
+    ):
+        raise ValueError("ACK differs from durable progress")
+    _require_protocol_record_committed_retained(
+        acks,
+        expected_name,
+        label="ACK",
+    )
+    acks._validate_live()
+    return ack
 
 
 def write_ack(
@@ -9160,75 +9172,84 @@ def wait_for_ack(
                         )
                     except FileNotFoundError:
                         worker._validate_live()
-                sequences = (
-                    ()
-                    if acks is None
-                    else _protocol_sequence_inventory_retained(
-                        acks,
+                with _shared_protocol_worker_lock(
+                    worker,
+                    operation_deadline=deadline,
+                ):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "timed out waiting for progress ACK"
+                        )
+                    _read_worker_protocol_identity_retained(worker, message)
+                    sequences = (
+                        ()
+                        if acks is None
+                        else _protocol_sequence_inventory_retained(
+                            acks,
+                            label="ACK",
+                            deadline=deadline,
+                        )
+                    )
+                    _require_protocol_sequence_prefix(
+                        sequences,
+                        expected_seq=message.seq,
                         label="ACK",
-                        deadline=deadline,
                     )
-                )
-                _require_protocol_sequence_prefix(
-                    sequences,
-                    expected_seq=message.seq,
-                    label="ACK",
-                )
-                if acks is not None:
-                    for sequence in range(1, message.seq):
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(
-                                "timed out waiting for progress ACK"
+                    if acks is not None:
+                        for sequence in range(1, message.seq):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    "timed out waiting for progress ACK"
+                                )
+                            prior_progress = read_progress(
+                                bound_worker
+                                / "progress"
+                                / f"{sequence:06d}.json",
+                                message.lane,
+                                sequence,
                             )
-                        prior_progress = read_progress(
-                            bound_worker
-                            / "progress"
-                            / f"{sequence:06d}.json",
-                            message.lane,
-                            sequence,
+                            worker._validate_live()
+                            _read_ack_for_progress_with_worker_lock_retained(
+                                worker,
+                                acks,
+                                prior_progress,
+                            )
+                        if (
+                            _protocol_sequence_inventory_retained(
+                                acks,
+                                label="ACK",
+                                deadline=deadline,
+                            )
+                            != sequences
+                        ):
+                            raise RuntimeError(
+                                "ACK inventory changed while polling"
+                            )
+                    if message.seq in sequences:
+                        if acks is None:
+                            raise AssertionError(
+                                "ACK inventory exists without a directory"
+                            )
+                        ack = (
+                            _read_ack_for_progress_with_worker_lock_retained(
+                                worker,
+                                acks,
+                                message,
+                            )
                         )
+                        if (
+                            _protocol_sequence_inventory_retained(
+                                acks,
+                                label="ACK",
+                                deadline=deadline,
+                            )
+                            != sequences
+                        ):
+                            raise RuntimeError(
+                                "ACK inventory changed while reading"
+                            )
                         worker._validate_live()
-                        _read_ack_for_progress_retained(
-                            worker,
-                            acks,
-                            prior_progress,
-                            lock_deadline=deadline,
-                        )
-                    if (
-                        _protocol_sequence_inventory_retained(
-                            acks,
-                            label="ACK",
-                            deadline=deadline,
-                        )
-                        != sequences
-                    ):
-                        raise RuntimeError(
-                            "ACK inventory changed while polling"
-                        )
-                if message.seq in sequences:
-                    if acks is None:
-                        raise AssertionError(
-                            "ACK inventory exists without a directory"
-                        )
-                    ack = _read_ack_for_progress_retained(
-                        worker,
-                        acks,
-                        message,
-                        lock_deadline=deadline,
-                    )
-                    if (
-                        _protocol_sequence_inventory_retained(
-                            acks,
-                            label="ACK",
-                            deadline=deadline,
-                        )
-                        != sequences
-                    ):
-                        raise RuntimeError(
-                            "ACK inventory changed while reading"
-                        )
-                    worker._validate_live()
-                    return ack
+                        return ack
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("timed out waiting for progress ACK")
