@@ -244,6 +244,281 @@ class _RetainedDirectory:
     slot: _DescriptorSlot
 
 
+@dataclass(frozen=True)
+class _RetainedUnlinkProof:
+    parent_slot: _DescriptorSlot
+    name: str
+    label: str
+    slot: _DescriptorSlot
+    identity: tuple[int, int]
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    content: bytes
+
+
+def _read_retained_unlink_content(
+    proof: "_RetainedUnlinkProof",
+    *,
+    byte_cap: int,
+    require_original_ctime: bool,
+) -> bytes:
+    metadata = os.fstat(proof.slot.descriptor)
+    _validate_owned_entry(
+        metadata,
+        label=proof.label,
+        kind="file",
+        mode=0o600,
+    )
+    os.lseek(proof.slot.descriptor, 0, os.SEEK_SET)
+    content = bytearray()
+    while True:
+        chunk = os.read(
+            proof.slot.descriptor,
+            min(64 * 1024, byte_cap + 1 - len(content)),
+        )
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > byte_cap:
+            raise ValueError(f"{proof.label} exceeds its byte cap")
+    after = os.fstat(proof.slot.descriptor)
+    if (
+        _stat_identity(metadata) != proof.identity
+        or _stat_identity(after) != proof.identity
+        or after.st_size != proof.size
+        or after.st_mtime_ns != proof.mtime_ns
+        or (
+            require_original_ctime
+            and after.st_ctime_ns != proof.ctime_ns
+        )
+        or bytes(content) != proof.content
+    ):
+        raise ValueError(f"{proof.label} changed before unlink")
+    return bytes(content)
+
+
+def _retain_verified_unlink_proof(
+    *,
+    parent_slot: _DescriptorSlot,
+    name: str,
+    expected_content: bytes | None,
+    label: str,
+    byte_cap: int,
+) -> _RetainedUnlinkProof:
+    if (
+        type(parent_slot) is not _DescriptorSlot
+        or type(name) is not str
+        or not name
+        or "/" in name
+        or name in {".", ".."}
+        or (
+            expected_content is not None
+            and type(expected_content) is not bytes
+        )
+        or type(label) is not str
+        or not label
+        or type(byte_cap) is not int
+        or byte_cap <= 0
+    ):
+        raise TypeError("retained unlink proof arguments are invalid")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_slot.descriptor)
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    proof: _RetainedUnlinkProof | None = None
+    try:
+        metadata = os.fstat(slot.descriptor)
+        _validate_owned_entry(
+            metadata,
+            label=label,
+            kind="file",
+            mode=0o600,
+        )
+        if metadata.st_size > byte_cap:
+            raise ValueError(f"{label} exceeds its byte cap")
+        identity = _stat_identity(metadata)
+        provisional = _RetainedUnlinkProof(
+            parent_slot=parent_slot,
+            name=name,
+            label=label,
+            slot=slot,
+            identity=identity,
+            size=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+            ctime_ns=metadata.st_ctime_ns,
+            content=b"",
+        )
+        os.lseek(slot.descriptor, 0, os.SEEK_SET)
+        content = bytearray()
+        while True:
+            chunk = os.read(
+                slot.descriptor,
+                min(64 * 1024, byte_cap + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > byte_cap:
+                raise ValueError(f"{label} exceeds its byte cap")
+        after = os.fstat(slot.descriptor)
+        named = os.stat(
+            name,
+            dir_fd=parent_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _stat_identity(after) != identity
+            or _stat_identity(named) != identity
+            or after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_ctime_ns != metadata.st_ctime_ns
+            or len(content) != metadata.st_size
+        ):
+            raise ValueError(f"{label} changed while retaining")
+        concrete = bytes(content)
+        if (
+            expected_content is not None
+            and concrete != expected_content
+        ):
+            raise ValueError(f"{label} differs from its verified content")
+        proof = replace(provisional, content=concrete)
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label=f"{label} retention or close failed",
+        )
+    if proof is None:
+        raise AssertionError("retained unlink proof produced no capability")
+    return proof
+
+
+def _unlink_retained_proofs(
+    proofs: Sequence[_RetainedUnlinkProof],
+) -> None:
+    frozen = tuple(proofs)
+    if (
+        not frozen
+        or any(type(proof) is not _RetainedUnlinkProof for proof in frozen)
+        or len({(id(proof.parent_slot), proof.name) for proof in frozen})
+        != len(frozen)
+    ):
+        raise ValueError("retained unlink proofs are invalid")
+    staged: list[tuple[_RetainedUnlinkProof, str]] = []
+    primary: BaseException | None = None
+    try:
+        for proof in frozen:
+            _read_retained_unlink_content(
+                proof,
+                byte_cap=max(proof.size, 1),
+                require_original_ctime=True,
+            )
+            named = os.stat(
+                proof.name,
+                dir_fd=proof.parent_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(named) != proof.identity:
+                raise ValueError(f"{proof.label} changed before unlink")
+            quarantine = (
+                f".{proof.name}.unlink-{os.getpid()}-"
+                f"{secrets.token_hex(16)}"
+            )
+            os.rename(
+                proof.name,
+                quarantine,
+                src_dir_fd=proof.parent_slot.descriptor,
+                dst_dir_fd=proof.parent_slot.descriptor,
+            )
+            staged.append((proof, quarantine))
+            quarantined = os.stat(
+                quarantine,
+                dir_fd=proof.parent_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(quarantined) != proof.identity:
+                raise ValueError(f"{proof.label} changed before unlink")
+            _read_retained_unlink_content(
+                proof,
+                byte_cap=max(proof.size, 1),
+                require_original_ctime=False,
+            )
+        for proof, quarantine in staged:
+            quarantined = os.stat(
+                quarantine,
+                dir_fd=proof.parent_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(quarantined) != proof.identity:
+                raise ValueError(f"{proof.label} changed before unlink")
+            _read_retained_unlink_content(
+                proof,
+                byte_cap=max(proof.size, 1),
+                require_original_ctime=False,
+            )
+        for proof, quarantine in staged:
+            os.unlink(quarantine, dir_fd=proof.parent_slot.descriptor)
+        for parent_slot in {
+            id(proof.parent_slot): proof.parent_slot for proof in frozen
+        }.values():
+            os.fsync(parent_slot.descriptor)
+    except BaseException as error:
+        primary = error
+        rollback_errors: list[BaseException] = []
+        for proof, quarantine in reversed(staged):
+            try:
+                try:
+                    os.stat(
+                        quarantine,
+                        dir_fd=proof.parent_slot.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                try:
+                    os.stat(
+                        proof.name,
+                        dir_fd=proof.parent_slot.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.rename(
+                        quarantine,
+                        proof.name,
+                        src_dir_fd=proof.parent_slot.descriptor,
+                        dst_dir_fd=proof.parent_slot.descriptor,
+                    )
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        for parent_slot in {
+            id(proof.parent_slot): proof.parent_slot for proof in frozen
+        }.values():
+            try:
+                os.fsync(parent_slot.descriptor)
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            errors = [primary, *rollback_errors]
+            group_type = (
+                ExceptionGroup
+                if all(isinstance(item, Exception) for item in errors)
+                else BaseExceptionGroup
+            )
+            primary = group_type(
+                "retained proof unlink and rollback failed",
+                errors,
+            )
+    _retire_task_descriptors(
+        [proof.slot for proof in frozen],
+        primary=primary,
+        label="retained proof unlink or descriptor close failed",
+    )
+
+
 def _require_lease_process_healthy() -> None:
     if _LEASE_PROCESS_POISON is not None:
         raise RuntimeError("lease process is poisoned by an indeterminate close") from (
@@ -9600,6 +9875,61 @@ class ProgressAckLedger:
         with self._state_lock:
             return self._state.aborted
 
+    @property
+    def last_sequence(self) -> dict[LaneName, int]:
+        with self._state_lock:
+            return dict(self._state.last_sequence)
+
+    @property
+    def completed_attempts(self) -> frozenset[tuple[CaseKey, int]]:
+        with self._state_lock:
+            return self._state.completed_attempts
+
+    @property
+    def active_cases(
+        self,
+    ) -> dict[LaneName, tuple[CaseKey, int] | None]:
+        with self._state_lock:
+            return dict(self._state.active_cases)
+
+    @property
+    def pending_retries(
+        self,
+    ) -> dict[LaneName, tuple[CaseKey, int] | None]:
+        with self._state_lock:
+            return dict(self._state.pending_retries)
+
+    @property
+    def exited(self) -> frozenset[LaneName]:
+        with self._state_lock:
+            return self._state.exited
+
+    @property
+    def protocol_identity(self) -> tuple[str | None, RunKind | None]:
+        with self._state_lock:
+            return self._state.epoch_id, self._state.run_kind
+
+    def _fork_for_replay(self) -> "ProgressAckLedger":
+        with self._state_lock:
+            fork = ProgressAckLedger(
+                max_total_tokens=self._max_total_tokens
+            )
+            state = self._state
+            fork._state = _ProgressAckLedgerState(
+                total_tokens=state.total_tokens,
+                last_sequence=dict(state.last_sequence),
+                accepted=dict(state.accepted),
+                active_cases=dict(state.active_cases),
+                pending_retries=dict(state.pending_retries),
+                completed_attempts=state.completed_attempts,
+                epoch_id=state.epoch_id,
+                run_kind=state.run_kind,
+                aborted=state.aborted,
+                stop_launches=state.stop_launches,
+                exited=state.exited,
+            )
+            return fork
+
     def accept_progress(
         self,
         message: ProgressMessage,
@@ -10363,24 +10693,18 @@ def _validate_case_integrity(
         raise ValueError("case integrity result differs from sealed evidence")
 
 
-def _decode_bootstrap_tombstone(
+def _decode_bootstrap_tombstone_records(
     *,
     plan: EpochPlan,
-    run_root: Path,
+    ownership_payload: dict[str, object],
+    ownership_bytes: bytes,
+    receipt_payload: dict[str, object],
+    receipt_bytes: bytes,
 ) -> tuple[BootstrapTombstoneReceipt, str]:
-    cleanup = run_root / "coordinator" / "cleanup"
-    ownership_payload, ownership_bytes = _read_canonical_record(
-        cleanup / "bootstrap-ownership.json",
-        "bootstrap ownership",
-    )
     _require_exact_fields(
         ownership_payload, BootstrapOwnership, "bootstrap ownership"
     )
     ownership = BootstrapOwnership(**ownership_payload)
-    receipt_payload, receipt_bytes = _read_canonical_record(
-        cleanup / "bootstrap-tombstone.json",
-        "bootstrap tombstone",
-    )
     _require_exact_fields(
         receipt_payload, BootstrapTombstoneReceipt, "bootstrap tombstone"
     )
@@ -10414,6 +10738,29 @@ def _decode_bootstrap_tombstone(
     ):
         raise ValueError("bootstrap tombstone is stale or invalid")
     return receipt, hashlib.sha256(receipt_bytes).hexdigest()
+
+
+def _decode_bootstrap_tombstone(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+) -> tuple[BootstrapTombstoneReceipt, str]:
+    cleanup = run_root / "coordinator" / "cleanup"
+    ownership_payload, ownership_bytes = _read_canonical_record(
+        cleanup / "bootstrap-ownership.json",
+        "bootstrap ownership",
+    )
+    receipt_payload, receipt_bytes = _read_canonical_record(
+        cleanup / "bootstrap-tombstone.json",
+        "bootstrap tombstone",
+    )
+    return _decode_bootstrap_tombstone_records(
+        plan=plan,
+        ownership_payload=ownership_payload,
+        ownership_bytes=ownership_bytes,
+        receipt_payload=receipt_payload,
+        receipt_bytes=receipt_bytes,
+    )
 
 
 def _validate_teardown_receipt(
@@ -11025,43 +11372,37 @@ class CoordinatorStateMachine:
     def _seed_resume_protocol(
         self,
         *,
-        total_tokens: int,
-        last_sequence: dict[LaneName, int],
-        completed_attempts: set[tuple[CaseKey, int]],
+        ledger: ProgressAckLedger,
     ) -> None:
         self._require_healthy()
         if (
             self._phase != "tearing-down"
-            or type(total_tokens) is not int
-            or total_tokens < 0
+            or type(ledger) is not ProgressAckLedger
             or self._ledger.total_tokens != 0
-            or type(last_sequence) is not dict
-            or set(last_sequence) != {"E1", "E2", "E3", "APP"}
+            or ledger.max_total_tokens
+            != self._options.max_total_tokens
         ):
             raise ValueError("resume protocol cannot seed this coordinator")
-        reaches_ceiling = (
-            self._options.max_total_tokens is not None
-            and total_tokens >= self._options.max_total_tokens
+        epoch_id, run_kind = ledger.protocol_identity
+        if (
+            (epoch_id is None) != (run_kind is None)
+            or (
+                epoch_id is not None
+                and (
+                    epoch_id != self._plan.epoch_id
+                    or run_kind != self._plan.run_kind
+                )
+            )
+            or any(
+                active is not None
+                for active in ledger.active_cases.values()
+            )
+        ):
+            raise ValueError("resume protocol differs from this coordinator")
+        self._ledger = ledger
+        self._stop_launches = (
+            ledger.stop_launches or ledger.aborted
         )
-        self._ledger._state = _ProgressAckLedgerState(
-            total_tokens=total_tokens,
-            epoch_id=self._plan.epoch_id,
-            run_kind=self._plan.run_kind,
-            last_sequence=dict(last_sequence),
-            active_cases={
-                lane: None for lane in ("E1", "E2", "E3", "APP")
-            },
-            pending_retries={
-                lane: None for lane in ("E1", "E2", "E3", "APP")
-            },
-            completed_attempts=set(completed_attempts),
-            exited=set(),
-            accepted={},
-            stop_launches=reaches_ceiling,
-            aborted=False,
-        )
-        if reaches_ceiling:
-            self._stop_launches = True
 
     def register_worker(self, lane: LaneName, process: subprocess.Popen) -> None:
         self._require_healthy()
@@ -11315,6 +11656,17 @@ class CoordinatorStateMachine:
         self._require_healthy()
         if self._phase not in ("preflight", "running", "cancelling"):
             raise RuntimeError("workers cannot become quiescent in this phase")
+        if self._run_lease is None:
+            raise RuntimeError(
+                "quiescence requires a live run lease bound to the coordinator"
+            )
+        self._run_lease._validate_live()
+        if (
+            self._run_lease._run_root != self._options.run_root
+            or self._run_lease._epoch_id != self._plan.epoch_id
+            or self._run_lease._run_kind != self._plan.run_kind
+        ):
+            raise RuntimeError("coordinator run lease binding changed")
         if (
             self._active_authority is not None
             and not self._active_authority._consumed
@@ -11345,8 +11697,7 @@ class CoordinatorStateMachine:
             coordinator=self,
         )
         self._issued_authorities.append(authority)
-        if self._run_lease is not None:
-            authority._bind_lease(self._run_lease)
+        authority._bind_lease(self._run_lease)
         self._active_authority = authority
         self._phase = "tearing-down"
         return authority
@@ -11378,7 +11729,7 @@ class CoordinatorStateMachine:
             or self._active_authority._consumed
         ):
             raise RuntimeError("teardown requires live quiescent authority")
-        self._active_authority._validate_identity()
+        self._active_authority._validate_live()
 
     def mark_torn_down(self, receipt: TeardownReceipt) -> None:
         self._require_healthy()
@@ -12421,50 +12772,23 @@ def _classify_resume_under_quiescence(
     return resume
 
 
-def _resume_token_total(
-    *,
-    plan: EpochPlan,
-    run_root: Path,
-    manifests: dict[EvalMode, list[dict[str, object]]],
-) -> int:
-    total = 0
-    for assignment in plan.assignments:
-        manifest_case = manifests[assignment.key.mode][
-            assignment.key.ordinal - 1
-        ]
-        paths = paths_for_case(run_root, assignment)
-        for attempt_number, _attempt_paths in enumerate(
-            scan_attempts(
-                paths, plan=plan, manifest_case=manifest_case
-            ),
-            start=1,
-        ):
-            attempt = read_attempt_seal(
-                plan=plan,
-                paths=paths,
-                assignment=assignment,
-                attempt=attempt_number,
-                manifest_case=manifest_case,
-            )
-            usage = attempt.terminal.get("usage")
-            if usage is None:
-                continue
-            validated = _validate_usage(usage, nullable=False)
-            if validated is None:
-                raise AssertionError("resume usage unexpectedly null")
-            total += validated["total_tokens"]
-            if total > MAX_TOKEN_COUNT:
-                raise ValueError("resumed token usage exceeds its bound")
-    return total
-
-
 def _resume_protocol_bindings(
     *,
     plan: EpochPlan,
     run_root: Path,
     manifests: dict[EvalMode, list[dict[str, object]]],
-) -> tuple[dict[LaneName, int], set[tuple[CaseKey, int]]]:
-    last_sequence: dict[LaneName, int] = {}
+    max_total_tokens: int | None,
+) -> ProgressAckLedger:
+    if (
+        type(plan) is not EpochPlan
+        or type(run_root) is not type(Path("."))
+        or not run_root.is_absolute()
+        or type(manifests) is not dict
+    ):
+        raise TypeError("resume protocol replay arguments are invalid")
+    lane_records: dict[
+        LaneName, tuple[tuple[Path, ProgressMessage, Ack], ...]
+    ] = {}
     for lane in ("E1", "E2", "E3", "APP"):
         worker_root = (
             Path(run_root) / "app-server"
@@ -12475,7 +12799,22 @@ def _resume_protocol_bindings(
         try:
             metadata = progress_root.lstat()
         except FileNotFoundError:
-            last_sequence[lane] = 0
+            try:
+                ack_metadata = (worker_root / "acks").lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise ValueError("resume ACK prefix is unavailable") from None
+            else:
+                if (
+                    stat.S_ISLNK(ack_metadata.st_mode)
+                    or not stat.S_ISDIR(ack_metadata.st_mode)
+                    or _directory_inventory(
+                        worker_root / "acks", "resume ACK prefix"
+                    )
+                ):
+                    raise ValueError("resume ACK prefix lacks progress")
+            lane_records[lane] = ()
             continue
         except OSError:
             raise ValueError("resume progress is unavailable") from None
@@ -12498,6 +12837,25 @@ def _resume_protocol_bindings(
         )
         if names != expected or len(names) > MAX_PROTOCOL_RECORDS:
             raise ValueError("resume progress prefix is invalid")
+        ack_root = worker_root / "acks"
+        try:
+            ack_metadata = ack_root.lstat()
+        except FileNotFoundError:
+            raise ValueError(
+                "resume progress lacks its durable ACK"
+            ) from None
+        except OSError:
+            raise ValueError("resume ACK prefix is unavailable") from None
+        if (
+            stat.S_ISLNK(ack_metadata.st_mode)
+            or not stat.S_ISDIR(ack_metadata.st_mode)
+            or stat.S_IMODE(ack_metadata.st_mode) != 0o700
+            or ack_metadata.st_uid != os.geteuid()
+            or _directory_inventory(ack_root, "resume ACK prefix")
+            != names
+        ):
+            raise ValueError("resume durable ACK prefix is invalid")
+        records: list[tuple[Path, ProgressMessage, Ack]] = []
         for sequence, name in enumerate(names, start=1):
             message = read_progress(
                 progress_root / name, lane, sequence
@@ -12507,14 +12865,83 @@ def _resume_protocol_bindings(
                 or message.run_kind != plan.run_kind
             ):
                 raise ValueError("resume progress differs from the plan")
-            try:
-                wait_for_ack(worker_root, message, 0.1)
-            except TimeoutError:
+            ack_payload, _ack_content = _read_canonical_record(
+                ack_root / name,
+                "resume durable ACK",
+                byte_cap=MAX_PROGRESS_BYTES,
+            )
+            ack = _decode_ack(ack_payload)
+            expected_hash = hashlib.sha256(
+                canonical_config_bytes(
+                    _encode_progress_message(message)
+                )
+            ).hexdigest()
+            if (
+                ack.epoch_id != message.epoch_id
+                or ack.run_kind != message.run_kind
+                or ack.lane != message.lane
+                or ack.seq != message.seq
+                or ack.message_sha256 != expected_hash
+            ):
                 raise ValueError(
-                    "resume progress lacks its durable ACK"
-                ) from None
-        last_sequence[lane] = len(names)
-    completed: set[tuple[CaseKey, int]] = set()
+                    "resume durable ACK differs from progress"
+                )
+            records.append((worker_root, message, ack))
+        lane_records[lane] = tuple(records)
+
+    ledger = ProgressAckLedger(max_total_tokens=max_total_tokens)
+    positions: dict[LaneName, int] = {
+        lane: 0 for lane in ("E1", "E2", "E3", "APP")
+    }
+    decision_priority = {
+        "continue": 0,
+        "retry": 0,
+        "stop-launches": 1,
+        "abort": 2,
+    }
+    lane_priority = {
+        lane: index
+        for index, lane in enumerate(("E1", "E2", "E3", "APP"))
+    }
+    remaining = sum(len(records) for records in lane_records.values())
+    while remaining:
+        candidates: list[
+            tuple[int, int, LaneName, ProgressAckLedger]
+        ] = []
+        for lane in ("E1", "E2", "E3", "APP"):
+            index = positions[lane]
+            records = lane_records[lane]
+            if index >= len(records):
+                continue
+            worker_root, message, durable_ack = records[index]
+            candidate = ledger._fork_for_replay()
+            try:
+                decision = candidate.accept_durable_progress(
+                    worker_root=worker_root,
+                    message=message,
+                )
+            except (TypeError, ValueError, RuntimeError) as error:
+                raise ValueError(
+                    "resume durable progress cannot be replayed"
+                ) from error
+            if decision == durable_ack.decision:
+                candidates.append(
+                    (
+                        decision_priority[decision],
+                        lane_priority[lane],
+                        lane,
+                        candidate,
+                    )
+                )
+        if not candidates:
+            raise ValueError(
+                "resume durable ACK differs from exact ledger replay"
+            )
+        _priority, _lane_order, lane, ledger = min(candidates)
+        positions[lane] += 1
+        remaining -= 1
+
+    sealed_attempts: set[tuple[CaseKey, int]] = set()
     for assignment in plan.assignments:
         manifest_case = manifests[assignment.key.mode][
             assignment.key.ordinal - 1
@@ -12523,11 +12950,44 @@ def _resume_protocol_bindings(
         attempts = scan_attempts(
             paths, plan=plan, manifest_case=manifest_case
         )
-        completed.update(
+        sealed_attempts.update(
             (assignment.key, attempt)
             for attempt in range(1, len(attempts) + 1)
         )
-    return last_sequence, completed
+    if ledger.completed_attempts != frozenset(sealed_attempts):
+        raise ValueError(
+            "resume durable progress differs from sealed attempts"
+        )
+    return ledger
+
+
+def _resume_replay_requires_cleanup(
+    *,
+    ledger: ProgressAckLedger,
+    resume: ResumePlan,
+    plan: EpochPlan,
+) -> bool:
+    if (
+        type(ledger) is not ProgressAckLedger
+        or type(resume) is not ResumePlan
+        or type(plan) is not EpochPlan
+        or resume.run_kind != plan.run_kind
+    ):
+        raise TypeError("resume cleanup decision arguments are invalid")
+    planned = {assignment.key for assignment in plan.assignments}
+    if (
+        any(key not in planned for key in resume.reusable)
+        or any(key not in planned for key in resume.pending)
+        or any(key not in planned for key in resume.invalid)
+    ):
+        raise ValueError("resume cleanup decision names an unknown case")
+    return (
+        bool(resume.invalid)
+        or ledger.aborted
+        or ledger.stop_launches
+        or bool(ledger.exited)
+        or any(active is not None for active in ledger.active_cases.values())
+    )
 
 
 def _rearm_bootstrap_before_resume(
@@ -12544,143 +13004,205 @@ def _rearm_bootstrap_before_resume(
         plan=plan,
         run_root=Path(coordinator_root).parent,
     )
-    _bootstrap, bootstrap_sha256 = _decode_bootstrap_tombstone(
-        plan=plan, run_root=lease._run_root
-    )
     try:
         (Path(coordinator_root) / "auth-bootstrap").lstat()
     except FileNotFoundError:
         pass
     else:
         raise ValueError("resume bootstrap was not torn down")
-    teardown_path = Path(coordinator_root) / "teardown.json"
-    payload, _content = _read_canonical_record(
-        teardown_path,
-        "resume coordinator teardown receipt",
-        byte_cap=64 * 1024,
-    )
-    _require_exact_fields(
-        payload, TeardownReceipt, "resume coordinator teardown receipt"
-    )
-    encoded_tombstones = payload.get("tombstone_receipts")
-    if type(encoded_tombstones) is not list:
-        raise ValueError("resume teardown tombstones are invalid")
-    decoded: list[tuple[CaseKey, str]] = []
-    for item in encoded_tombstones:
-        if type(item) is not list or len(item) != 2:
-            raise ValueError("resume teardown tombstone is invalid")
-        key = _decode_case_key(item[0], "resume teardown case")
-        digest = item[1]
-        if type(digest) is not str or not _is_sha256(digest):
-            raise ValueError("resume teardown tombstone hash is invalid")
-        decoded.append((key, digest))
-    decoded_tuple = tuple(decoded)
-    plan_order = tuple(
-        assignment.key
-        for assignment in plan.assignments
-        if assignment.key in {key for key, _digest in decoded_tuple}
-    )
-    if (
-        type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 1
-        or payload.get("epoch_id") != plan.epoch_id
-        or payload.get("run_kind") != plan.run_kind
-        or tuple(key for key, _digest in decoded_tuple) != plan_order
-        or len({key for key, _digest in decoded_tuple})
-        != len(decoded_tuple)
-        or payload.get("bootstrap_tombstone_receipt_sha256")
-        != bootstrap_sha256
-        or payload.get("codex_homes_absent") is not True
-        or payload.get("bootstrap_absent") is not True
-    ):
-        raise ValueError("resume coordinator teardown receipt is stale")
-    assignment_by_key = {
-        assignment.key: assignment for assignment in plan.assignments
-    }
-    for key, expected_digest in decoded_tuple:
-        assignment = assignment_by_key.get(key)
-        if assignment is None:
-            raise ValueError("resume teardown names an unknown case")
-        paths = paths_for_case(lease._run_root, assignment)
-        verified = read_verified_tombstone_receipt(
-            plan=plan, assignment=assignment, paths=paths
-        )
-        if verified.sha256 != expected_digest:
-            raise ValueError("resume teardown tombstone changed")
-    for assignment in plan.assignments:
-        try:
-            paths_for_case(
-                lease._run_root, assignment
-            ).codex_home.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError("resume case Codex home still exists")
     coordinator_descriptor, _metadata = _open_private_directory(
         Path(coordinator_root), "resume coordinator root"
     )
     coordinator_slot = _DescriptorSlot(coordinator_descriptor)
-    primary: BaseException | None = None
-    try:
-        for name in ("teardown.json", "stop-launches.json"):
-            try:
-                metadata = os.stat(
-                    name,
-                    dir_fd=coordinator_slot.descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                continue
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                raise ValueError("resume coordinator terminal is unsafe")
-            os.unlink(name, dir_fd=coordinator_slot.descriptor)
-        os.fsync(coordinator_slot.descriptor)
-    except BaseException as error:
-        primary = error
-    _retire_task_descriptors(
-        [coordinator_slot],
-        primary=primary,
-        label="resume coordinator reset or close failed",
-    )
     cleanup = Path(coordinator_root) / "cleanup"
-    cleanup_descriptor, _metadata = _open_private_directory(
-        cleanup, "resume bootstrap cleanup"
-    )
-    cleanup_slot = _DescriptorSlot(cleanup_descriptor)
-    primary = None
     try:
-        inventory = _directory_inventory(
+        cleanup_descriptor, _metadata = _open_private_directory(
             cleanup, "resume bootstrap cleanup"
         )
+    except BaseException as error:
+        _retire_task_descriptors(
+            [coordinator_slot],
+            primary=error,
+            label="resume proof directory open or close failed",
+        )
+        raise AssertionError(
+            "resume cleanup directory open unexpectedly returned"
+        )
+    cleanup_slot = _DescriptorSlot(cleanup_descriptor)
+    proofs: list[_RetainedUnlinkProof] = []
+    primary: BaseException | None = None
+    try:
+        inventory = tuple(sorted(os.listdir(cleanup_slot.descriptor)))
         if inventory != (
             "bootstrap-ownership.json",
             "bootstrap-tombstone.json",
         ):
             raise ValueError("resume bootstrap proof is incomplete")
-        for name in inventory:
-            metadata = os.stat(
-                name,
-                dir_fd=cleanup_slot.descriptor,
+        teardown_proof = _retain_verified_unlink_proof(
+            parent_slot=coordinator_slot,
+            name="teardown.json",
+            expected_content=None,
+            label="resume coordinator teardown receipt",
+            byte_cap=64 * 1024,
+        )
+        proofs.append(teardown_proof)
+        try:
+            os.stat(
+                "stop-launches.json",
+                dir_fd=coordinator_slot.descriptor,
                 follow_symlinks=False,
             )
+        except FileNotFoundError:
+            stop_proof = None
+        else:
+            stop_proof = _retain_verified_unlink_proof(
+                parent_slot=coordinator_slot,
+                name="stop-launches.json",
+                expected_content=None,
+                label="resume coordinator stop marker",
+                byte_cap=64 * 1024,
+            )
+            proofs.append(stop_proof)
+        ownership_proof = _retain_verified_unlink_proof(
+            parent_slot=cleanup_slot,
+            name="bootstrap-ownership.json",
+            expected_content=None,
+            label="resume bootstrap ownership",
+            byte_cap=64 * 1024,
+        )
+        proofs.append(ownership_proof)
+        tombstone_proof = _retain_verified_unlink_proof(
+            parent_slot=cleanup_slot,
+            name="bootstrap-tombstone.json",
+            expected_content=None,
+            label="resume bootstrap tombstone",
+            byte_cap=64 * 1024,
+        )
+        proofs.append(tombstone_proof)
+
+        def decode_proof(
+            proof: _RetainedUnlinkProof,
+        ) -> dict[str, object]:
+            try:
+                decoded_record = json.loads(proof.content.decode("ascii"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError(
+                    f"{proof.label} is not canonical ASCII JSON"
+                ) from None
             if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) != 0o600
+                type(decoded_record) is not dict
+                or canonical_config_bytes(decoded_record) != proof.content
             ):
-                raise ValueError("resume bootstrap proof is unsafe")
-            os.unlink(name, dir_fd=cleanup_slot.descriptor)
-        os.fsync(cleanup_slot.descriptor)
+                raise ValueError(
+                    f"{proof.label} is not canonical ASCII JSON"
+                )
+            return decoded_record
+
+        ownership_payload = decode_proof(ownership_proof)
+        tombstone_payload = decode_proof(tombstone_proof)
+        _bootstrap, bootstrap_sha256 = (
+            _decode_bootstrap_tombstone_records(
+                plan=plan,
+                ownership_payload=ownership_payload,
+                ownership_bytes=ownership_proof.content,
+                receipt_payload=tombstone_payload,
+                receipt_bytes=tombstone_proof.content,
+            )
+        )
+        payload = decode_proof(teardown_proof)
+        _require_exact_fields(
+            payload,
+            TeardownReceipt,
+            "resume coordinator teardown receipt",
+        )
+        if stop_proof is not None:
+            stop_payload = decode_proof(stop_proof)
+            if (
+                set(stop_payload)
+                != {
+                    "schema_version",
+                    "epoch_id",
+                    "run_kind",
+                    "reason_sha256",
+                }
+                or type(stop_payload.get("schema_version")) is not int
+                or stop_payload.get("schema_version") != 1
+                or stop_payload.get("epoch_id") != plan.epoch_id
+                or stop_payload.get("run_kind") != plan.run_kind
+                or not _is_sha256(stop_payload.get("reason_sha256"))
+            ):
+                raise ValueError("resume coordinator stop marker is stale")
+        encoded_tombstones = payload.get("tombstone_receipts")
+        if type(encoded_tombstones) is not list:
+            raise ValueError("resume teardown tombstones are invalid")
+        decoded: list[tuple[CaseKey, str]] = []
+        for item in encoded_tombstones:
+            if type(item) is not list or len(item) != 2:
+                raise ValueError("resume teardown tombstone is invalid")
+            key = _decode_case_key(item[0], "resume teardown case")
+            digest = item[1]
+            if type(digest) is not str or not _is_sha256(digest):
+                raise ValueError(
+                    "resume teardown tombstone hash is invalid"
+                )
+            decoded.append((key, digest))
+        decoded_tuple = tuple(decoded)
+        plan_order = tuple(
+            assignment.key
+            for assignment in plan.assignments
+            if assignment.key
+            in {key for key, _digest in decoded_tuple}
+        )
+        if (
+            type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != 1
+            or payload.get("epoch_id") != plan.epoch_id
+            or payload.get("run_kind") != plan.run_kind
+            or tuple(key for key, _digest in decoded_tuple) != plan_order
+            or len({key for key, _digest in decoded_tuple})
+            != len(decoded_tuple)
+            or payload.get("bootstrap_tombstone_receipt_sha256")
+            != bootstrap_sha256
+            or payload.get("codex_homes_absent") is not True
+            or payload.get("bootstrap_absent") is not True
+        ):
+            raise ValueError(
+                "resume coordinator teardown receipt is stale"
+            )
+        assignment_by_key = {
+            assignment.key: assignment for assignment in plan.assignments
+        }
+        for key, expected_digest in decoded_tuple:
+            assignment = assignment_by_key.get(key)
+            if assignment is None:
+                raise ValueError(
+                    "resume teardown names an unknown case"
+                )
+            paths = paths_for_case(lease._run_root, assignment)
+            verified = read_verified_tombstone_receipt(
+                plan=plan, assignment=assignment, paths=paths
+            )
+            if verified.sha256 != expected_digest:
+                raise ValueError("resume teardown tombstone changed")
+        for assignment in plan.assignments:
+            try:
+                paths_for_case(
+                    lease._run_root, assignment
+                ).codex_home.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError(
+                    "resume case Codex home still exists"
+                )
+        _unlink_retained_proofs(tuple(proofs))
     except BaseException as error:
         primary = error
     _retire_task_descriptors(
-        [cleanup_slot],
+        [proof.slot for proof in proofs]
+        + [cleanup_slot, coordinator_slot],
         primary=primary,
-        label="resume bootstrap proof reset or close failed",
+        label="resume proof reset or descriptor close failed",
     )
     return prepare_auth_bootstrap(
         source_codex_home=source_codex_home,
@@ -14050,27 +14572,32 @@ def run_parallel_evaluation(
                 lease=run_lease,
                 authority=resume_authority,
             )
-            resume_last_sequence, resume_completed = (
-                _resume_protocol_bindings(
+            try:
+                resume_ledger = _resume_protocol_bindings(
                     plan=plan,
                     run_root=run_root,
                     manifests=frozen_manifests,
+                    max_total_tokens=bound_options.max_total_tokens,
                 )
-            )
-            machine._seed_resume_protocol(
-                total_tokens=_resume_token_total(
-                    plan=plan,
-                    run_root=run_root,
-                    manifests=frozen_manifests,
-                ),
-                last_sequence=resume_last_sequence,
-                completed_attempts=resume_completed,
-            )
-            if resume.invalid or (
-                machine.stop_launches and resume.pending
+            except (TypeError, ValueError, RuntimeError):
+                resume_ledger = None
+                replay_requires_cleanup = True
+            else:
+                replay_requires_cleanup = (
+                    _resume_replay_requires_cleanup(
+                        ledger=resume_ledger,
+                        resume=resume,
+                        plan=plan,
+                    )
+                )
+            if (
+                not replay_requires_cleanup
+                and resume_ledger is not None
             ):
+                machine._seed_resume_protocol(ledger=resume_ledger)
+            if replay_requires_cleanup:
                 machine._cancel_reason = (
-                    "resume snapshot is invalid or token-limited"
+                    "resume snapshot or durable prefix requires cleanup"
                 )
                 machine._stop_launches = True
                 cleanup_only = True

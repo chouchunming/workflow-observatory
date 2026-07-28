@@ -9152,6 +9152,99 @@ class ProgressProtocolTests(unittest.TestCase):
             tombstone_receipt_sha256=None,
         )
 
+    def _case_started_message(self, *, seq, attempt=1):
+        return sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane="E1",
+            seq=seq,
+            type="case-started",
+            case=self.assignment.key,
+            attempt=attempt,
+            status=None,
+            classification=None,
+            model_started=None,
+            usage=None,
+            attempt_terminal_sha256=None,
+            case_commit_sha256=None,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=None,
+        )
+
+    def _write_protocol_prefix(self, worker_root, messages, decisions):
+        self.assertEqual(len(messages), len(decisions))
+        for message, decision in zip(messages, decisions, strict=True):
+            sharding.write_progress(worker_root, message)
+            sharding.write_ack(worker_root, message, decision)
+
+    def test_resume_replays_durable_stop_prefix_into_exact_ledger(self):
+        worker_root = self._worker_root()
+        terminal = self._success_terminal_message(seq=3)
+        messages = (
+            self._lane_message(seq=1, progress_type="lane-ready"),
+            self._case_started_message(seq=2),
+            terminal,
+            self._lane_message(seq=4, progress_type="worker-stopped"),
+        )
+        self._write_protocol_prefix(
+            worker_root,
+            messages,
+            ("continue", "continue", "stop-launches", "stop-launches"),
+        )
+
+        ledger = sharding._resume_protocol_bindings(
+            plan=self.plan,
+            run_root=self.run_root,
+            manifests=self.manifests,
+            max_total_tokens=terminal.usage.total_tokens,
+        )
+
+        self.assertIs(type(ledger), sharding.ProgressAckLedger)
+        self.assertEqual(terminal.usage.total_tokens, ledger.total_tokens)
+        self.assertTrue(ledger.stop_launches)
+        self.assertFalse(ledger.aborted)
+        self.assertEqual(4, ledger._state.last_sequence["E1"])
+        self.assertIn(self.assignment.key, {
+            key for key, _attempt in ledger._state.completed_attempts
+        })
+        self.assertIn("E1", ledger._state.exited)
+        resume = sharding.ResumePlan(
+            run_kind=self.plan.run_kind,
+            reusable=(),
+            pending=(self.assignment.key,),
+            invalid=(),
+        )
+        self.assertTrue(
+            sharding._resume_replay_requires_cleanup(
+                ledger=ledger,
+                resume=resume,
+                plan=self.plan,
+            )
+        )
+
+    def test_resume_rejects_durable_ack_that_does_not_match_replay(self):
+        worker_root = self._worker_root()
+        terminal = self._success_terminal_message(seq=3)
+        messages = (
+            self._lane_message(seq=1, progress_type="lane-ready"),
+            self._case_started_message(seq=2),
+            terminal,
+        )
+        self._write_protocol_prefix(
+            worker_root,
+            messages,
+            ("continue", "continue", "continue"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "durable ACK"):
+            sharding._resume_protocol_bindings(
+                plan=self.plan,
+                run_root=self.run_root,
+                manifests=self.manifests,
+                max_total_tokens=terminal.usage.total_tokens,
+            )
+
     def _failed_terminal_scenario(
         self,
         name,
@@ -9204,6 +9297,133 @@ class ProgressProtocolTests(unittest.TestCase):
             tombstone_receipt_sha256=receipt_sha256,
         )
         return worker_root, message
+
+    def test_resume_replays_durable_abort_prefix(self):
+        worker_root, terminal = self._failed_terminal_scenario(
+            "resume-abort-prefix",
+            cleanup_passed=True,
+            canonical_binding="expected",
+        )
+        terminal = replace(terminal, seq=3)
+        messages = (
+            self._lane_message(seq=1, progress_type="lane-ready"),
+            self._case_started_message(seq=2),
+            terminal,
+            self._lane_message(seq=4, progress_type="worker-stopped"),
+        )
+        self._write_protocol_prefix(
+            worker_root,
+            messages,
+            ("continue", "continue", "abort", "abort"),
+        )
+
+        ledger = sharding._resume_protocol_bindings(
+            plan=self.plan,
+            run_root=worker_root.parent.parent,
+            manifests=self.manifests,
+            max_total_tokens=None,
+        )
+
+        self.assertTrue(ledger.aborted)
+        self.assertFalse(ledger.stop_launches)
+        self.assertIn("E1", ledger._state.exited)
+        self.assertEqual(4, ledger._state.last_sequence["E1"])
+
+    def test_resume_preserves_pending_retry_ack_authority(self):
+        paths, receipt_sha256 = self._new_seal_scenario(
+            "resume-retry-prefix",
+            canonical_binding="expected",
+        )
+        failure_text = "retryable pre-model infrastructure failure"
+        sharding.write_attempt_start(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        sharding.write_attempt_terminal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+            status="failed",
+            classification="pre-model-infrastructure",
+            model_started=False,
+            cleanup_passed=True,
+            usage=None,
+            failure={
+                "classification": "pre-model-infrastructure",
+                "type": "RuntimeError",
+                "chars": len(failure_text),
+                "sha256": hashlib.sha256(
+                    failure_text.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        attempt = sharding.read_attempt_seal(
+            plan=self.plan,
+            paths=paths,
+            assignment=self.assignment,
+            attempt=1,
+            manifest_case=self.manifest_case,
+        )
+        worker_root = self._worker_root(paths.root.parent.parent)
+        terminal = sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane="E1",
+            seq=3,
+            type="case-terminal",
+            case=self.assignment.key,
+            attempt=1,
+            status="failed",
+            classification="pre-model-infrastructure",
+            model_started=False,
+            usage=None,
+            attempt_terminal_sha256=attempt.terminal_sha256,
+            case_commit_sha256=None,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=receipt_sha256,
+        )
+        self._write_protocol_prefix(
+            worker_root,
+            (
+                self._lane_message(seq=1, progress_type="lane-ready"),
+                self._case_started_message(seq=2),
+                terminal,
+            ),
+            ("continue", "continue", "retry"),
+        )
+
+        ledger = sharding._resume_protocol_bindings(
+            plan=self.plan,
+            run_root=worker_root.parent.parent,
+            manifests=self.manifests,
+            max_total_tokens=None,
+        )
+
+        self.assertEqual(
+            (self.assignment.key, 2),
+            ledger.pending_retries["E1"],
+        )
+        self.assertFalse(ledger.aborted)
+        self.assertFalse(ledger.stop_launches)
+        resume = sharding.ResumePlan(
+            run_kind=self.plan.run_kind,
+            reusable=(),
+            pending=(self.assignment.key,),
+            invalid=(),
+        )
+        self.assertFalse(
+            sharding._resume_replay_requires_cleanup(
+                ledger=ledger,
+                resume=resume,
+                plan=self.plan,
+            )
+        )
 
     def _failed_precommit_scenario(
         self,
@@ -13189,6 +13409,233 @@ class CoordinatorStateTests(unittest.TestCase):
         evidence.chmod(0o600)
         return lease, bootstrap, assignment, paths, installed, evidence
 
+    def test_quiescent_authority_requires_live_bound_run_lease(self):
+        machine, _guard = self._new_machine()
+        with self.assertRaisesRegex(RuntimeError, "live run lease"):
+            machine.workers_stopped()
+
+        stale_lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        machine._bind_run_lease(stale_lease)
+        stale_lease.close()
+        with self.assertRaises(RuntimeError):
+            machine.workers_stopped()
+
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            self.assertIs(authority._lease, lease)
+            lease.close()
+            with self.assertRaises(RuntimeError):
+                machine.begin_teardown()
+        finally:
+            if lease.active:
+                lease.close()
+
+    def test_seed_resume_protocol_preserves_exact_replayed_ledger(self):
+        ledger = sharding.ProgressAckLedger(max_total_tokens=0)
+        message = self._lane_message("E1", progress_type="lane-ready")
+        self.assertEqual("stop-launches", ledger.accept_progress(message))
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            machine, _guard = self._new_machine(
+                options=self._options(max_total_tokens=0)
+            )
+            machine._bind_run_lease(lease)
+            machine.workers_stopped()
+            machine._seed_resume_protocol(ledger=ledger)
+            self.assertIs(machine._ledger, ledger)
+            self.assertTrue(machine.stop_launches)
+        finally:
+            if lease.active:
+                lease.close()
+
+    def test_retained_proof_transaction_never_deletes_replacement(self):
+        proof_names = (
+            "teardown.json",
+            "stop-launches.json",
+            "bootstrap-ownership.json",
+            "bootstrap-tombstone.json",
+        )
+        original = b'{"proof":"original"}'
+        replacement = b'{"proof":"replacement"}'
+        for index, name in enumerate(proof_names):
+            with self.subTest(name=name):
+                parent = self.root / f"retained-proof-{index}"
+                parent.mkdir(mode=0o700)
+                path = parent / name
+                path.write_bytes(original)
+                path.chmod(0o600)
+                descriptor, _metadata = sharding._open_private_directory(
+                    parent, f"{name} test parent"
+                )
+                parent_slot = sharding._DescriptorSlot(descriptor)
+                try:
+                    proof = sharding._retain_verified_unlink_proof(
+                        parent_slot=parent_slot,
+                        name=name,
+                        expected_content=original,
+                        label=f"{name} test proof",
+                        byte_cap=4096,
+                    )
+                    real_rename = sharding.os.rename
+                    injected = False
+
+                    def replace_before_rename(
+                        source,
+                        destination,
+                        *,
+                        src_dir_fd=None,
+                        dst_dir_fd=None,
+                    ):
+                        nonlocal injected
+                        if not injected and source == name:
+                            injected = True
+                            path.unlink()
+                            path.write_bytes(replacement)
+                            path.chmod(0o600)
+                        return real_rename(
+                            source,
+                            destination,
+                            src_dir_fd=src_dir_fd,
+                            dst_dir_fd=dst_dir_fd,
+                        )
+
+                    with mock.patch.object(
+                        sharding.os,
+                        "rename",
+                        side_effect=replace_before_rename,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "changed before unlink"
+                        ):
+                            sharding._unlink_retained_proofs((proof,))
+                    self.assertEqual(replacement, path.read_bytes())
+                    self.assertEqual((name,), tuple(
+                        entry.name for entry in parent.iterdir()
+                    ))
+                finally:
+                    sharding._retire_task_descriptors(
+                        [parent_slot],
+                        primary=None,
+                        label="retained proof parent close failed",
+                    )
+
+    def test_rearm_unlinks_only_retained_verified_proofs(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        (
+            lease,
+            bootstrap,
+            assignment,
+            paths,
+            installed,
+            _evidence,
+        ) = self._prepare_case_and_bootstrap()
+        try:
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+            case_receipt = worker.cleanup_case_auth(
+                installed=installed,
+                paths=paths,
+            )
+            sharding.teardown_case_auth(
+                paths=paths,
+                receipt=case_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            bootstrap_receipt = sharding.cleanup_auth_bootstrap(
+                installed=bootstrap,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.teardown_auth_bootstrap(
+                coordinator_root=self.run_root / "coordinator",
+                receipt=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.write_teardown_receipt(
+                plan=self.plan,
+                run_root=self.run_root,
+                tombstones=((assignment.key, case_receipt),),
+                bootstrap=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+        finally:
+            if lease.active:
+                lease.close()
+
+        sharding._atomic_write_record(
+            self.run_root / "coordinator/stop-launches.json",
+            {
+                "schema_version": 1,
+                "epoch_id": self.plan.epoch_id,
+                "run_kind": self.plan.run_kind,
+                "reason_sha256": "a" * 64,
+            },
+        )
+        resumed_lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        resumed_bootstrap = None
+        try:
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(resumed_lease)
+            authority = machine.workers_stopped()
+            resumed_bootstrap = sharding._rearm_bootstrap_before_resume(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                source_codex_home=self.source_codex_home,
+                lease=resumed_lease,
+                authority=authority,
+            )
+            self.assertTrue(resumed_bootstrap.path.is_dir())
+            self.assertFalse(
+                (self.run_root / "coordinator/teardown.json").exists()
+            )
+            self.assertFalse(
+                (self.run_root / "coordinator/stop-launches.json").exists()
+            )
+            self.assertEqual(
+                ("bootstrap-ownership.json",),
+                tuple(sorted(
+                    entry.name
+                    for entry in (
+                        self.run_root / "coordinator/cleanup"
+                    ).iterdir()
+                )),
+            )
+        finally:
+            if (
+                resumed_bootstrap is not None
+                and resumed_bootstrap.descriptor_close_state == "owned"
+            ):
+                sharding._retire_descriptor_capability(
+                    resumed_bootstrap
+                )
+            if resumed_lease.active:
+                resumed_lease.close()
+
     def test_terminal_checkpoint_precedes_ack_and_failure_cancels_all(self):
         machine, _guard = self._new_machine()
         events = []
@@ -13260,6 +13707,7 @@ class CoordinatorStateTests(unittest.TestCase):
             close_error = sharding._retire_descriptor_capability(installed)
             self.assertIsNone(close_error)
             machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
             machine.cancel("worker exited before tombstone")
             authority = machine.workers_stopped()
             machine.begin_teardown()
@@ -13336,6 +13784,7 @@ class CoordinatorStateTests(unittest.TestCase):
                 )
 
             machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
             with self.assertRaises(RuntimeError):
                 machine.begin_teardown()
             authority = machine.workers_stopped()
@@ -13397,6 +13846,7 @@ class CoordinatorStateTests(unittest.TestCase):
                 ).exists()
             )
             machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
             authority = machine.workers_stopped()
             machine.begin_teardown()
             recovered = sharding.recover_auth_bootstrap_cleanup(
@@ -13444,6 +13894,7 @@ class CoordinatorStateTests(unittest.TestCase):
             plan=self.plan,
         )
         machine, _guard = self._new_machine()
+        machine._bind_run_lease(lease)
         authority = machine.workers_stopped()
         machine.begin_teardown()
         real_close = sharding.os.close
@@ -13514,6 +13965,7 @@ class CoordinatorStateTests(unittest.TestCase):
         teardown = None
         try:
             fresh_machine, _guard = self._new_machine()
+            fresh_machine._bind_run_lease(fresh_lease)
             fresh_authority = fresh_machine.workers_stopped()
             fresh_machine.begin_teardown()
             recovered = sharding.recover_auth_bootstrap_cleanup(
@@ -13552,6 +14004,7 @@ class CoordinatorStateTests(unittest.TestCase):
         )
         try:
             verifying_machine, _guard = self._new_machine()
+            verifying_machine._bind_run_lease(verifying_lease)
             verifying_authority = verifying_machine.workers_stopped()
             verifying_machine.begin_teardown()
             self.assertEqual(
@@ -13659,13 +14112,23 @@ class CoordinatorStateTests(unittest.TestCase):
             machine.begin_validation()
         with self.assertRaises(RuntimeError):
             machine.mark_committed()
-        authority = machine.workers_stopped()
-        with self.assertRaises(RuntimeError):
-            machine.workers_stopped()
-        machine.begin_teardown()
-        self.assertFalse(authority.consumed)
-        with self.assertRaises((TypeError, RuntimeError)):
-            sharding.QuiescentRunAuthority()
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            with self.assertRaises(RuntimeError):
+                machine.workers_stopped()
+            machine.begin_teardown()
+            self.assertFalse(authority.consumed)
+            with self.assertRaises((TypeError, RuntimeError)):
+                sharding.QuiescentRunAuthority()
+        finally:
+            if lease.active:
+                lease.close()
 
     def test_option_a_resume_classification_holds_launch_authority(self):
         machine, _guard = self._new_machine()
@@ -13675,6 +14138,7 @@ class CoordinatorStateTests(unittest.TestCase):
             run_kind=self.plan.run_kind,
         )
         try:
+            machine._bind_run_lease(lease)
             authority = machine.workers_stopped()
             observed = []
 
