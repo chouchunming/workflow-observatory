@@ -1,4 +1,4 @@
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, fields, FrozenInstanceError, replace
 import errno
 import hashlib
 import inspect
@@ -16,6 +16,7 @@ import threading
 from typing import get_args, get_type_hints
 import unittest
 from unittest import mock
+import weakref
 
 from scripts import workflow_eval_sharding as sharding
 
@@ -8363,9 +8364,6 @@ class AggregationGateTests(unittest.TestCase):
             "_teardown_receipt_sha256",
             "_guard",
             "_owner_pid",
-            "_claim_lock",
-            "_claim_state",
-            "_issued_capability",
         )
         for field in validated_fields:
             setattr(first, field, getattr(second, field))
@@ -8531,6 +8529,248 @@ class AggregationGateTests(unittest.TestCase):
                         guard=arguments["guard"],
                     )
             repeat_spy.assert_not_called()
+        finally:
+            lease.close()
+
+    def test_live_issuance_binding_cannot_retarget_validated_epoch(self):
+        other_repository = self._new_repository(
+            "issuance-other-repository"
+        )
+        other_fingerprints = replace(
+            input_fingerprints("formal"), archive_sha256="e" * 64
+        )
+        first_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="issuance-first",
+            repository=self.repository,
+        )
+        first_arguments.pop("integrity_calls")
+        second_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="issuance-second",
+            repository=other_repository,
+            fingerprints=other_fingerprints,
+        )
+        second_arguments.pop("integrity_calls")
+        first = sharding.validate_epoch_for_aggregation(**first_arguments)
+        second = sharding.validate_epoch_for_aggregation(**second_arguments)
+        self.assertNotEqual(first.epoch_id, second.epoch_id)
+
+        first_exposed = first._issuance()
+        second_exposed = second._issuance()
+        target_binding = getattr(
+            second_exposed, "binding", second_exposed
+        )
+        with self.subTest(surface="immutable issuance"):
+            with self.assertRaises(
+                (AttributeError, FrozenInstanceError, TypeError)
+            ):
+                if hasattr(first_exposed, "binding"):
+                    first_exposed.binding = target_binding
+                else:
+                    first_exposed.plan = target_binding.plan
+        with self.subTest(surface="state not exposed"):
+            for attribute in (
+                "lock",
+                "claim_state",
+                "issued_capability_ref",
+                "consumed",
+            ):
+                self.assertFalse(hasattr(first_exposed, attribute))
+
+        for field in (
+            "_plan",
+            "_forward_bytes",
+            "_lifecycle_bytes",
+            "_manifest_bytes",
+            "_forward_sha256",
+            "_lifecycle_sha256",
+            "_manifest_sha256",
+            "_evidence_sha256",
+            "_teardown_receipt_sha256",
+            "_guard",
+            "_owner_pid",
+        ):
+            setattr(first, field, getattr(second, field))
+        for surface, operation in (
+            ("issuance", first._issuance),
+            ("nominal", first._validate_nominal),
+            ("property", lambda: first.epoch_id),
+            (
+                "aggregation",
+                lambda: sharding.aggregate_committed_cases(first),
+            ),
+            ("claim", first.claim_formal_commit),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(RuntimeError):
+                    operation()
+
+    def test_live_issuance_binding_cannot_retarget_issued_commit(self):
+        other_repository = self._new_repository(
+            "commit-issuance-other-repository"
+        )
+        other_fingerprints = replace(
+            input_fingerprints("formal"), archive_sha256="e" * 64
+        )
+        first_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="commit-issuance-first",
+            repository=self.repository,
+        )
+        first_arguments.pop("integrity_calls")
+        second_arguments = self._build_valid_epoch(
+            "formal",
+            fixture_name="commit-issuance-second",
+            repository=other_repository,
+            fingerprints=other_fingerprints,
+        )
+        second_arguments.pop("integrity_calls")
+        first = sharding.validate_epoch_for_aggregation(**first_arguments)
+        second = sharding.validate_epoch_for_aggregation(**second_arguments)
+        first_commit = first.claim_formal_commit()
+        second_commit = second.claim_formal_commit()
+        self.assertNotEqual(first_commit.epoch_id, second_commit.epoch_id)
+
+        first_exposed = first_commit._issuance()
+        second_exposed = second_commit._issuance()
+        target_binding = getattr(
+            second_exposed, "binding", second_exposed
+        )
+        second_validated_exposed = second._issuance()
+        with self.subTest(surface="immutable formal issuance"):
+            with self.assertRaises(
+                (AttributeError, FrozenInstanceError, TypeError)
+            ):
+                if hasattr(first_exposed, "binding"):
+                    first_exposed.binding = target_binding
+                else:
+                    first_exposed.plan = target_binding.plan
+        with self.subTest(surface="immutable claim state"):
+            with self.assertRaises(
+                (AttributeError, FrozenInstanceError, TypeError)
+            ):
+                second_validated_exposed.issued_capability_ref = weakref.ref(
+                    first_commit
+                )
+
+        first_commit._validated = second
+        first_commit._owner_pid = second_commit._owner_pid
+        second._issued_capability = first_commit
+        for surface, operation in (
+            ("issuance", first_commit._issuance),
+            ("nominal", first_commit._validate_nominal),
+            ("property", lambda: first_commit.epoch_id),
+            ("consumed", lambda: first_commit.consumed),
+            ("preflight", first_commit._preflight),
+            ("consume", first_commit._consume),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(RuntimeError):
+                    operation()
+
+    def test_consumed_commit_state_cannot_be_reset_or_reused(self):
+        arguments = self._build_valid_epoch(
+            "formal", fixture_name="consume-reset"
+        )
+        arguments.pop("integrity_calls")
+        validated = sharding.validate_epoch_for_aggregation(**arguments)
+        commit = validated.claim_formal_commit()
+        binding = commit._preflight()
+        commit._consume(binding)
+        self.assertTrue(commit.consumed)
+
+        exposed = commit._issuance()
+        with self.subTest(surface="immutable consume state"):
+            with self.assertRaises(
+                (AttributeError, FrozenInstanceError, TypeError)
+            ):
+                exposed.consumed = False
+        commit._consumed = False
+        with self.subTest(surface="consumed property"):
+            self.assertTrue(commit.consumed)
+        for surface, operation in (
+            ("preflight", commit._preflight),
+            ("consume", commit._consume),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(RuntimeError):
+                    operation()
+
+    def test_two_thread_persist_invokes_writer_exactly_once(self):
+        arguments = self._build_valid_epoch(
+            "formal", fixture_name="two-thread-persist"
+        )
+        arguments.pop("integrity_calls")
+        validated = sharding.validate_epoch_for_aggregation(**arguments)
+        commit = validated.claim_formal_commit()
+        destinations = {
+            "forward": self.repository / "results/forward.json",
+            "lifecycle": self.repository / "results/lifecycle.json",
+        }
+        lease = sharding.ResultWriterLease.acquire(
+            self.repository,
+            role="serial-coordinator",
+            run_kind="formal",
+        )
+        try:
+            authority = lease.authority()
+            real_preflight = commit._preflight
+            preflight_barrier = threading.Barrier(2)
+            writer_calls = []
+            writer_lock = threading.Lock()
+            errors = []
+            errors_lock = threading.Lock()
+
+            def synchronized_preflight():
+                binding = real_preflight()
+                preflight_barrier.wait(timeout=5)
+                return binding
+
+            def writer(*_args, **_kwargs):
+                with writer_lock:
+                    writer_calls.append(threading.get_ident())
+                raise OSError("writer entered")
+
+            def persist():
+                try:
+                    sharding.persist_validated_epoch(
+                        commit,
+                        authority=authority,
+                        destinations=destinations,
+                        guard=arguments["guard"],
+                    )
+                except BaseException as error:
+                    with errors_lock:
+                        errors.append(error)
+
+            from scripts import run_observing_workflows_task9_eval as evaluator
+
+            with mock.patch.object(
+                commit,
+                "_preflight",
+                side_effect=synchronized_preflight,
+            ), mock.patch.object(
+                evaluator, "persist_result_pair", side_effect=writer
+            ) as persist_spy:
+                threads = [
+                    threading.Thread(target=persist)
+                    for _index in range(2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+
+            self.assertEqual(1, len(writer_calls))
+            self.assertEqual(1, persist_spy.call_count)
+            self.assertEqual(2, len(errors))
+            self.assertEqual(
+                [OSError, RuntimeError],
+                sorted((type(error) for error in errors), key=lambda item: item.__name__),
+            )
+            self.assertTrue(commit.consumed)
         finally:
             lease.close()
 

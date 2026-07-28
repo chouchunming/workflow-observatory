@@ -2099,26 +2099,6 @@ _VALIDATED_EPOCH_TOKEN = object()
 _FORMAL_COMMIT_TOKEN = object()
 
 
-class _NominalCapabilityRegistry:
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._records = weakref.WeakKeyDictionary()
-
-    def issue(self, capability: object, record: object) -> None:
-        with self._lock:
-            if capability in self._records:
-                raise RuntimeError("capability was already issued")
-            self._records[capability] = record
-
-    def lookup(self, capability: object, label: str) -> object:
-        with self._lock:
-            try:
-                record = self._records[capability]
-            except (KeyError, TypeError):
-                raise RuntimeError(f"{label} was not module-issued") from None
-            return record
-
-
 @dataclass(frozen=True)
 class _CoordinatorGuardBinding:
     repository_root: Path
@@ -2148,12 +2128,11 @@ class _ValidatedEpochBinding:
     owner_pid: int
 
 
+@dataclass(frozen=True)
 class _ValidatedEpochIssuance:
-    def __init__(self, binding: _ValidatedEpochBinding) -> None:
-        self.binding = binding
-        self.lock = threading.RLock()
-        self.claim_state = "validated"
-        self.issued_capability_ref: Any = None
+    binding: _ValidatedEpochBinding
+    claim_state: Literal["validated", "issued"]
+    issued_capability_ref: Any
 
 
 @dataclass(frozen=True)
@@ -2175,16 +2154,245 @@ class _FormalCommitBinding:
     owner_pid: int
 
 
+@dataclass(frozen=True)
 class _FormalCommitIssuance:
-    def __init__(self, binding: _FormalCommitBinding) -> None:
-        self.binding = binding
-        self.lock = threading.RLock()
-        self.consumed = False
+    binding: _FormalCommitBinding
+    consumed: bool
 
 
-_COORDINATOR_GUARD_REGISTRY = _NominalCapabilityRegistry()
-_VALIDATED_EPOCH_REGISTRY = _NominalCapabilityRegistry()
-_FORMAL_COMMIT_REGISTRY = _NominalCapabilityRegistry()
+class _NominalCapabilityRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._guards = weakref.WeakKeyDictionary()
+        self._validated_epochs = weakref.WeakKeyDictionary()
+        self._formal_commits = weakref.WeakKeyDictionary()
+
+    @staticmethod
+    def _lookup_locked(
+        records: weakref.WeakKeyDictionary,
+        capability: object,
+        label: str,
+        expected_type: type,
+    ) -> object:
+        try:
+            snapshot = records[capability]
+        except (KeyError, TypeError):
+            raise RuntimeError(f"{label} was not module-issued") from None
+        if type(snapshot) is not expected_type:
+            raise RuntimeError(f"{label} issuance snapshot changed")
+        return snapshot
+
+    @staticmethod
+    def _issue_locked(
+        records: weakref.WeakKeyDictionary,
+        capability: object,
+        snapshot: object,
+    ) -> None:
+        if capability in records:
+            raise RuntimeError("capability was already issued")
+        records[capability] = snapshot
+
+    def issue_guard(
+        self,
+        guard: object,
+        binding: _CoordinatorGuardBinding,
+    ) -> None:
+        with self._lock:
+            self._issue_locked(self._guards, guard, binding)
+
+    def _guard_binding_locked(
+        self, guard: object
+    ) -> _CoordinatorGuardBinding:
+        binding = self._lookup_locked(
+            self._guards,
+            guard,
+            "CoordinatorGuard",
+            _CoordinatorGuardBinding,
+        )
+        guard._validate_registry_binding(binding)
+        return binding
+
+    def guard_binding(
+        self, guard: object
+    ) -> _CoordinatorGuardBinding:
+        with self._lock:
+            return self._guard_binding_locked(guard)
+
+    def issue_validated(
+        self,
+        validated: object,
+        binding: _ValidatedEpochBinding,
+    ) -> None:
+        with self._lock:
+            self._issue_locked(
+                self._validated_epochs,
+                validated,
+                _ValidatedEpochIssuance(
+                    binding=binding,
+                    claim_state="validated",
+                    issued_capability_ref=None,
+                ),
+            )
+
+    def _validated_snapshot_locked(
+        self, validated: object
+    ) -> tuple[_ValidatedEpochIssuance, object | None]:
+        snapshot = self._lookup_locked(
+            self._validated_epochs,
+            validated,
+            "ValidatedEpoch",
+            _ValidatedEpochIssuance,
+        )
+        issued_capability = (
+            None
+            if snapshot.issued_capability_ref is None
+            else snapshot.issued_capability_ref()
+        )
+        if (
+            snapshot.claim_state == "validated"
+            and snapshot.issued_capability_ref is not None
+        ) or (
+            snapshot.claim_state == "issued"
+            and snapshot.issued_capability_ref is None
+        ):
+            raise RuntimeError("ValidatedEpoch issuance state changed")
+        validated._validate_registry_binding(snapshot.binding)
+        guard_binding = self._guard_binding_locked(snapshot.binding.guard)
+        if (
+            guard_binding is not snapshot.binding.guard_binding
+            or guard_binding.repository_root
+            != snapshot.binding.repository_root
+            or guard_binding.repository_key
+            != snapshot.binding.repository_key
+            or guard_binding.baseline is not snapshot.binding.baseline
+            or guard_binding.baseline_rows
+            is not snapshot.binding.baseline_rows
+        ):
+            raise RuntimeError("ValidatedEpoch guard binding changed")
+        return snapshot, issued_capability
+
+    def validated_binding(
+        self, validated: object
+    ) -> _ValidatedEpochBinding:
+        with self._lock:
+            snapshot, _issued_capability = (
+                self._validated_snapshot_locked(validated)
+            )
+            return snapshot.binding
+
+    def issue_formal(
+        self,
+        commit: object,
+        binding: _FormalCommitBinding,
+    ) -> None:
+        with self._lock:
+            self._issue_locked(
+                self._formal_commits,
+                commit,
+                _FormalCommitIssuance(
+                    binding=binding,
+                    consumed=False,
+                ),
+            )
+
+    def claim_formal(self, validated: object) -> object:
+        with self._lock:
+            snapshot, _issued_capability = (
+                self._validated_snapshot_locked(validated)
+            )
+            if snapshot.binding.plan.run_kind != "formal":
+                raise RuntimeError(
+                    "only a formal validated epoch can claim commit"
+                )
+            if snapshot.claim_state != "validated":
+                raise RuntimeError(
+                    "formal commit capability was already claimed"
+                )
+            capability = FormalCommitCapability(
+                _FORMAL_COMMIT_TOKEN,
+                validated=validated,
+                validated_binding=snapshot.binding,
+            )
+            self._validated_epochs[validated] = replace(
+                snapshot,
+                claim_state="issued",
+                issued_capability_ref=weakref.ref(capability),
+            )
+            return capability
+
+    def _formal_snapshot_locked(
+        self, commit: object
+    ) -> _FormalCommitIssuance:
+        snapshot = self._lookup_locked(
+            self._formal_commits,
+            commit,
+            "FormalCommitCapability",
+            _FormalCommitIssuance,
+        )
+        validated = snapshot.binding.validated_ref()
+        commit._validate_registry_binding(snapshot.binding)
+        if type(validated) is not ValidatedEpoch:
+            raise RuntimeError("FormalCommitCapability issuer changed")
+        validated_snapshot, issued_capability = (
+            self._validated_snapshot_locked(validated)
+        )
+        if (
+            validated_snapshot.binding
+            is not snapshot.binding.validated_binding
+            or validated_snapshot.claim_state != "issued"
+            or issued_capability is not commit
+        ):
+            raise RuntimeError(
+                "FormalCommitCapability provenance binding changed"
+            )
+        return snapshot
+
+    def formal_binding(
+        self, commit: object
+    ) -> _FormalCommitBinding:
+        with self._lock:
+            return self._formal_snapshot_locked(commit).binding
+
+    def formal_preflight(
+        self, commit: object
+    ) -> _FormalCommitBinding:
+        with self._lock:
+            snapshot = self._formal_snapshot_locked(commit)
+            if snapshot.consumed:
+                raise RuntimeError(
+                    "formal commit capability was already consumed"
+                )
+            return snapshot.binding
+
+    def formal_consumed(self, commit: object) -> bool:
+        with self._lock:
+            return self._formal_snapshot_locked(commit).consumed
+
+    def consume_formal(
+        self,
+        commit: object,
+        expected_binding: _FormalCommitBinding | None,
+    ) -> _FormalCommitBinding:
+        with self._lock:
+            snapshot = self._formal_snapshot_locked(commit)
+            if (
+                expected_binding is not None
+                and snapshot.binding is not expected_binding
+            ):
+                raise RuntimeError(
+                    "formal commit capability preflight binding changed"
+                )
+            if snapshot.consumed:
+                raise RuntimeError(
+                    "formal commit capability was already consumed"
+                )
+            self._formal_commits[commit] = replace(
+                snapshot, consumed=True
+            )
+            return snapshot.binding
+
+
+_CAPABILITY_REGISTRY = _NominalCapabilityRegistry()
 
 
 class CoordinatorGuard:
@@ -2204,7 +2412,7 @@ class CoordinatorGuard:
         self._baseline = baseline
         self._baseline_rows = baseline_rows
         self._owner_pid = os.getpid()
-        _COORDINATOR_GUARD_REGISTRY.issue(
+        _CAPABILITY_REGISTRY.issue_guard(
             self,
             _CoordinatorGuardBinding(
                 repository_root=repository_root,
@@ -2230,14 +2438,9 @@ class CoordinatorGuard:
             baseline_rows=rows,
         )
 
-    def _validate_nominal(self) -> _CoordinatorGuardBinding:
-        if type(self) is not CoordinatorGuard:
-            raise TypeError("CoordinatorGuard must be exact")
-        binding = _COORDINATOR_GUARD_REGISTRY.lookup(
-            self, "CoordinatorGuard"
-        )
-        if type(binding) is not _CoordinatorGuardBinding:
-            raise RuntimeError("CoordinatorGuard issuance record changed")
+    def _validate_registry_binding(
+        self, binding: _CoordinatorGuardBinding
+    ) -> None:
         if binding.owner_pid != os.getpid():
             raise RuntimeError("CoordinatorGuard belongs to another process")
         if (
@@ -2250,7 +2453,11 @@ class CoordinatorGuard:
             or not _is_sha256(self._baseline.fingerprint)
         ):
             raise RuntimeError("CoordinatorGuard provenance binding changed")
-        return binding
+
+    def _validate_nominal(self) -> _CoordinatorGuardBinding:
+        if type(self) is not CoordinatorGuard:
+            raise TypeError("CoordinatorGuard must be exact")
+        return _CAPABILITY_REGISTRY.guard_binding(self)
 
     @property
     def baseline(self) -> ProductionSnapshot:
@@ -2354,33 +2561,18 @@ class ValidatedEpoch:
             baseline_rows=guard_binding.baseline_rows,
             owner_pid=self._owner_pid,
         )
-        issuance = _ValidatedEpochIssuance(binding)
-        self._claim_lock = issuance.lock
-        self._claim_state = issuance.claim_state
-        self._issued_capability: FormalCommitCapability | None = None
-        _VALIDATED_EPOCH_REGISTRY.issue(self, issuance)
+        _CAPABILITY_REGISTRY.issue_validated(self, binding)
 
-    def _issuance(self) -> _ValidatedEpochIssuance:
+    def _issuance(self) -> _ValidatedEpochBinding:
         if type(self) is not ValidatedEpoch:
             raise TypeError("ValidatedEpoch must be exact")
-        issuance = _VALIDATED_EPOCH_REGISTRY.lookup(
-            self, "ValidatedEpoch"
-        )
-        if type(issuance) is not _ValidatedEpochIssuance:
-            raise RuntimeError("ValidatedEpoch issuance record changed")
-        return issuance
+        return _CAPABILITY_REGISTRY.validated_binding(self)
 
-    def _validate_issuance_locked(
-        self, issuance: _ValidatedEpochIssuance
-    ) -> _ValidatedEpochBinding:
-        binding = issuance.binding
+    def _validate_registry_binding(
+        self, binding: _ValidatedEpochBinding
+    ) -> None:
         if binding.owner_pid != os.getpid():
             raise RuntimeError("ValidatedEpoch belongs to another process")
-        issued_capability = (
-            None
-            if issuance.issued_capability_ref is None
-            else issuance.issued_capability_ref()
-        )
         if (
             self._owner_pid != binding.owner_pid
             or self._plan is not binding.plan
@@ -2394,9 +2586,6 @@ class ValidatedEpoch:
             or self._teardown_receipt_sha256
             != binding.teardown_receipt_sha256
             or self._guard is not binding.guard
-            or self._claim_lock is not issuance.lock
-            or self._claim_state != issuance.claim_state
-            or self._issued_capability is not issued_capability
             or type(self._plan) is not EpochPlan
             or binding.plan.run_kind not in ("discovery", "formal")
             or not _is_sha256(binding.evidence_sha256)
@@ -2404,21 +2593,9 @@ class ValidatedEpoch:
             or type(self._guard) is not CoordinatorGuard
         ):
             raise RuntimeError("ValidatedEpoch provenance binding changed")
-        guard_binding = binding.guard._validate_nominal()
-        if (
-            guard_binding is not binding.guard_binding
-            or guard_binding.repository_root != binding.repository_root
-            or guard_binding.repository_key != binding.repository_key
-            or guard_binding.baseline is not binding.baseline
-            or guard_binding.baseline_rows is not binding.baseline_rows
-        ):
-            raise RuntimeError("ValidatedEpoch guard binding changed")
-        return binding
 
     def _validate_nominal(self) -> _ValidatedEpochBinding:
-        issuance = self._issuance()
-        with issuance.lock:
-            return self._validate_issuance_locked(issuance)
+        return self._issuance()
 
     @property
     def run_kind(self) -> RunKind:
@@ -2433,23 +2610,12 @@ class ValidatedEpoch:
         return self._validate_nominal().teardown_receipt_sha256
 
     def claim_formal_commit(self) -> "FormalCommitCapability":
-        issuance = self._issuance()
-        with issuance.lock:
-            binding = self._validate_issuance_locked(issuance)
-            if binding.plan.run_kind != "formal":
-                raise RuntimeError("only a formal validated epoch can claim commit")
-            if issuance.claim_state != "validated":
-                raise RuntimeError("formal commit capability was already claimed")
-            capability = FormalCommitCapability(
-                _FORMAL_COMMIT_TOKEN,
-                validated=self,
-                validated_binding=binding,
-            )
-            issuance.issued_capability_ref = weakref.ref(capability)
-            issuance.claim_state = "issued"
-            self._issued_capability = capability
-            self._claim_state = issuance.claim_state
-            return capability
+        if type(self) is not ValidatedEpoch:
+            raise TypeError("ValidatedEpoch must be exact")
+        capability = _CAPABILITY_REGISTRY.claim_formal(self)
+        if type(capability) is not FormalCommitCapability:
+            raise RuntimeError("formal commit issuance returned an invalid type")
+        return capability
 
 
 class FormalCommitCapability:
@@ -2483,25 +2649,16 @@ class FormalCommitCapability:
             baseline_rows=validated_binding.baseline_rows,
             owner_pid=self._owner_pid,
         )
-        issuance = _FormalCommitIssuance(binding)
-        self._consume_lock = issuance.lock
-        self._consumed = False
-        _FORMAL_COMMIT_REGISTRY.issue(self, issuance)
+        _CAPABILITY_REGISTRY.issue_formal(self, binding)
 
-    def _issuance(self) -> _FormalCommitIssuance:
+    def _issuance(self) -> _FormalCommitBinding:
         if type(self) is not FormalCommitCapability:
             raise TypeError("FormalCommitCapability must be exact")
-        issuance = _FORMAL_COMMIT_REGISTRY.lookup(
-            self, "FormalCommitCapability"
-        )
-        if type(issuance) is not _FormalCommitIssuance:
-            raise RuntimeError("FormalCommitCapability issuance record changed")
-        return issuance
+        return _CAPABILITY_REGISTRY.formal_binding(self)
 
-    def _validate_issuance_locked(
-        self, issuance: _FormalCommitIssuance
-    ) -> _FormalCommitBinding:
-        binding = issuance.binding
+    def _validate_registry_binding(
+        self, binding: _FormalCommitBinding
+    ) -> None:
         validated = binding.validated_ref()
         if binding.owner_pid != os.getpid():
             raise RuntimeError("FormalCommitCapability belongs to another process")
@@ -2509,47 +2666,17 @@ class FormalCommitCapability:
             self._owner_pid != binding.owner_pid
             or validated is None
             or self._validated is not validated
-            or self._consume_lock is not issuance.lock
-            or self._consumed != issuance.consumed
             or binding.plan.run_kind != "formal"
         ):
             raise RuntimeError("FormalCommitCapability provenance binding changed")
-        if type(validated) is not ValidatedEpoch:
-            raise RuntimeError("FormalCommitCapability issuer changed")
-        validated_issuance = validated._issuance()
-        with validated_issuance.lock:
-            current_binding = validated._validate_issuance_locked(
-                validated_issuance
-            )
-            issued_capability = (
-                None
-                if validated_issuance.issued_capability_ref is None
-                else validated_issuance.issued_capability_ref()
-            )
-            if (
-                current_binding is not binding.validated_binding
-                or validated_issuance.claim_state != "issued"
-                or issued_capability is not self
-            ):
-                raise RuntimeError(
-                    "FormalCommitCapability provenance binding changed"
-                )
-        return binding
 
     def _validate_nominal(self) -> _FormalCommitBinding:
-        issuance = self._issuance()
-        with issuance.lock:
-            return self._validate_issuance_locked(issuance)
+        return self._issuance()
 
     def _preflight(self) -> _FormalCommitBinding:
-        issuance = self._issuance()
-        with issuance.lock:
-            binding = self._validate_issuance_locked(issuance)
-            if issuance.consumed:
-                raise RuntimeError(
-                    "formal commit capability was already consumed"
-                )
-            return binding
+        if type(self) is not FormalCommitCapability:
+            raise TypeError("FormalCommitCapability must be exact")
+        return _CAPABILITY_REGISTRY.formal_preflight(self)
 
     @property
     def epoch_id(self) -> str:
@@ -2562,30 +2689,19 @@ class FormalCommitCapability:
 
     @property
     def consumed(self) -> bool:
-        issuance = self._issuance()
-        with issuance.lock:
-            self._validate_issuance_locked(issuance)
-            return issuance.consumed
+        if type(self) is not FormalCommitCapability:
+            raise TypeError("FormalCommitCapability must be exact")
+        return _CAPABILITY_REGISTRY.formal_consumed(self)
 
     def _consume(
         self,
         expected_binding: _FormalCommitBinding | None = None,
     ) -> _FormalCommitBinding:
-        issuance = self._issuance()
-        with issuance.lock:
-            binding = self._validate_issuance_locked(issuance)
-            if (
-                expected_binding is not None
-                and binding is not expected_binding
-            ):
-                raise RuntimeError(
-                    "formal commit capability preflight binding changed"
-                )
-            if issuance.consumed:
-                raise RuntimeError("formal commit capability was already consumed")
-            issuance.consumed = True
-            self._consumed = True
-            return binding
+        if type(self) is not FormalCommitCapability:
+            raise TypeError("FormalCommitCapability must be exact")
+        return _CAPABILITY_REGISTRY.consume_formal(
+            self, expected_binding
+        )
 
 
 def _open_regular_file(path: Path, label: str) -> tuple[int, os.stat_result]:
