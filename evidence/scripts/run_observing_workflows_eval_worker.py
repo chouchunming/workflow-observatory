@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -13,14 +14,18 @@ import subprocess
 import sys
 import time
 from types import ModuleType
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from scripts.run_observing_workflows_task9_eval import (
     AUTH_CLEANUP_MAX_DEPTH,
     AUTH_CLEANUP_MAX_ENTRIES,
+    CaseCleanupFailure,
     CaseEventSink,
     CaseExecution,
+    CaseInfrastructureFailure,
     CaseRuntime,
+    CaseTransportFailure,
+    ProcessSurvivalCleanupFailure,
     RuntimePayloadAudit,
     _contains_process_survival_failure,
     _raise_case_and_auth_cleanup_failures,
@@ -33,14 +38,21 @@ from scripts.workflow_eval_sharding import (
     CaseAuthOwnership,
     CasePaths,
     EpochPlan,
+    FailureSummary,
     InstalledCaseAuth,
+    MAX_PROTOCOL_RECORDS,
     ProgressMessage,
     ResolvedTransportConfig,
     RetryDecision,
+    ShardTerminal,
     TombstoneReceipt,
+    TokenUsage,
+    WorkerDependencies,
     _DescriptorSlot,
     _atomic_write_record,
+    _decode_epoch_plan_record,
     _decode_case_key,
+    _decode_resume_plan_record,
     _read_canonical_record,
     _require_exact_fields,
     _retire_descriptor_capability,
@@ -48,14 +60,23 @@ from scripts.workflow_eval_sharding import (
     _validate_wait_timeout,
     _write_progress_with_deadline,
     canonical_run_root,
+    canonical_config_bytes,
     decide_retry,
     install_case_auth,
     is_indeterminate_descriptor_close,
     paths_for_case,
+    read_attempt_seal,
     read_case_auth_ownership as _read_case_auth_ownership,
+    read_case_seal,
+    read_progress,
     read_tombstone_receipt,
+    scan_attempts,
+    seal_case,
+    seal_shard,
     stage_marketplace_for_case,
     wait_for_ack,
+    write_attempt_start,
+    write_attempt_terminal,
 )
 
 
@@ -1092,3 +1113,962 @@ def build_production_runtime_factory(
         transport_config=transport_config,
         plan=plan,
     )
+
+
+def production_worker_dependencies(
+    *,
+    snapshot_root: Path,
+    transport_config: ResolvedTransportConfig,
+    plan: EpochPlan,
+) -> WorkerDependencies:
+    if not isinstance(transport_config, ResolvedTransportConfig):
+        raise TypeError("transport_config must be ResolvedTransportConfig")
+    if type(plan) is not EpochPlan:
+        raise TypeError("plan must be exact EpochPlan")
+    runtime_factory = build_production_runtime_factory(
+        snapshot_root=snapshot_root,
+        transport_config=transport_config,
+        plan=plan,
+    )
+    case_driver = build_production_case_driver(
+        snapshot_root=snapshot_root,
+        transport_config=transport_config,
+    )
+    return WorkerDependencies(
+        runtime_factory=runtime_factory,
+        case_driver=case_driver,
+    )
+
+
+def _worker_root(run_root: Path, lane: str) -> Path:
+    return (
+        run_root / "app-server"
+        if lane == "APP"
+        else run_root / "workers" / lane
+    )
+
+
+def _load_worker_manifests(
+    snapshot_root: Path,
+) -> dict[str, list[dict[str, object]]]:
+    root = Path(snapshot_root)
+    bases = (
+        root / "evidence/tests/skill_evals",
+        root / "plugins/workflow-observer/tests/skill_evals",
+        root
+        / "workflow-observatory/plugins/workflow-observer/tests/skill_evals",
+    )
+    matches = [
+        base
+        for base in bases
+        if (base / "observing_workflows_cases.json").is_file()
+        and (
+            base / "observing_workflows_lifecycle_cases.json"
+        ).is_file()
+    ]
+    if not matches:
+        raise ValueError("captured worker manifests are unavailable")
+    base = matches[0]
+    try:
+        forward_content = (
+            base / "observing_workflows_cases.json"
+        ).read_bytes()
+        lifecycle_content = (
+            base / "observing_workflows_lifecycle_cases.json"
+        ).read_bytes()
+        forward = json.loads(forward_content)
+        lifecycle = json.loads(lifecycle_content)
+    except (OSError, json.JSONDecodeError):
+        raise ValueError("captured worker manifests are invalid") from None
+    if (
+        type(forward) is not list
+        or type(lifecycle) is not list
+        or any(type(row) is not dict for row in forward + lifecycle)
+    ):
+        raise ValueError("captured worker manifests are invalid")
+    return {"forward": forward, "lifecycle": lifecycle}
+
+
+def _load_worker_transport_config(
+    *, run_root: Path, plan: EpochPlan
+) -> ResolvedTransportConfig:
+    payload, content = _read_canonical_record(
+        run_root / "coordinator/transport-config.json",
+        "sealed transport config",
+    )
+    _require_exact_fields(
+        payload, ResolvedTransportConfig, "sealed transport config"
+    )
+    config = ResolvedTransportConfig(**payload)
+    if (
+        hashlib.sha256(content).hexdigest()
+        != plan.fingerprints.transport_config_sha256
+        or canonical_config_bytes(payload) != content
+    ):
+        raise ValueError("sealed transport config differs from the epoch plan")
+    return config
+
+
+def _worker_message(
+    *,
+    plan: EpochPlan,
+    lane: str,
+    seq: int,
+    progress_type: str,
+    case=None,
+    attempt=None,
+    status=None,
+    classification=None,
+    model_started=None,
+    usage=None,
+    attempt_terminal_sha256=None,
+    case_commit_sha256=None,
+    shard_commit_sha256=None,
+    tombstone_receipt_sha256=None,
+) -> ProgressMessage:
+    return ProgressMessage(
+        schema_version=1,
+        epoch_id=plan.epoch_id,
+        run_kind=plan.run_kind,
+        lane=lane,
+        seq=seq,
+        type=progress_type,
+        case=case,
+        attempt=attempt,
+        status=status,
+        classification=classification,
+        model_started=model_started,
+        usage=usage,
+        attempt_terminal_sha256=attempt_terminal_sha256,
+        case_commit_sha256=case_commit_sha256,
+        shard_commit_sha256=shard_commit_sha256,
+        tombstone_receipt_sha256=tombstone_receipt_sha256,
+    )
+
+
+def _inventory_file_count(path: Path) -> int:
+    try:
+        entries = tuple(path.iterdir())
+    except OSError:
+        raise ValueError("worker evidence directory is unavailable") from None
+    for entry in entries:
+        metadata = entry.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("worker evidence directory contains a non-file")
+    return len(entries)
+
+
+def _audit_event_count(path: Path) -> int:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except (OSError, UnicodeDecodeError):
+        raise ValueError("worker audit log is unavailable") from None
+    return len(content.splitlines())
+
+
+def _next_worker_sequence(worker_root: Path, lane: str) -> int:
+    progress = Path(worker_root) / "progress"
+    try:
+        metadata = progress.lstat()
+    except FileNotFoundError:
+        return 1
+    except OSError:
+        raise ValueError("worker progress prefix is unavailable") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("worker progress prefix is unsafe")
+    progress_names: list[str] = []
+    with os.scandir(progress) as entries:
+        for entry in entries:
+            if len(progress_names) >= MAX_PROTOCOL_RECORDS:
+                raise ValueError(
+                    "worker progress prefix exceeds its cap"
+                )
+            progress_names.append(entry.name)
+    names = tuple(sorted(progress_names))
+    expected = tuple(
+        f"{sequence:06d}.json"
+        for sequence in range(1, len(names) + 1)
+    )
+    if names != expected or len(names) > MAX_PROTOCOL_RECORDS:
+        raise ValueError("worker progress prefix is invalid")
+    for sequence, name in enumerate(names, start=1):
+        message = read_progress(progress / name, lane, sequence)
+        try:
+            wait_for_ack(worker_root, message, 0.1)
+        except TimeoutError:
+            raise ValueError(
+                "worker progress lacks its durable ACK"
+            ) from None
+    return len(names) + 1
+
+
+def _reset_case_for_retry(
+    *,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
+    paths: CasePaths,
+) -> None:
+    first = read_attempt_seal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        attempt=1,
+        manifest_case=manifest_case,
+    )
+    receipt = read_tombstone_receipt(
+        plan=plan, assignment=assignment, paths=paths
+    )
+    if (
+        first.terminal.get("tombstone_receipt_sha256")
+        != hashlib.sha256(
+            canonical_config_bytes(asdict(receipt))
+        ).hexdigest()
+        or receipt.canonical_binding != "expected"
+    ):
+        raise ValueError("retry cleanup proof differs from attempt one")
+    try:
+        paths.codex_home.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("retry Codex home was not torn down")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    root_slot = _DescriptorSlot(os.open(paths.root, flags))
+    primary: BaseException | None = None
+    try:
+        names = tuple(sorted(entry.name for entry in os.scandir(root_slot.descriptor)))
+        allowed = {
+            "attempts",
+            "cleanup",
+            "staging",
+            "workspace",
+            "store",
+            "audit",
+            "payload",
+            "output",
+            "home",
+            "tmp",
+            "config",
+            "cache",
+            "sealed",
+        }
+        if any(name not in allowed for name in names):
+            raise ValueError("retry case contains an unknown entry")
+        remaining = [AUTH_CLEANUP_MAX_ENTRIES]
+        for name in names:
+            if name in ("attempts", "cleanup"):
+                continue
+            if remaining[0] <= 0:
+                raise OSError("retry reset bound exceeded")
+            remaining[0] -= 1
+            _remove_tree_entry(
+                root_slot.descriptor,
+                name,
+                depth=1,
+                remaining=remaining,
+                charged=True,
+            )
+        cleanup_slot = _DescriptorSlot(
+            os.open(paths.cleanup, flags)
+        )
+        cleanup_primary: BaseException | None = None
+        try:
+            cleanup_names = tuple(
+                sorted(
+                    entry.name
+                    for entry in os.scandir(cleanup_slot.descriptor)
+                )
+            )
+            if cleanup_names != ("ownership.json", "tombstone.json"):
+                raise ValueError("retry cleanup proof is incomplete")
+            for name in cleanup_names:
+                metadata = os.stat(
+                    name,
+                    dir_fd=cleanup_slot.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise ValueError("retry cleanup proof is unsafe")
+        except BaseException as error:
+            cleanup_primary = error
+        close_error = _retire_descriptor_capability(cleanup_slot)
+        _raise_case_and_auth_cleanup_failures(
+            cleanup_primary,
+            [close_error] if close_error is not None else [],
+        )
+        try:
+            os.stat(
+                "cleanup-attempt-1",
+                dir_fd=root_slot.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("retry cleanup backup already exists")
+        os.rename(
+            "cleanup",
+            "cleanup-attempt-1",
+            src_dir_fd=root_slot.descriptor,
+            dst_dir_fd=root_slot.descriptor,
+        )
+        os.mkdir(
+            "cleanup", mode=0o700, dir_fd=root_slot.descriptor
+        )
+        os.fsync(root_slot.descriptor)
+    except BaseException as error:
+        primary = error
+    close_error = _retire_descriptor_capability(root_slot)
+    _raise_case_and_auth_cleanup_failures(
+        primary, [close_error] if close_error is not None else []
+    )
+
+
+def _worker_failure_leaves(error: BaseException) -> tuple[BaseException, ...]:
+    nested = getattr(error, "exceptions", ())
+    if isinstance(nested, (tuple, list)) and nested:
+        return tuple(
+            leaf
+            for child in nested
+            if isinstance(child, BaseException)
+            for leaf in _worker_failure_leaves(child)
+        )
+    return (error,)
+
+
+def _classify_worker_failure(
+    error: BaseException, *, model_started: bool
+) -> str:
+    leaves = _worker_failure_leaves(error)
+    if any(
+        isinstance(leaf, ProcessSurvivalCleanupFailure)
+        for leaf in leaves
+    ):
+        return "surviving-process"
+    if any(isinstance(leaf, CaseCleanupFailure) for leaf in leaves):
+        return "cleanup"
+    for leaf in leaves:
+        if isinstance(leaf, CaseTransportFailure):
+            classification = leaf.classification
+            if leaf.retryable is False and classification == (
+                "pre-model-infrastructure"
+            ):
+                return "protocol"
+            if classification in (
+                "model",
+                "pre-model-infrastructure",
+                "timeout",
+                "protocol",
+                "post-start-transport",
+            ):
+                return classification
+            return "protocol"
+    if any(isinstance(leaf, TimeoutError) for leaf in leaves):
+        return "timeout"
+    if any(isinstance(leaf, CaseInfrastructureFailure) for leaf in leaves):
+        return (
+            "post-start-transport"
+            if model_started
+            else "pre-model-infrastructure"
+        )
+    if any(isinstance(leaf, AssertionError) for leaf in leaves):
+        return "semantic"
+    return "protocol" if model_started else "pre-model-infrastructure"
+
+
+def _worker_failure_summary(
+    error: BaseException, classification: str
+) -> tuple[dict[str, object], FailureSummary]:
+    rendered = str(error)
+    error_type = type(error).__name__
+    if not error_type or len(error_type) > 128 or not all(
+        character.isalnum() or character in "._-"
+        for character in error_type
+    ):
+        error_type = "WorkerFailure"
+    payload = {
+        "classification": classification,
+        "type": error_type,
+        "chars": min(len(rendered), 200),
+        "sha256": hashlib.sha256(
+            rendered.encode("utf-8", errors="replace")
+        ).hexdigest(),
+    }
+    return payload, FailureSummary(**payload)
+
+
+def _drive_worker_attempt(
+    *,
+    plan: EpochPlan,
+    lane: str,
+    sequence: int,
+    assignment: CaseAssignment,
+    manifest_case: dict[str, object],
+    paths: CasePaths,
+    attempt: int,
+    runtime_factory: RuntimeFactory,
+    case_driver: CaseDriver,
+) -> tuple[ShardTerminal, ProgressMessage, RetryDecision]:
+    observed_model_start = False
+
+    def event_sink(event, _pid, _pgid):
+        nonlocal observed_model_start
+        if event == "model-started":
+            observed_model_start = True
+
+    try:
+        driven = case_driver(
+            assignment=assignment,
+            manifest_case=manifest_case,
+            paths=paths,
+            runtime_factory=runtime_factory,
+            event_sink=event_sink,
+        )
+        if not isinstance(driven, DrivenCase):
+            raise TypeError("case driver must return DrivenCase")
+        if not observed_model_start:
+            raise ValueError("successful worker case never started a model")
+    except BaseException as error:
+        if worker_exit_required(error, runtime_factory):
+            raise
+        try:
+            verified_receipt = read_tombstone_receipt(
+                plan=plan,
+                assignment=assignment,
+                paths=paths,
+            )
+        except (OSError, TypeError, ValueError):
+            verified_receipt = None
+        cleanup_passed = (
+            verified_receipt is not None
+            and verified_receipt.canonical_binding == "expected"
+        )
+        classification = _classify_worker_failure(
+            error, model_started=observed_model_start
+        )
+        failure_payload, failure = _worker_failure_summary(
+            error, classification
+        )
+        write_attempt_terminal(
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=attempt,
+            manifest_case=manifest_case,
+            status="failed",
+            classification=classification,
+            model_started=observed_model_start,
+            cleanup_passed=cleanup_passed,
+            usage=None,
+            failure=failure_payload,
+        )
+        attempt_seal = read_attempt_seal(
+            plan=plan,
+            paths=paths,
+            assignment=assignment,
+            attempt=attempt,
+            manifest_case=manifest_case,
+        )
+        tombstone_sha256 = attempt_seal.terminal.get(
+            "tombstone_receipt_sha256"
+        )
+        retry = decide_retry(
+            classification=classification,
+            attempt=attempt,
+            model_started=observed_model_start,
+            cleanup_passed=cleanup_passed,
+            fingerprints_unchanged=True,
+        )
+        terminal = ShardTerminal(
+            key=assignment.key,
+            run_kind=plan.run_kind,
+            status="failed",
+            classification=classification,
+            attempt_terminal_sha256=attempt_seal.terminal_sha256,
+            case_commit_sha256=None,
+            tombstone_receipt_sha256=tombstone_sha256,
+            failure=failure,
+        )
+        progress = _worker_message(
+            plan=plan,
+            lane=lane,
+            seq=sequence,
+            progress_type="case-terminal",
+            case=assignment.key,
+            attempt=attempt,
+            status="failed",
+            classification=classification,
+            model_started=observed_model_start,
+            attempt_terminal_sha256=attempt_seal.terminal_sha256,
+            tombstone_receipt_sha256=tombstone_sha256,
+        )
+        return terminal, progress, retry
+
+    verified_receipt = read_tombstone_receipt(
+        plan=plan,
+        assignment=assignment,
+        paths=paths,
+    )
+    if verified_receipt.canonical_binding != "expected":
+        raise ValueError("worker cleanup did not retain expected tombstone")
+    execution_usage = driven.execution.usage
+    if not isinstance(execution_usage, TokenUsage):
+        raise TypeError("case execution usage must be TokenUsage")
+    usage = asdict(execution_usage)
+    write_attempt_terminal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        attempt=attempt,
+        manifest_case=manifest_case,
+        status="success",
+        classification="success",
+        model_started=True,
+        cleanup_passed=True,
+        usage=usage,
+        failure=None,
+    )
+    evidence = {
+        "status": "success",
+        "classification": "success",
+        "model_started": True,
+        "elapsed_milliseconds": 0,
+        "usage": usage,
+        "failure": None,
+        "store_record_count": len(tuple(paths.store.rglob("*.md"))),
+        "store_invalidated_count": len(
+            tuple(paths.store.rglob("*.invalidated"))
+        ),
+        "audit_event_count": _audit_event_count(
+            paths.audit / "payload-audit.jsonl"
+        ),
+        "payload_file_count": _inventory_file_count(paths.payload),
+        "output_file_count": _inventory_file_count(paths.output),
+        "process_cleanup_passed": True,
+        "credential_cleanup_passed": True,
+    }
+    seal_case(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        attempt=attempt,
+        result=driven.result,
+        evidence=evidence,
+        manifest_case=manifest_case,
+        fault_injector=None,
+    )
+    attempt_seal = read_attempt_seal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        attempt=attempt,
+        manifest_case=manifest_case,
+    )
+    case_seal = read_case_seal(
+        plan=plan,
+        paths=paths,
+        assignment=assignment,
+        manifest_case=manifest_case,
+    )
+    terminal = ShardTerminal(
+        key=assignment.key,
+        run_kind=plan.run_kind,
+        status="success",
+        classification="success",
+        attempt_terminal_sha256=attempt_seal.terminal_sha256,
+        case_commit_sha256=case_seal.commit_sha256,
+        tombstone_receipt_sha256=case_seal.tombstone_receipt_sha256,
+        failure=None,
+    )
+    progress = _worker_message(
+        plan=plan,
+        lane=lane,
+        seq=sequence,
+        progress_type="case-terminal",
+        case=assignment.key,
+        attempt=attempt,
+        status="success",
+        classification="success",
+        model_started=True,
+        usage=execution_usage,
+        attempt_terminal_sha256=attempt_seal.terminal_sha256,
+        case_commit_sha256=case_seal.commit_sha256,
+        tombstone_receipt_sha256=case_seal.tombstone_receipt_sha256,
+    )
+    return (
+        terminal,
+        progress,
+        decide_retry(
+            classification="success",
+            attempt=attempt,
+            model_started=True,
+            cleanup_passed=True,
+            fingerprints_unchanged=True,
+        ),
+    )
+
+
+def _run_worker_impl(
+    *,
+    lane: str,
+    plan: EpochPlan,
+    run_root: Path,
+    snapshot_root: Path,
+    resume,
+    dependencies: WorkerDependencies | None = None,
+) -> Path:
+    if type(lane) is not str or lane not in ("E1", "E2", "E3", "APP"):
+        raise ValueError("worker lane is invalid")
+    if type(plan) is not EpochPlan:
+        raise TypeError("plan must be exact EpochPlan")
+    root = canonical_run_root(run_root)
+    plan_payload, _plan_content = _read_canonical_record(
+        root / "coordinator/epoch-plan.json",
+        "sealed epoch plan",
+        byte_cap=64 * 1024,
+    )
+    sealed_plan = _decode_epoch_plan_record(plan_payload)
+    if sealed_plan != plan:
+        raise ValueError("worker plan differs from sealed epoch plan")
+    if resume is None:
+        raise ValueError("worker resume plan is unavailable")
+    if resume.invalid:
+        raise ValueError("worker cannot launch an invalid resume plan")
+    transport_config = _load_worker_transport_config(
+        run_root=root, plan=plan
+    )
+    bound_dependencies = (
+        production_worker_dependencies(
+            snapshot_root=snapshot_root,
+            transport_config=transport_config,
+            plan=plan,
+        )
+        if dependencies is None
+        else dependencies
+    )
+    if type(bound_dependencies) is not WorkerDependencies:
+        raise TypeError("dependencies must be exact WorkerDependencies")
+    if (
+        not callable(bound_dependencies.runtime_factory)
+        or not callable(bound_dependencies.case_driver)
+    ):
+        raise TypeError("worker dependencies must be callable")
+    manifests = _load_worker_manifests(snapshot_root)
+    if (
+        hashlib.sha256(
+            json.dumps(
+                manifests["forward"],
+                indent=2,
+                ensure_ascii=True,
+            ).encode("utf-8")
+            + b"\n"
+        ).hexdigest()
+        != plan.fingerprints.forward_manifest_sha256
+        or hashlib.sha256(
+            json.dumps(
+                manifests["lifecycle"],
+                indent=2,
+                ensure_ascii=True,
+            ).encode("utf-8")
+            + b"\n"
+        ).hexdigest()
+        != plan.fingerprints.lifecycle_manifest_sha256
+    ):
+        raise ValueError("captured worker manifests differ from the epoch plan")
+    lane_assignments = tuple(
+        assignment for assignment in plan.assignments if assignment.lane == lane
+    )
+    reusable_keys = set(resume.reusable)
+    pending_keys = set(resume.pending)
+    assignments = tuple(
+        assignment
+        for assignment in lane_assignments
+        if assignment.key in pending_keys
+    )
+    worker_root = _worker_root(root, lane)
+    _secure_directory(worker_root, anchor=root)
+    sequence = _next_worker_sequence(worker_root, lane)
+    terminals: list[ShardTerminal] = []
+    case_paths: dict[object, CasePaths] = {}
+    runtime_factory = bound_dependencies.runtime_factory
+    try:
+        for assignment in lane_assignments:
+            if assignment.key not in reusable_keys:
+                continue
+            manifest_case = manifests[assignment.key.mode][
+                assignment.key.ordinal - 1
+            ]
+            paths = paths_for_case(root, assignment)
+            case_paths[assignment.key] = paths
+            attempts = scan_attempts(
+                paths, plan=plan, manifest_case=manifest_case
+            )
+            if len(attempts) not in (1, 2):
+                raise ValueError("reusable case has invalid attempt count")
+            attempt_seal = read_attempt_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=len(attempts),
+                manifest_case=manifest_case,
+            )
+            case_seal = read_case_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                manifest_case=manifest_case,
+            )
+            terminals.append(
+                ShardTerminal(
+                    key=assignment.key,
+                    run_kind=plan.run_kind,
+                    status="success",
+                    classification="success",
+                    attempt_terminal_sha256=attempt_seal.terminal_sha256,
+                    case_commit_sha256=case_seal.commit_sha256,
+                    tombstone_receipt_sha256=(
+                        case_seal.tombstone_receipt_sha256
+                    ),
+                    failure=None,
+                )
+            )
+        ready = _worker_message(
+            plan=plan,
+            lane=lane,
+            seq=sequence,
+            progress_type="lane-ready",
+        )
+        ack = publish_progress_and_wait_for_ack(
+            worker_root=worker_root,
+            message=ready,
+            timeout=300.0,
+        )
+        sequence += 1
+        if ack.decision != "continue":
+            assignments = ()
+
+        for assignment in assignments:
+            manifest_case = manifests[assignment.key.mode][
+                assignment.key.ordinal - 1
+            ]
+            if manifest_case.get("id") != assignment.key.case_id:
+                raise ValueError("worker manifest ordinal binding changed")
+            paths = paths_for_case(root, assignment)
+            case_paths[assignment.key] = paths
+            _secure_directory(paths.root, anchor=root)
+            _secure_directory(paths.cleanup, anchor=root)
+            _secure_directory(paths.attempts, anchor=root)
+            prior_attempts = scan_attempts(
+                paths, plan=plan, manifest_case=manifest_case
+            )
+            attempt = len(prior_attempts) + 1
+            if attempt not in (1, 2):
+                raise ValueError("pending case exhausted its attempt budget")
+            if attempt == 2:
+                prior = read_attempt_seal(
+                    plan=plan,
+                    paths=paths,
+                    assignment=assignment,
+                    attempt=1,
+                    manifest_case=manifest_case,
+                )
+                terminal = prior.terminal
+                retry = decide_retry(
+                    classification=terminal["classification"],
+                    attempt=1,
+                    model_started=terminal["model_started"],
+                    cleanup_passed=terminal["cleanup_passed"],
+                    fingerprints_unchanged=True,
+                )
+                if (
+                    not retry.retry
+                    or retry.next_attempt != 2
+                    or retry.action != "reuse"
+                ):
+                    raise ValueError(
+                        "pending attempt two lacks retry authority"
+                    )
+            write_attempt_start(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=attempt,
+                manifest_case=manifest_case,
+            )
+            started = _worker_message(
+                plan=plan,
+                lane=lane,
+                seq=sequence,
+                progress_type="case-started",
+                case=assignment.key,
+                attempt=attempt,
+            )
+            ack = publish_progress_and_wait_for_ack(
+                worker_root=worker_root,
+                message=started,
+                timeout=300.0,
+            )
+            sequence += 1
+            if ack.decision != "continue":
+                break
+            if attempt == 2:
+                _reset_case_for_retry(
+                    plan=plan,
+                    assignment=assignment,
+                    manifest_case=manifest_case,
+                    paths=paths,
+                )
+
+            terminal, progress, retry = _drive_worker_attempt(
+                plan=plan,
+                lane=lane,
+                sequence=sequence,
+                assignment=assignment,
+                manifest_case=manifest_case,
+                paths=paths,
+                attempt=attempt,
+                runtime_factory=runtime_factory,
+                case_driver=bound_dependencies.case_driver,
+            )
+            ack = publish_progress_and_wait_for_ack(
+                worker_root=worker_root,
+                message=progress,
+                timeout=300.0,
+            )
+            sequence += 1
+            terminals.append(terminal)
+            if ack.decision != "continue":
+                break
+            if terminal.status == "failed":
+                break
+
+        shard_path = worker_root
+        shard_status = (
+            "failed"
+            if terminals and terminals[-1].status == "failed"
+            else "success"
+        )
+        if (
+            len(terminals) == len(lane_assignments)
+            or shard_status == "failed"
+        ):
+            shard_path = seal_shard(
+                worker_root=worker_root,
+                plan=plan,
+                lane=lane,
+                terminals=terminals,
+                manifests=manifests,
+                case_paths=case_paths,
+                fault_injector=None,
+            )
+            shard_content = shard_path.read_bytes()
+            shard_message = _worker_message(
+                plan=plan,
+                lane=lane,
+                seq=sequence,
+                progress_type="shard-terminal",
+                status=shard_status,
+                shard_commit_sha256=hashlib.sha256(
+                    shard_content
+                ).hexdigest(),
+            )
+            publish_progress_and_wait_for_ack(
+                worker_root=worker_root,
+                message=shard_message,
+                timeout=300.0,
+            )
+            sequence += 1
+        stopped = _worker_message(
+            plan=plan,
+            lane=lane,
+            seq=sequence,
+            progress_type="worker-stopped",
+        )
+        publish_progress_and_wait_for_ack(
+            worker_root=worker_root,
+            message=stopped,
+            timeout=300.0,
+        )
+        return shard_path
+    finally:
+        runtime_factory.close()
+
+
+def run_worker(
+    *,
+    lane: str,
+    plan: EpochPlan,
+    run_root: Path,
+    snapshot_root: Path,
+    dependencies: WorkerDependencies | None = None,
+) -> Path:
+    from scripts.workflow_eval_sharding import ResumePlan
+
+    return _run_worker_impl(
+        lane=lane,
+        plan=plan,
+        run_root=run_root,
+        snapshot_root=snapshot_root,
+        resume=ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=tuple(
+                assignment.key for assignment in plan.assignments
+            ),
+            invalid=(),
+        ),
+        dependencies=dependencies,
+    )
+
+
+def worker_main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run one sealed parallel evaluation lane."
+    )
+    parser.add_argument(
+        "--lane", required=True, choices=("E1", "E2", "E3", "APP")
+    )
+    parser.add_argument("--run-root", required=True, type=Path)
+    parser.add_argument("--snapshot-root", required=True, type=Path)
+    parser.add_argument("--epoch-id", required=True)
+    parser.add_argument("--resume-plan-hex", required=True)
+    arguments = parser.parse_args(argv)
+    run_root = canonical_run_root(arguments.run_root)
+    payload, _content = _read_canonical_record(
+        run_root / "coordinator/epoch-plan.json",
+        "sealed epoch plan",
+        byte_cap=64 * 1024,
+    )
+    plan = _decode_epoch_plan_record(payload)
+    if plan.epoch_id != arguments.epoch_id:
+        raise ValueError("worker epoch argument differs from sealed plan")
+    try:
+        resume_content = bytes.fromhex(arguments.resume_plan_hex)
+        resume_payload = json.loads(resume_content)
+    except (ValueError, json.JSONDecodeError):
+        raise ValueError("worker resume plan argument is invalid") from None
+    if canonical_config_bytes(resume_payload) != resume_content:
+        raise ValueError("worker resume plan argument is non-canonical")
+    resume = _decode_resume_plan_record(resume_payload, plan=plan)
+    _run_worker_impl(
+        lane=arguments.lane,
+        plan=plan,
+        run_root=run_root,
+        snapshot_root=arguments.snapshot_root,
+        resume=resume,
+        dependencies=None,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(worker_main())

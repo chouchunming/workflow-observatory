@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -18,7 +19,24 @@ import threading
 import time
 import tomllib
 import weakref
-from typing import Any, Callable, Literal, Mapping, Sequence
+import zipfile
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    Protocol,
+    Sequence,
+)
+
+if TYPE_CHECKING:
+    from scripts.run_observing_workflows_task9_eval import (
+        CaseEventSink,
+        CaseExecution,
+        CaseRuntime,
+    )
+    from scripts.run_observing_workflows_eval_worker import DrivenCase
 
 
 RunKind = Literal["diagnostic", "discovery", "formal"]
@@ -60,6 +78,17 @@ ProgressType = Literal[
     "worker-stopped",
 ]
 AckDecision = Literal["continue", "stop-launches", "abort"]
+CoordinatorPhase = Literal[
+    "preflight",
+    "running",
+    "cancelling",
+    "tearing-down",
+    "validating",
+    "validated",
+    "commit-ready",
+    "committed",
+    "failed",
+]
 MAX_ATTEMPT_START_BYTES = 4 * 1024
 MAX_ATTEMPT_TERMINAL_BYTES = 8 * 1024
 MAX_CASE_RESULT_BYTES = 64 * 1024
@@ -2094,9 +2123,89 @@ class ProductionSnapshot:
     entries: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class ParallelOptions:
+    run_kind: RunKind
+    run_root: Path
+    source_codex_home: Path
+    codex_executable: Path
+    requested_model: str | None = None
+    requested_reasoning_effort: str | None = None
+    resume_run_root: Path | None = None
+    max_total_tokens: int | None = None
+
+
+class RuntimeFactory(Protocol):
+    @property
+    def poisoned(self) -> bool: ...
+
+    def __call__(
+        self,
+        *,
+        assignment: CaseAssignment,
+        manifest_case: dict[str, object],
+        paths: CasePaths,
+        transport_config: ResolvedTransportConfig,
+    ) -> "CaseRuntime": ...
+
+    def cleanup_case(self, paths: CasePaths) -> TombstoneReceipt: ...
+
+    def close(self) -> None: ...
+
+
+class CaseDriver(Protocol):
+    def __call__(
+        self,
+        *,
+        assignment: CaseAssignment,
+        manifest_case: dict[str, object],
+        paths: CasePaths,
+        runtime_factory: RuntimeFactory,
+        event_sink: "CaseEventSink",
+    ) -> "DrivenCase": ...
+
+
+class CaseTransport(Protocol):
+    def __call__(
+        self,
+        case: dict[str, object],
+        workspace: Path,
+        runtime: "CaseRuntime",
+        wiki_root: Path,
+        after_first_turn: Callable[[], None] | None = None,
+        event_sink: "CaseEventSink | None" = None,
+    ) -> "CaseExecution": ...
+
+
+@dataclass(frozen=True)
+class WorkerDependencies:
+    runtime_factory: RuntimeFactory
+    case_driver: CaseDriver
+
+
+WorkerCommandFactory = Callable[
+    [LaneName, EpochPlan, ParallelOptions, Path], Sequence[str]
+]
+
+
+@dataclass(frozen=True)
+class CoordinatorDependencies:
+    worker_command_factory: WorkerCommandFactory
+    integrity_runner: Callable[..., dict[str, object]]
+
+
+@dataclass(frozen=True)
+class ParallelRunResult:
+    run_kind: RunKind
+    run_root: Path
+    status: Literal["diagnostic", "validated", "committed", "failed"]
+    validated: "ValidatedEpoch | None"
+
+
 _COORDINATOR_GUARD_TOKEN = object()
 _VALIDATED_EPOCH_TOKEN = object()
 _FORMAL_COMMIT_TOKEN = object()
+_QUIESCENT_AUTHORITY_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -10480,3 +10589,3439 @@ def persist_validated_epoch(
         expected_delta, "after validated epoch persistence"
     )
     return pointer
+
+
+class QuiescentRunAuthority:
+    def __init__(
+        self,
+        token: object,
+        *,
+        coordinator: "CoordinatorStateMachine",
+    ) -> None:
+        if (
+            token is not _QUIESCENT_AUTHORITY_TOKEN
+            or type(coordinator) is not CoordinatorStateMachine
+        ):
+            raise TypeError(
+                "QuiescentRunAuthority cannot be constructed directly"
+            )
+        self._coordinator = coordinator
+        self._owner_pid = os.getpid()
+        self._epoch_id = coordinator._plan.epoch_id
+        self._run_kind = coordinator._plan.run_kind
+        self._consumed = False
+        self._lease: RunCoordinatorLease | None = None
+
+    def _validate_identity(self) -> "CoordinatorStateMachine":
+        if type(self) is not QuiescentRunAuthority:
+            raise TypeError("QuiescentRunAuthority must be exact")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError(
+                "quiescent run authority belongs to another process"
+            )
+        coordinator = self._coordinator
+        if (
+            type(coordinator) is not CoordinatorStateMachine
+            or not any(
+                candidate is self
+                for candidate in coordinator._issued_authorities
+            )
+            or self._epoch_id != coordinator._plan.epoch_id
+            or self._run_kind != coordinator._plan.run_kind
+        ):
+            raise RuntimeError("quiescent run authority binding changed")
+        return coordinator
+
+    def _validate_live(self) -> "CoordinatorStateMachine":
+        coordinator = self._validate_identity()
+        coordinator._require_healthy()
+        if self._consumed:
+            raise RuntimeError("quiescent run authority was already consumed")
+        if coordinator._active_authority is not self:
+            raise RuntimeError("quiescent run authority is no longer active")
+        if coordinator._phase != "tearing-down":
+            raise RuntimeError("run is not quiescent")
+        if self._lease is None:
+            raise RuntimeError(
+                "quiescent run authority is not bound to a live run lease"
+            )
+        self._lease._validate_live()
+        if (
+            self._lease._epoch_id != self._epoch_id
+            or self._lease._run_kind != self._run_kind
+            or self._lease._run_root != coordinator._options.run_root
+        ):
+            raise RuntimeError("quiescent run authority lease binding changed")
+        return coordinator
+
+    def _bind_lease(self, lease: RunCoordinatorLease) -> None:
+        if type(lease) is not RunCoordinatorLease:
+            raise TypeError("quiescent authority requires exact run lease")
+        lease._validate_live()
+        if self._lease is None:
+            self._lease = lease
+        elif self._lease is not lease:
+            raise RuntimeError(
+                "quiescent authority was bound to another run lease"
+            )
+
+    def _consume(self, purpose: str) -> None:
+        if purpose not in ("resume-launch", "teardown-receipt"):
+            raise ValueError("invalid quiescent authority consumption purpose")
+        coordinator = self._validate_live()
+        self._consumed = True
+        coordinator._active_authority = None
+
+    def _poison(self, error: BaseException) -> None:
+        coordinator = self._validate_identity()
+        coordinator._poisoned = True
+        coordinator._poison_error = error
+
+    @property
+    def epoch_id(self) -> str:
+        self._validate_identity()
+        return self._epoch_id
+
+    @property
+    def run_kind(self) -> RunKind:
+        self._validate_identity()
+        return self._run_kind
+
+    @property
+    def consumed(self) -> bool:
+        self._validate_identity()
+        return self._consumed
+
+
+class CoordinatorStateMachine:
+    def __init__(
+        self,
+        token: object,
+        *,
+        plan: EpochPlan,
+        options: ParallelOptions,
+        guard: CoordinatorGuard,
+    ) -> None:
+        if token is not _QUIESCENT_AUTHORITY_TOKEN:
+            raise TypeError(
+                "CoordinatorStateMachine cannot be constructed directly"
+            )
+        self._plan = plan
+        self._options = options
+        self._guard = guard
+        self._phase: CoordinatorPhase = "preflight"
+        self._workers: dict[LaneName, object] = {}
+        self._worker_groups: dict[LaneName, int] = {}
+        self._ledger = ProgressAckLedger(
+            max_total_tokens=options.max_total_tokens
+        )
+        self._stop_launches = False
+        self._cancel_reason: str | None = None
+        self._active_authority: QuiescentRunAuthority | None = None
+        self._issued_authorities: list[QuiescentRunAuthority] = []
+        self._teardown_receipt: TeardownReceipt | None = None
+        self._validated: ValidatedEpoch | None = None
+        self._commit: FormalCommitCapability | None = None
+        self._resume_snapshot_rows: (
+            tuple[tuple[str, str, int, int, str], ...] | None
+        ) = None
+        self._poisoned = False
+        self._poison_error: BaseException | None = None
+        self._owner_pid = os.getpid()
+        self._run_lease: RunCoordinatorLease | None = None
+
+    @classmethod
+    def create(
+        cls,
+        plan: EpochPlan,
+        options: ParallelOptions,
+        guard: CoordinatorGuard,
+    ) -> "CoordinatorStateMachine":
+        if cls is not CoordinatorStateMachine:
+            raise TypeError("CoordinatorStateMachine subclasses are unsupported")
+        if type(plan) is not EpochPlan:
+            raise TypeError("plan must be an exact EpochPlan")
+        if type(options) is not ParallelOptions:
+            raise TypeError("options must be exact ParallelOptions")
+        if type(guard) is not CoordinatorGuard:
+            raise TypeError("guard must be an exact CoordinatorGuard")
+        guard._validate_nominal()
+        run_root = canonical_run_root(options.run_root)
+        if (
+            options.run_kind != plan.run_kind
+            or type(options.run_kind) is not str
+            or options.source_codex_home != Path(options.source_codex_home)
+            or options.codex_executable != Path(options.codex_executable)
+            or (
+                options.resume_run_root is not None
+                and canonical_run_root(options.resume_run_root) != run_root
+            )
+            or (
+                options.max_total_tokens is not None
+                and (
+                    type(options.max_total_tokens) is not int
+                    or options.max_total_tokens < 0
+                )
+            )
+        ):
+            raise ValueError("parallel options differ from the epoch plan")
+        return cls(
+            _QUIESCENT_AUTHORITY_TOKEN,
+            plan=plan,
+            options=replace(options, run_root=run_root),
+            guard=guard,
+        )
+
+    def _require_healthy(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("coordinator belongs to another process")
+        if self._poisoned:
+            raise RuntimeError("coordinator is poisoned") from self._poison_error
+
+    def _bind_run_lease(self, lease: RunCoordinatorLease) -> None:
+        self._require_healthy()
+        if type(lease) is not RunCoordinatorLease:
+            raise TypeError("coordinator requires exact run lease")
+        lease._validate_live()
+        if (
+            lease._run_root != self._options.run_root
+            or lease._epoch_id != self._plan.epoch_id
+            or lease._run_kind != self._plan.run_kind
+        ):
+            raise ValueError("coordinator run lease binding differs")
+        if self._run_lease is not None and self._run_lease is not lease:
+            raise RuntimeError("coordinator run lease was already bound")
+        self._run_lease = lease
+
+    @property
+    def phase(self) -> CoordinatorPhase:
+        self._require_healthy()
+        return self._phase
+
+    @property
+    def stop_launches(self) -> bool:
+        self._require_healthy()
+        return self._stop_launches
+
+    @property
+    def total_tokens(self) -> int:
+        self._require_healthy()
+        return self._ledger.total_tokens
+
+    def _seed_resume_protocol(
+        self,
+        *,
+        total_tokens: int,
+        last_sequence: dict[LaneName, int],
+        completed_attempts: set[tuple[CaseKey, int]],
+    ) -> None:
+        self._require_healthy()
+        if (
+            self._phase != "tearing-down"
+            or type(total_tokens) is not int
+            or total_tokens < 0
+            or self._ledger.total_tokens != 0
+            or type(last_sequence) is not dict
+            or set(last_sequence) != {"E1", "E2", "E3", "APP"}
+        ):
+            raise ValueError("resume protocol cannot seed this coordinator")
+        reaches_ceiling = (
+            self._options.max_total_tokens is not None
+            and total_tokens >= self._options.max_total_tokens
+        )
+        self._ledger._state = _ProgressAckLedgerState(
+            total_tokens=total_tokens,
+            epoch_id=self._plan.epoch_id,
+            run_kind=self._plan.run_kind,
+            last_sequence=dict(last_sequence),
+            active_cases={
+                lane: None for lane in ("E1", "E2", "E3", "APP")
+            },
+            completed_attempts=set(completed_attempts),
+            exited=set(),
+            accepted={},
+            stop_launches=reaches_ceiling,
+            aborted=False,
+        )
+        if reaches_ceiling:
+            self._stop_launches = True
+
+    def register_worker(self, lane: LaneName, process: subprocess.Popen) -> None:
+        self._require_healthy()
+        if (
+            type(lane) is not str
+            or lane not in ("E1", "E2", "E3", "APP")
+            or lane in self._workers
+        ):
+            raise ValueError("worker lane is invalid or already registered")
+        if self._phase not in ("preflight", "running"):
+            raise RuntimeError("workers cannot launch in the current phase")
+        if self._stop_launches:
+            raise RuntimeError("worker launches are stopped")
+        pid = getattr(process, "pid", None)
+        if type(pid) is not int or pid <= 0:
+            raise TypeError("worker process must expose a positive PID")
+        pgid = getattr(process, "pgid", None)
+        if pgid is None:
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                pgid = pid
+        if type(pgid) is not int or pgid <= 0:
+            raise RuntimeError("worker process group is invalid")
+        self._workers[lane] = process
+        self._worker_groups[lane] = pgid
+        self._phase = "running"
+
+    @staticmethod
+    def _readers_for(process: object) -> tuple[object, ...]:
+        readers = getattr(process, "_coordinator_readers", ())
+        if not isinstance(readers, (tuple, list)):
+            raise RuntimeError("worker readers are invalid")
+        return tuple(readers)
+
+    @staticmethod
+    def _join_readers(process: object) -> None:
+        for reader in CoordinatorStateMachine._readers_for(process):
+            join = getattr(reader, "join", None)
+            alive = getattr(reader, "is_alive", None)
+            if not callable(join) or not callable(alive):
+                raise RuntimeError("worker reader is invalid")
+            join(timeout=5.0)
+            if alive():
+                raise RuntimeError("worker reader survived cancellation")
+
+    @staticmethod
+    def _production_group_exists(process: object, pgid: int) -> bool:
+        probe = getattr(process, "process_group_alive", None)
+        if callable(probe):
+            alive = probe()
+            if type(alive) is not bool:
+                raise RuntimeError("worker process-group probe is invalid")
+            return alive
+        if not isinstance(process, subprocess.Popen):
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            raise RuntimeError(
+                "worker process-group quiescence is indeterminate"
+            ) from None
+        return True
+
+    def _stop_worker(self, lane: LaneName, process: object) -> None:
+        poll = getattr(process, "poll", None)
+        wait = getattr(process, "wait", None)
+        if not callable(poll) or not callable(wait):
+            raise RuntimeError("worker process interface is invalid")
+        pgid = self._worker_groups[lane]
+        errors: list[BaseException] = []
+        try:
+            leader_alive = poll() is None
+            group_alive = self._production_group_exists(process, pgid)
+            if leader_alive or group_alive:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                if leader_alive:
+                    try:
+                        wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if self._production_group_exists(process, pgid):
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 5.0
+                    while (
+                        self._production_group_exists(process, pgid)
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                if poll() is None:
+                    wait(timeout=5.0)
+            if poll() is None or self._production_group_exists(process, pgid):
+                raise RuntimeError(
+                    "worker process group survived cancellation"
+                )
+        except BaseException as error:
+            errors.append(error)
+        try:
+            self._join_readers(process)
+        except BaseException as error:
+            errors.append(error)
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        group_type = (
+            ExceptionGroup
+            if all(isinstance(error, Exception) for error in errors)
+            else BaseExceptionGroup
+        )
+        raise group_type(
+            f"worker {lane} cancellation or reader join failed",
+            errors,
+        )
+
+    def accept_progress(self, message: ProgressMessage) -> AckDecision:
+        self._require_healthy()
+        if self._phase != "running":
+            raise RuntimeError("progress is invalid outside the running phase")
+        try:
+            if (
+                type(message) is not ProgressMessage
+                or message.epoch_id != self._plan.epoch_id
+                or message.run_kind != self._plan.run_kind
+                or message.lane not in self._workers
+            ):
+                raise ValueError("progress differs from the coordinator epoch")
+            decision = self._ledger.accept_progress(message)
+            self._guard.checkpoint(
+                f"before ACK {message.lane} sequence {message.seq}"
+            )
+            process = self._workers[message.lane]
+            worker_root = getattr(process, "worker_root", None)
+            if worker_root is None:
+                worker_root = (
+                    self._options.run_root / "app-server"
+                    if message.lane == "APP"
+                    else self._options.run_root
+                    / "workers"
+                    / message.lane
+                )
+            write_ack(Path(worker_root), message, decision)
+            if decision in ("stop-launches", "abort"):
+                self._stop_launches = True
+            if decision == "abort":
+                self.cancel(
+                    f"progress requested abort for {message.lane} "
+                    f"sequence {message.seq}"
+                )
+            return decision
+        except BaseException as primary:
+            if self._phase == "running":
+                try:
+                    self.cancel("malformed or unauthenticated progress")
+                except BaseException as cancellation_error:
+                    group_type = (
+                        ExceptionGroup
+                        if isinstance(primary, Exception)
+                        and isinstance(cancellation_error, Exception)
+                        else BaseExceptionGroup
+                    )
+                    raise group_type(
+                        "progress failure and cancellation failure",
+                        [primary, cancellation_error],
+                    )
+            raise
+
+    def cancel(self, reason: str) -> None:
+        self._require_healthy()
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("cancellation reason must be nonempty")
+        if self._phase in (
+            "tearing-down",
+            "validating",
+            "validated",
+            "commit-ready",
+            "committed",
+            "failed",
+        ):
+            raise RuntimeError("coordinator cannot cancel in the current phase")
+        if self._phase == "cancelling":
+            return
+        self._phase = "cancelling"
+        self._stop_launches = True
+        self._cancel_reason = reason
+        errors: list[BaseException] = []
+        if self._run_lease is not None:
+            try:
+                self._run_lease._validate_live()
+                ownership = (
+                    self._options.run_root
+                    / "coordinator/cleanup/bootstrap-ownership.json"
+                )
+                if _entry_exists_no_follow(
+                    ownership, "bootstrap ownership"
+                ):
+                    _atomic_write_record(
+                        self._options.run_root
+                        / "coordinator/stop-launches.json",
+                        {
+                            "schema_version": 1,
+                            "epoch_id": self._plan.epoch_id,
+                            "run_kind": self._plan.run_kind,
+                            "reason_sha256": hashlib.sha256(
+                                reason.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    )
+            except BaseException as error:
+                errors.append(error)
+        for lane in ("E1", "E2", "E3", "APP"):
+            process = self._workers.get(lane)
+            if process is None:
+                continue
+            try:
+                self._stop_worker(lane, process)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            failure: BaseException
+            if len(errors) == 1:
+                failure = errors[0]
+            else:
+                group_type = (
+                    ExceptionGroup
+                    if all(isinstance(error, Exception) for error in errors)
+                    else BaseExceptionGroup
+                )
+                failure = group_type("worker cancellation failed", errors)
+            if is_indeterminate_descriptor_close(failure):
+                self._poisoned = True
+                self._poison_error = failure
+            raise failure
+
+    def workers_stopped(self) -> QuiescentRunAuthority:
+        self._require_healthy()
+        if self._phase not in ("preflight", "running", "cancelling"):
+            raise RuntimeError("workers cannot become quiescent in this phase")
+        if (
+            self._active_authority is not None
+            and not self._active_authority._consumed
+        ):
+            raise RuntimeError("quiescent authority was already issued")
+        for process in self._workers.values():
+            poll = getattr(process, "poll", None)
+            if not callable(poll) or poll() is None:
+                raise RuntimeError("worker is still running")
+            lane = getattr(process, "lane", None)
+            if lane is None:
+                lane = next(
+                    key
+                    for key, candidate in self._workers.items()
+                    if candidate is process
+                )
+            if self._production_group_exists(
+                process, self._worker_groups[lane]
+            ):
+                raise RuntimeError("worker process group is still running")
+            self._join_readers(process)
+        _recover_durable_worker_groups(
+            run_root=self._options.run_root,
+            plan=self._plan,
+        )
+        authority = QuiescentRunAuthority(
+            _QUIESCENT_AUTHORITY_TOKEN,
+            coordinator=self,
+        )
+        self._issued_authorities.append(authority)
+        if self._run_lease is not None:
+            authority._bind_lease(self._run_lease)
+        self._active_authority = authority
+        self._phase = "tearing-down"
+        return authority
+
+    def _resume_to_launch(self, authority: QuiescentRunAuthority) -> None:
+        self._require_healthy()
+        if type(authority) is not QuiescentRunAuthority:
+            raise TypeError("resume requires exact quiescent authority")
+        if (
+            self._resume_snapshot_rows is None
+            or _capture_directory_rows(self._options.run_root)
+            != self._resume_snapshot_rows
+        ):
+            raise RuntimeError(
+                "resume evidence changed before launch linearization"
+            )
+        authority._consume("resume-launch")
+        self._resume_snapshot_rows = None
+        self._workers.clear()
+        self._worker_groups.clear()
+        self._phase = "preflight"
+
+    def begin_teardown(self) -> None:
+        self._require_healthy()
+        if self._phase != "tearing-down":
+            raise RuntimeError("teardown requires quiescent workers")
+        if (
+            self._active_authority is None
+            or self._active_authority._consumed
+        ):
+            raise RuntimeError("teardown requires live quiescent authority")
+        self._active_authority._validate_identity()
+
+    def mark_torn_down(self, receipt: TeardownReceipt) -> None:
+        self._require_healthy()
+        if self._phase != "tearing-down":
+            raise RuntimeError("teardown receipt is invalid in this phase")
+        if type(receipt) is not TeardownReceipt:
+            raise TypeError("receipt must be exact TeardownReceipt")
+        if (
+            receipt.epoch_id != self._plan.epoch_id
+            or receipt.run_kind != self._plan.run_kind
+            or self._active_authority is not None
+        ):
+            raise ValueError("teardown receipt differs from coordinator state")
+        self._teardown_receipt = receipt
+        if self._cancel_reason is not None:
+            self._phase = "failed"
+
+    def begin_validation(self) -> None:
+        self._require_healthy()
+        if self._phase != "tearing-down" or self._teardown_receipt is None:
+            raise RuntimeError("validation requires committed teardown")
+        self._phase = "validating"
+
+    def mark_validated(self, validated: ValidatedEpoch) -> None:
+        self._require_healthy()
+        if self._phase != "validating" or type(validated) is not ValidatedEpoch:
+            raise RuntimeError("validated capability is invalid in this phase")
+        binding = validated._validate_nominal()
+        if binding.plan is not self._plan:
+            raise ValueError("validated epoch differs from coordinator plan")
+        self._validated = validated
+        self._phase = "validated"
+
+    def mark_commit_ready(self, commit: FormalCommitCapability) -> None:
+        self._require_healthy()
+        if (
+            self._phase != "validated"
+            or self._plan.run_kind != "formal"
+            or type(commit) is not FormalCommitCapability
+        ):
+            raise RuntimeError("formal commit is invalid in this phase")
+        binding = commit._validate_nominal()
+        if self._validated is None or binding.validated_ref() is not self._validated:
+            raise ValueError("formal commit differs from validated epoch")
+        self._commit = commit
+        self._phase = "commit-ready"
+
+    def mark_committed(self) -> None:
+        self._require_healthy()
+        if (
+            self._phase != "commit-ready"
+            or self._commit is None
+            or not self._commit.consumed
+        ):
+            raise RuntimeError("commit completion is invalid in this phase")
+        self._phase = "committed"
+
+
+def _validate_quiescent_cleanup_access(
+    *,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+    plan: EpochPlan | None = None,
+    run_root: Path | None = None,
+) -> CoordinatorStateMachine:
+    if type(lease) is not RunCoordinatorLease:
+        raise TypeError("cleanup requires exact RunCoordinatorLease")
+    if type(authority) is not QuiescentRunAuthority:
+        raise TypeError("cleanup requires exact QuiescentRunAuthority")
+    lease._validate_live()
+    authority._bind_lease(lease)
+    coordinator = authority._validate_live()
+    if (
+        lease._epoch_id != authority.epoch_id
+        or lease._run_kind != authority.run_kind
+        or lease._run_root != coordinator._options.run_root
+    ):
+        raise RuntimeError("cleanup lease and quiescent authority differ")
+    if plan is not None and (
+        type(plan) is not EpochPlan
+        or plan is not coordinator._plan
+        or plan.epoch_id != lease._epoch_id
+        or plan.run_kind != lease._run_kind
+    ):
+        raise ValueError("cleanup plan differs from live authority")
+    if run_root is not None and canonical_run_root(run_root) != lease._run_root:
+        raise ValueError("cleanup run root differs from live lease")
+    return coordinator
+
+
+def _poison_quiescent_on_indeterminate(
+    authority: QuiescentRunAuthority,
+    error: BaseException,
+) -> None:
+    if is_indeterminate_descriptor_close(error):
+        global _LEASE_PROCESS_POISON
+        _LEASE_PROCESS_POISON = error
+        authority._poison(error)
+
+
+def _scrub_coordinator_owned_directory(descriptor: int) -> None:
+    from scripts.run_observing_workflows_eval_worker import _remove_tree_entry
+    from scripts.run_observing_workflows_task9_eval import (
+        AUTH_CLEANUP_MAX_ENTRIES,
+    )
+
+    remaining = [AUTH_CLEANUP_MAX_ENTRIES - 1]
+    if remaining[0] < 0:
+        raise OSError("owned auth cleanup bound exceeded")
+    names: list[str] = []
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            if remaining[0] <= 0:
+                raise OSError("owned auth cleanup bound exceeded")
+            remaining[0] -= 1
+            names.append(entry.name)
+    for name in sorted(names):
+        _remove_tree_entry(
+            descriptor,
+            name,
+            depth=1,
+            remaining=remaining,
+            charged=True,
+        )
+    with os.scandir(descriptor) as entries:
+        if any(True for _entry in entries):
+            raise ValueError("owned auth directory is not empty after scrub")
+    os.fsync(descriptor)
+
+
+def _case_root_matches(
+    paths: CasePaths, ownership: CaseAuthOwnership
+) -> os.stat_result:
+    try:
+        metadata = paths.root.lstat()
+    except OSError:
+        raise ValueError("case evidence root is unavailable") from None
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or (metadata.st_dev, metadata.st_ino)
+        != (ownership.case_root_device, ownership.case_root_inode)
+    ):
+        raise ValueError("case evidence root ownership changed")
+    return metadata
+
+
+def _case_home_binding(
+    paths: CasePaths, ownership: CaseAuthOwnership
+) -> Literal["expected", "missing", "replaced"]:
+    try:
+        metadata = paths.codex_home.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        raise ValueError("case Codex home is unavailable") from None
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        and stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and (metadata.st_dev, metadata.st_ino)
+        == (ownership.codex_home_device, ownership.codex_home_inode)
+    ):
+        return "expected"
+    return "replaced"
+
+
+def _open_recovery_case_home(
+    paths: CasePaths, ownership: CaseAuthOwnership
+) -> _DescriptorSlot:
+    _case_root_matches(paths, ownership)
+    descriptor, metadata = _open_private_directory(
+        paths.codex_home, "case Codex home"
+    )
+    slot = _DescriptorSlot(descriptor)
+    if (metadata.st_dev, metadata.st_ino) != (
+        ownership.codex_home_device,
+        ownership.codex_home_inode,
+    ):
+        _retire_task_descriptors(
+            [slot],
+            primary=ValueError("case Codex-home ownership changed"),
+            label="case recovery open or close failed",
+        )
+    return slot
+
+
+def recover_case_auth_cleanup(
+    *,
+    plan: EpochPlan,
+    assignment: CaseAssignment,
+    paths: CasePaths,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> TombstoneReceipt:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=paths.root.parent.parent,
+    )
+    _validate_plan_assignment(plan, assignment)
+    if paths != paths_for_case(lease._run_root, assignment):
+        raise ValueError("case recovery paths differ from the plan")
+    initial_inventory = _directory_inventory(
+        paths.cleanup, "case cleanup directory"
+    )
+    if initial_inventory not in (
+        ("ownership.json",),
+        ("ownership.json", "tombstone.json"),
+    ):
+        raise ValueError("case cleanup namespace is invalid")
+    existing = _read_optional_verified_tombstone_receipt(
+        plan=plan,
+        assignment=assignment,
+        paths=paths,
+    )
+    if existing is not None:
+        ownership, _ = read_case_auth_ownership(
+            plan=plan, assignment=assignment, paths=paths
+        )
+        binding = _case_home_binding(paths, ownership)
+        if existing.receipt.canonical_binding != "expected":
+            raise ValueError("case tombstone does not authorize teardown")
+        if binding == "replaced":
+            raise ValueError("case Codex-home name was replaced")
+        if binding == "expected":
+            descriptor, metadata = _open_private_directory(
+                paths.codex_home, "case Codex-home tombstone"
+            )
+            slot = _DescriptorSlot(descriptor)
+            primary: BaseException | None = None
+            try:
+                if (metadata.st_dev, metadata.st_ino) != (
+                    ownership.codex_home_device,
+                    ownership.codex_home_inode,
+                ):
+                    raise ValueError("case Codex-home tombstone changed")
+                with os.scandir(slot.descriptor) as entries:
+                    if any(True for _entry in entries):
+                        raise ValueError("case Codex-home tombstone is not empty")
+            except BaseException as error:
+                primary = error
+            try:
+                _retire_task_descriptors(
+                    [slot],
+                    primary=primary,
+                    label="case tombstone verification or close failed",
+                )
+            except BaseException as error:
+                _poison_quiescent_on_indeterminate(authority, error)
+                raise
+        return existing.receipt
+
+    ownership, ownership_bytes = read_case_auth_ownership(
+        plan=plan, assignment=assignment, paths=paths
+    )
+    if _case_home_binding(paths, ownership) != "expected":
+        raise ValueError("case recovery requires the recorded Codex home")
+    slot = _open_recovery_case_home(paths, ownership)
+    primary: BaseException | None = None
+    receipt: TombstoneReceipt | None = None
+    try:
+        _scrub_coordinator_owned_directory(slot.descriptor)
+        current = os.fstat(slot.descriptor)
+        if (
+            (current.st_dev, current.st_ino)
+            != (ownership.codex_home_device, ownership.codex_home_inode)
+            or stat.S_IMODE(current.st_mode) != 0o700
+        ):
+            raise ValueError("case recovery Codex-home identity changed")
+        receipt = TombstoneReceipt(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=ownership.case_root_device,
+            case_root_inode=ownership.case_root_inode,
+            codex_home_device=ownership.codex_home_device,
+            codex_home_inode=ownership.codex_home_inode,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="coordinator-recovery",
+        )
+        _atomic_write_record(paths.cleanup / "tombstone.json", asdict(receipt))
+    except BaseException as error:
+        primary = error
+    try:
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label="case recovery scrub or close failed",
+        )
+    except BaseException as error:
+        _poison_quiescent_on_indeterminate(authority, error)
+        raise
+    if receipt is None:
+        raise AssertionError("case recovery produced no tombstone")
+    if _directory_inventory(
+        paths.cleanup, "case cleanup directory"
+    ) != ("ownership.json", "tombstone.json"):
+        raise RuntimeError("case cleanup namespace changed during recovery")
+    return receipt
+
+
+def teardown_case_auth(
+    *,
+    paths: CasePaths,
+    receipt: TombstoneReceipt,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> None:
+    coordinator = _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        run_root=paths.root.parent.parent,
+    )
+    if type(receipt) is not TombstoneReceipt:
+        raise TypeError("case teardown requires exact TombstoneReceipt")
+    assignments = [
+        assignment
+        for assignment in coordinator._plan.assignments
+        if assignment.key == receipt.case
+    ]
+    if len(assignments) != 1:
+        raise ValueError("case teardown receipt names an unknown case")
+    assignment = assignments[0]
+    if paths != paths_for_case(lease._run_root, assignment):
+        raise ValueError("case teardown paths differ from the plan")
+    if _directory_inventory(
+        paths.cleanup, "case cleanup directory"
+    ) != ("ownership.json", "tombstone.json"):
+        raise ValueError("case cleanup namespace is invalid")
+    verified = read_verified_tombstone_receipt(
+        plan=coordinator._plan,
+        assignment=assignment,
+        paths=paths,
+    )
+    if (
+        verified.receipt != receipt
+        or receipt.canonical_binding != "expected"
+    ):
+        raise ValueError("case tombstone does not authorize teardown")
+    ownership, _ = read_case_auth_ownership(
+        plan=coordinator._plan,
+        assignment=assignment,
+        paths=paths,
+    )
+    _case_root_matches(paths, ownership)
+    binding = _case_home_binding(paths, ownership)
+    if binding == "missing":
+        return
+    if binding != "expected":
+        raise ValueError("case Codex-home name was replaced")
+
+    root_descriptor, root_metadata = _open_private_directory(
+        paths.root, "case evidence root"
+    )
+    root_slot = _DescriptorSlot(root_descriptor)
+    child_slot: _DescriptorSlot | None = None
+    primary: BaseException | None = None
+    try:
+        if (root_metadata.st_dev, root_metadata.st_ino) != (
+            ownership.case_root_device,
+            ownership.case_root_inode,
+        ):
+            raise ValueError("case evidence root ownership changed")
+        child_descriptor, child_metadata = _open_private_directory(
+            paths.codex_home, "case Codex-home tombstone"
+        )
+        child_slot = _DescriptorSlot(child_descriptor)
+        if (child_metadata.st_dev, child_metadata.st_ino) != (
+            ownership.codex_home_device,
+            ownership.codex_home_inode,
+        ):
+            raise ValueError("case Codex-home tombstone ownership changed")
+        with os.scandir(child_slot.descriptor) as entries:
+            if any(True for _entry in entries):
+                raise ValueError("case Codex-home tombstone is not empty")
+    except BaseException as error:
+        primary = error
+    if child_slot is not None:
+        try:
+            _retire_task_descriptors(
+                [child_slot],
+                primary=primary,
+                label="case tombstone verification or close failed",
+            )
+            primary = None
+        except BaseException as error:
+            _poison_quiescent_on_indeterminate(authority, error)
+            primary = error
+    if primary is None:
+        try:
+            named = os.stat(
+                paths.codex_home.name,
+                dir_fd=root_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or (named.st_dev, named.st_ino)
+                != (ownership.codex_home_device, ownership.codex_home_inode)
+            ):
+                raise ValueError("case Codex-home tombstone changed")
+            os.rmdir(paths.codex_home.name, dir_fd=root_slot.descriptor)
+            os.fsync(root_slot.descriptor)
+        except BaseException as error:
+            primary = error
+    try:
+        _retire_task_descriptors(
+            [root_slot],
+            primary=primary,
+            label="case tombstone teardown or close failed",
+        )
+    except BaseException as error:
+        _poison_quiescent_on_indeterminate(authority, error)
+        raise
+
+
+def _read_bootstrap_ownership_record(
+    *, coordinator_root: Path, plan: EpochPlan
+) -> tuple[BootstrapOwnership, bytes]:
+    payload, content = _read_canonical_record(
+        Path(coordinator_root) / "cleanup/bootstrap-ownership.json",
+        "bootstrap ownership",
+    )
+    _require_exact_fields(payload, BootstrapOwnership, "bootstrap ownership")
+    ownership = BootstrapOwnership(**payload)
+    if (
+        type(ownership.schema_version) is not int
+        or ownership.schema_version != 1
+        or ownership.epoch_id != plan.epoch_id
+        or ownership.run_kind != plan.run_kind
+        or type(ownership.bootstrap_device) is not int
+        or ownership.bootstrap_device < 0
+        or type(ownership.bootstrap_inode) is not int
+        or ownership.bootstrap_inode < 0
+    ):
+        raise ValueError("bootstrap ownership is stale or invalid")
+    return ownership, content
+
+
+def _bootstrap_binding(
+    coordinator_root: Path, ownership: BootstrapOwnership
+) -> Literal["expected", "missing", "replaced"]:
+    path = Path(coordinator_root) / "auth-bootstrap"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        raise ValueError("auth bootstrap is unavailable") from None
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        and stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and (metadata.st_dev, metadata.st_ino)
+        == (ownership.bootstrap_device, ownership.bootstrap_inode)
+    ):
+        return "expected"
+    return "replaced"
+
+
+def _reopen_auth_bootstrap(
+    *, plan: EpochPlan, coordinator_root: Path
+) -> InstalledAuthBootstrap:
+    ownership, _ownership_bytes = _read_bootstrap_ownership_record(
+        coordinator_root=coordinator_root, plan=plan
+    )
+    if _directory_inventory(
+        Path(coordinator_root) / "cleanup",
+        "coordinator cleanup directory",
+    ) != ("bootstrap-ownership.json",):
+        raise ValueError("active bootstrap cleanup namespace is invalid")
+    if _bootstrap_binding(coordinator_root, ownership) != "expected":
+        raise ValueError("active bootstrap ownership changed")
+    descriptor, metadata = _open_private_directory(
+        Path(coordinator_root) / "auth-bootstrap",
+        "active auth bootstrap",
+    )
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    try:
+        if (metadata.st_dev, metadata.st_ino) != (
+            ownership.bootstrap_device,
+            ownership.bootstrap_inode,
+        ):
+            raise ValueError("active bootstrap ownership changed")
+        auth_descriptor = _validate_private_auth(
+            Path(coordinator_root) / "auth-bootstrap/auth.json",
+            "active bootstrap auth.json",
+        )
+        _retire_task_descriptors(
+            [_DescriptorSlot(auth_descriptor)],
+            primary=None,
+            label="active bootstrap auth close failed",
+        )
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label="active bootstrap reopen or close failed",
+        )
+    return InstalledAuthBootstrap(
+        path=Path(coordinator_root) / "auth-bootstrap",
+        ownership=ownership,
+        descriptor=slot.descriptor,
+        state="active",
+        descriptor_close_state="owned",
+        descriptor_close_error=None,
+    )
+
+
+def _write_bootstrap_tombstone(
+    *,
+    coordinator_root: Path,
+    plan: EpochPlan,
+    ownership: BootstrapOwnership,
+    ownership_bytes: bytes,
+    producer: Literal["coordinator", "coordinator-recovery"],
+) -> BootstrapTombstoneReceipt:
+    receipt = BootstrapTombstoneReceipt(
+        schema_version=1,
+        epoch_id=plan.epoch_id,
+        run_kind=plan.run_kind,
+        ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+        bootstrap_device=ownership.bootstrap_device,
+        bootstrap_inode=ownership.bootstrap_inode,
+        scrubbed=True,
+        empty=True,
+        canonical_binding="expected",
+        producer=producer,
+    )
+    _atomic_write_record(
+        Path(coordinator_root) / "cleanup/bootstrap-tombstone.json",
+        asdict(receipt),
+    )
+    return receipt
+
+
+def cleanup_auth_bootstrap(
+    *,
+    installed: InstalledAuthBootstrap,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> BootstrapTombstoneReceipt:
+    coordinator = _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+    )
+    if type(installed) is not InstalledAuthBootstrap:
+        raise TypeError("bootstrap cleanup requires exact InstalledAuthBootstrap")
+    coordinator_root = lease._run_root / "coordinator"
+    if _directory_inventory(
+        coordinator_root / "cleanup",
+        "coordinator cleanup directory",
+    ) != ("bootstrap-ownership.json",):
+        raise ValueError("coordinator cleanup namespace is invalid")
+    ownership, ownership_bytes = _read_bootstrap_ownership_record(
+        coordinator_root=coordinator_root,
+        plan=coordinator._plan,
+    )
+    if installed.ownership != ownership or installed.path != (
+        coordinator_root / "auth-bootstrap"
+    ):
+        raise ValueError("installed bootstrap ownership changed")
+    if installed.state != "active":
+        raise RuntimeError("installed bootstrap is not active")
+    if (
+        installed.descriptor_close_state != "owned"
+        or installed.descriptor < 0
+    ):
+        raise RuntimeError("installed bootstrap descriptor is unavailable")
+    current = os.fstat(installed.descriptor)
+    if (
+        stat.S_IMODE(current.st_mode) != 0o700
+        or (current.st_dev, current.st_ino)
+        != (ownership.bootstrap_device, ownership.bootstrap_inode)
+        or _bootstrap_binding(coordinator_root, ownership) != "expected"
+    ):
+        raise ValueError("installed bootstrap ownership changed")
+    installed.state = "scrubbing"
+    primary: BaseException | None = None
+    receipt: BootstrapTombstoneReceipt | None = None
+    try:
+        _scrub_coordinator_owned_directory(installed.descriptor)
+        receipt = _write_bootstrap_tombstone(
+            coordinator_root=coordinator_root,
+            plan=coordinator._plan,
+            ownership=ownership,
+            ownership_bytes=ownership_bytes,
+            producer="coordinator",
+        )
+        installed.state = "tombstoned"
+    except BaseException as error:
+        installed.state = "active"
+        primary = error
+    if (
+        primary is not None
+        and not is_indeterminate_descriptor_close(primary)
+    ):
+        raise primary
+    close_error = _retire_descriptor_capability(installed)
+    errors = ([primary] if primary is not None else []) + (
+        [close_error] if close_error is not None else []
+    )
+    if errors:
+        failure: BaseException
+        if len(errors) == 1:
+            failure = errors[0]
+        else:
+            group_type = (
+                ExceptionGroup
+                if all(isinstance(error, Exception) for error in errors)
+                else BaseExceptionGroup
+            )
+            failure = group_type("bootstrap cleanup failed", errors)
+        _poison_quiescent_on_indeterminate(authority, failure)
+        raise failure
+    if receipt is None:
+        raise AssertionError("bootstrap cleanup produced no tombstone")
+    if _directory_inventory(
+        coordinator_root / "cleanup",
+        "coordinator cleanup directory",
+    ) != (
+        "bootstrap-ownership.json",
+        "bootstrap-tombstone.json",
+    ):
+        raise RuntimeError("coordinator cleanup namespace changed")
+    return receipt
+
+
+def recover_auth_bootstrap_cleanup(
+    *,
+    plan: EpochPlan,
+    coordinator_root: Path,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> BootstrapTombstoneReceipt:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=Path(coordinator_root).parent,
+    )
+    coordinator_root = Path(coordinator_root)
+    if coordinator_root != lease._run_root / "coordinator":
+        raise ValueError("coordinator cleanup root differs from live lease")
+    ownership, ownership_bytes = _read_bootstrap_ownership_record(
+        coordinator_root=coordinator_root,
+        plan=plan,
+    )
+    cleanup_inventory = _directory_inventory(
+        coordinator_root / "cleanup",
+        "coordinator cleanup directory",
+    )
+    if cleanup_inventory not in (
+        ("bootstrap-ownership.json",),
+        ("bootstrap-ownership.json", "bootstrap-tombstone.json"),
+    ):
+        raise ValueError("coordinator cleanup namespace is invalid")
+    tombstone = coordinator_root / "cleanup/bootstrap-tombstone.json"
+    try:
+        tombstone.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        raise ValueError("bootstrap tombstone is unavailable") from None
+    else:
+        existing, _digest = _decode_bootstrap_tombstone(
+            plan=plan, run_root=lease._run_root
+        )
+    if existing is not None:
+        binding = _bootstrap_binding(coordinator_root, ownership)
+        if binding == "replaced":
+            raise ValueError("auth bootstrap name was replaced")
+        if binding == "expected":
+            descriptor, metadata = _open_private_directory(
+                coordinator_root / "auth-bootstrap",
+                "auth bootstrap tombstone",
+            )
+            slot = _DescriptorSlot(descriptor)
+            primary: BaseException | None = None
+            try:
+                if (metadata.st_dev, metadata.st_ino) != (
+                    ownership.bootstrap_device,
+                    ownership.bootstrap_inode,
+                ):
+                    raise ValueError("auth bootstrap tombstone changed")
+                with os.scandir(slot.descriptor) as entries:
+                    if any(True for _entry in entries):
+                        raise ValueError("auth bootstrap tombstone is not empty")
+            except BaseException as error:
+                primary = error
+            try:
+                _retire_task_descriptors(
+                    [slot],
+                    primary=primary,
+                    label="bootstrap verification or close failed",
+                )
+            except BaseException as error:
+                _poison_quiescent_on_indeterminate(authority, error)
+                raise
+        return existing
+    if _bootstrap_binding(coordinator_root, ownership) != "expected":
+        raise ValueError("bootstrap recovery requires recorded ownership")
+    descriptor, metadata = _open_private_directory(
+        coordinator_root / "auth-bootstrap",
+        "auth bootstrap",
+    )
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    receipt: BootstrapTombstoneReceipt | None = None
+    try:
+        if (metadata.st_dev, metadata.st_ino) != (
+            ownership.bootstrap_device,
+            ownership.bootstrap_inode,
+        ):
+            raise ValueError("auth bootstrap ownership changed")
+        _scrub_coordinator_owned_directory(slot.descriptor)
+        receipt = _write_bootstrap_tombstone(
+            coordinator_root=coordinator_root,
+            plan=plan,
+            ownership=ownership,
+            ownership_bytes=ownership_bytes,
+            producer="coordinator-recovery",
+        )
+    except BaseException as error:
+        primary = error
+    try:
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label="bootstrap recovery or close failed",
+        )
+    except BaseException as error:
+        _poison_quiescent_on_indeterminate(authority, error)
+        raise
+    if receipt is None:
+        raise AssertionError("bootstrap recovery produced no tombstone")
+    if _directory_inventory(
+        coordinator_root / "cleanup",
+        "coordinator cleanup directory",
+    ) != (
+        "bootstrap-ownership.json",
+        "bootstrap-tombstone.json",
+    ):
+        raise RuntimeError("coordinator cleanup namespace changed")
+    return receipt
+
+
+def teardown_auth_bootstrap(
+    *,
+    coordinator_root: Path,
+    receipt: BootstrapTombstoneReceipt,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> None:
+    coordinator = _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        run_root=Path(coordinator_root).parent,
+    )
+    if type(receipt) is not BootstrapTombstoneReceipt:
+        raise TypeError(
+            "bootstrap teardown requires exact BootstrapTombstoneReceipt"
+        )
+    coordinator_root = Path(coordinator_root)
+    if coordinator_root != lease._run_root / "coordinator":
+        raise ValueError("coordinator cleanup root differs from live lease")
+    if _directory_inventory(
+        coordinator_root / "cleanup",
+        "coordinator cleanup directory",
+    ) != (
+        "bootstrap-ownership.json",
+        "bootstrap-tombstone.json",
+    ):
+        raise ValueError("coordinator cleanup namespace is invalid")
+    durable, _digest = _decode_bootstrap_tombstone(
+        plan=coordinator._plan, run_root=lease._run_root
+    )
+    if durable != receipt or receipt.canonical_binding != "expected":
+        raise ValueError("bootstrap tombstone does not authorize teardown")
+    ownership, _ = _read_bootstrap_ownership_record(
+        coordinator_root=coordinator_root,
+        plan=coordinator._plan,
+    )
+    binding = _bootstrap_binding(coordinator_root, ownership)
+    if binding == "missing":
+        return
+    if binding != "expected":
+        raise ValueError("auth bootstrap name was replaced")
+    coordinator_descriptor, coordinator_metadata = _open_private_directory(
+        coordinator_root, "coordinator root"
+    )
+    coordinator_slot = _DescriptorSlot(coordinator_descriptor)
+    bootstrap_slot: _DescriptorSlot | None = None
+    primary: BaseException | None = None
+    try:
+        bootstrap_descriptor, bootstrap_metadata = _open_private_directory(
+            coordinator_root / "auth-bootstrap",
+            "auth bootstrap tombstone",
+        )
+        bootstrap_slot = _DescriptorSlot(bootstrap_descriptor)
+        if (bootstrap_metadata.st_dev, bootstrap_metadata.st_ino) != (
+            ownership.bootstrap_device,
+            ownership.bootstrap_inode,
+        ):
+            raise ValueError("auth bootstrap tombstone changed")
+        with os.scandir(bootstrap_slot.descriptor) as entries:
+            if any(True for _entry in entries):
+                raise ValueError("auth bootstrap tombstone is not empty")
+    except BaseException as error:
+        primary = error
+    if bootstrap_slot is not None:
+        try:
+            _retire_task_descriptors(
+                [bootstrap_slot],
+                primary=primary,
+                label="bootstrap tombstone verification or close failed",
+            )
+            primary = None
+        except BaseException as error:
+            _poison_quiescent_on_indeterminate(authority, error)
+            primary = error
+    if primary is None:
+        try:
+            named = os.stat(
+                "auth-bootstrap",
+                dir_fd=coordinator_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or (named.st_dev, named.st_ino)
+                != (ownership.bootstrap_device, ownership.bootstrap_inode)
+            ):
+                raise ValueError("auth bootstrap tombstone changed")
+            os.rmdir(
+                "auth-bootstrap", dir_fd=coordinator_slot.descriptor
+            )
+            os.fsync(coordinator_slot.descriptor)
+            if (coordinator_metadata.st_dev, coordinator_metadata.st_ino) != (
+                os.fstat(coordinator_slot.descriptor).st_dev,
+                os.fstat(coordinator_slot.descriptor).st_ino,
+            ):
+                raise RuntimeError("coordinator root changed during teardown")
+        except BaseException as error:
+            primary = error
+    try:
+        _retire_task_descriptors(
+            [coordinator_slot],
+            primary=primary,
+            label="bootstrap teardown or close failed",
+        )
+    except BaseException as error:
+        _poison_quiescent_on_indeterminate(authority, error)
+        raise
+
+
+def write_teardown_receipt(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    tombstones: Sequence[tuple[CaseKey, TombstoneReceipt]],
+    bootstrap: BootstrapTombstoneReceipt,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> TeardownReceipt:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=run_root,
+    )
+    if type(bootstrap) is not BootstrapTombstoneReceipt:
+        raise TypeError("teardown requires exact bootstrap tombstone")
+    if _directory_inventory(
+        lease._run_root / "coordinator/cleanup",
+        "coordinator cleanup directory",
+    ) != (
+        "bootstrap-ownership.json",
+        "bootstrap-tombstone.json",
+    ):
+        raise ValueError("coordinator cleanup namespace is invalid")
+    bindings = tuple(tombstones)
+    keys = tuple(key for key, _receipt in bindings)
+    plan_order = tuple(
+        assignment.key
+        for assignment in plan.assignments
+        if assignment.key in set(keys)
+    )
+    if (
+        keys != plan_order
+        or len(set(keys)) != len(keys)
+        or any(
+            type(key) is not CaseKey
+            or type(receipt) is not TombstoneReceipt
+            or receipt.case != key
+            or receipt.epoch_id != plan.epoch_id
+            or receipt.run_kind != plan.run_kind
+            or receipt.canonical_binding != "expected"
+            for key, receipt in bindings
+        )
+    ):
+        raise ValueError("teardown tombstone bindings are invalid")
+    verified_bindings: list[tuple[CaseKey, str]] = []
+    for key, receipt in bindings:
+        assignment = next(
+            item for item in plan.assignments if item.key == key
+        )
+        paths = paths_for_case(lease._run_root, assignment)
+        verified = read_verified_tombstone_receipt(
+            plan=plan, assignment=assignment, paths=paths
+        )
+        try:
+            paths.codex_home.lstat()
+        except FileNotFoundError:
+            codex_home_absent = True
+        except OSError:
+            raise ValueError("case Codex-home absence is indeterminate") from None
+        else:
+            codex_home_absent = False
+        ownership, _ownership_bytes = read_case_auth_ownership(
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+        )
+        _case_root_matches(paths, ownership)
+        if verified.receipt != receipt or not codex_home_absent:
+            raise ValueError("case teardown is incomplete")
+        verified_bindings.append((key, verified.sha256))
+    bound_keys = set(keys)
+    for assignment in plan.assignments:
+        if assignment.key in bound_keys:
+            continue
+        paths = paths_for_case(lease._run_root, assignment)
+        try:
+            paths.codex_home.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise ValueError(
+                "case Codex-home absence is indeterminate"
+            ) from None
+        else:
+            raise ValueError(
+                "unowned case Codex home remains before teardown"
+            )
+    durable_bootstrap, bootstrap_sha256 = _decode_bootstrap_tombstone(
+        plan=plan, run_root=lease._run_root
+    )
+    try:
+        (lease._run_root / "coordinator/auth-bootstrap").lstat()
+    except FileNotFoundError:
+        bootstrap_absent = True
+    except OSError:
+        raise ValueError("bootstrap absence is indeterminate") from None
+    else:
+        bootstrap_absent = False
+    if durable_bootstrap != bootstrap or not bootstrap_absent:
+        raise ValueError("bootstrap teardown is incomplete")
+    receipt = TeardownReceipt(
+        schema_version=1,
+        epoch_id=plan.epoch_id,
+        run_kind=plan.run_kind,
+        tombstone_receipts=tuple(verified_bindings),
+        bootstrap_tombstone_receipt_sha256=bootstrap_sha256,
+        codex_homes_absent=True,
+        bootstrap_absent=True,
+    )
+    receipt_path = lease._run_root / "coordinator/teardown.json"
+    try:
+        receipt_path.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        raise ValueError("coordinator teardown receipt is unavailable") from None
+    else:
+        payload, content = _read_canonical_record(
+            receipt_path,
+            "coordinator teardown receipt",
+            byte_cap=64 * 1024,
+        )
+        _require_exact_fields(
+            payload, TeardownReceipt, "coordinator teardown receipt"
+        )
+        if content != canonical_config_bytes(asdict(receipt)):
+            raise ValueError(
+                "existing coordinator teardown receipt differs"
+            )
+        existing = receipt
+    authority._consume("teardown-receipt")
+    if existing is not None:
+        return existing
+    try:
+        _atomic_write_record(
+            receipt_path,
+            asdict(receipt),
+        )
+    except BaseException as error:
+        _poison_quiescent_on_indeterminate(authority, error)
+        raise
+    return receipt
+
+
+def _classify_resume_under_quiescence(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    current_fingerprints: InputFingerprints,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> ResumePlan:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=run_root,
+    )
+    before = _capture_directory_rows(run_root)
+    resume = plan_resume(
+        plan=plan,
+        run_root=run_root,
+        current_fingerprints=current_fingerprints,
+        manifests=manifests,
+    )
+    after = _capture_directory_rows(run_root)
+    if after != before:
+        raise RuntimeError("resume evidence changed during classification")
+    coordinator = authority._validate_live()
+    coordinator._resume_snapshot_rows = after
+    return resume
+
+
+def _resume_token_total(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+) -> int:
+    total = 0
+    for assignment in plan.assignments:
+        manifest_case = manifests[assignment.key.mode][
+            assignment.key.ordinal - 1
+        ]
+        paths = paths_for_case(run_root, assignment)
+        for attempt_number, _attempt_paths in enumerate(
+            scan_attempts(
+                paths, plan=plan, manifest_case=manifest_case
+            ),
+            start=1,
+        ):
+            attempt = read_attempt_seal(
+                plan=plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=attempt_number,
+                manifest_case=manifest_case,
+            )
+            usage = attempt.terminal.get("usage")
+            if usage is None:
+                continue
+            validated = _validate_usage(usage, nullable=False)
+            if validated is None:
+                raise AssertionError("resume usage unexpectedly null")
+            total += validated["total_tokens"]
+            if total > MAX_TOKEN_COUNT:
+                raise ValueError("resumed token usage exceeds its bound")
+    return total
+
+
+def _resume_protocol_bindings(
+    *,
+    plan: EpochPlan,
+    run_root: Path,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+) -> tuple[dict[LaneName, int], set[tuple[CaseKey, int]]]:
+    last_sequence: dict[LaneName, int] = {}
+    for lane in ("E1", "E2", "E3", "APP"):
+        worker_root = (
+            Path(run_root) / "app-server"
+            if lane == "APP"
+            else Path(run_root) / "workers" / lane
+        )
+        progress_root = worker_root / "progress"
+        try:
+            metadata = progress_root.lstat()
+        except FileNotFoundError:
+            last_sequence[lane] = 0
+            continue
+        except OSError:
+            raise ValueError("resume progress is unavailable") from None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise ValueError("resume progress is unsafe")
+        progress_names: list[str] = []
+        with os.scandir(progress_root) as entries:
+            for entry in entries:
+                if len(progress_names) >= MAX_PROTOCOL_RECORDS:
+                    raise ValueError(
+                        "resume progress prefix exceeds its cap"
+                    )
+                progress_names.append(entry.name)
+        names = tuple(sorted(progress_names))
+        expected = tuple(
+            f"{sequence:06d}.json"
+            for sequence in range(1, len(names) + 1)
+        )
+        if names != expected or len(names) > MAX_PROTOCOL_RECORDS:
+            raise ValueError("resume progress prefix is invalid")
+        for sequence, name in enumerate(names, start=1):
+            message = read_progress(
+                progress_root / name, lane, sequence
+            )
+            if (
+                message.epoch_id != plan.epoch_id
+                or message.run_kind != plan.run_kind
+            ):
+                raise ValueError("resume progress differs from the plan")
+            try:
+                wait_for_ack(worker_root, message, 0.1)
+            except TimeoutError:
+                raise ValueError(
+                    "resume progress lacks its durable ACK"
+                ) from None
+        last_sequence[lane] = len(names)
+    completed: set[tuple[CaseKey, int]] = set()
+    for assignment in plan.assignments:
+        manifest_case = manifests[assignment.key.mode][
+            assignment.key.ordinal - 1
+        ]
+        paths = paths_for_case(run_root, assignment)
+        attempts = scan_attempts(
+            paths, plan=plan, manifest_case=manifest_case
+        )
+        completed.update(
+            (assignment.key, attempt)
+            for attempt in range(1, len(attempts) + 1)
+        )
+    return last_sequence, completed
+
+
+def _rearm_bootstrap_before_resume(
+    *,
+    plan: EpochPlan,
+    coordinator_root: Path,
+    source_codex_home: Path,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> InstalledAuthBootstrap:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=Path(coordinator_root).parent,
+    )
+    _bootstrap, bootstrap_sha256 = _decode_bootstrap_tombstone(
+        plan=plan, run_root=lease._run_root
+    )
+    try:
+        (Path(coordinator_root) / "auth-bootstrap").lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("resume bootstrap was not torn down")
+    teardown_path = Path(coordinator_root) / "teardown.json"
+    payload, _content = _read_canonical_record(
+        teardown_path,
+        "resume coordinator teardown receipt",
+        byte_cap=64 * 1024,
+    )
+    _require_exact_fields(
+        payload, TeardownReceipt, "resume coordinator teardown receipt"
+    )
+    encoded_tombstones = payload.get("tombstone_receipts")
+    if type(encoded_tombstones) is not list:
+        raise ValueError("resume teardown tombstones are invalid")
+    decoded: list[tuple[CaseKey, str]] = []
+    for item in encoded_tombstones:
+        if type(item) is not list or len(item) != 2:
+            raise ValueError("resume teardown tombstone is invalid")
+        key = _decode_case_key(item[0], "resume teardown case")
+        digest = item[1]
+        if type(digest) is not str or not _is_sha256(digest):
+            raise ValueError("resume teardown tombstone hash is invalid")
+        decoded.append((key, digest))
+    decoded_tuple = tuple(decoded)
+    plan_order = tuple(
+        assignment.key
+        for assignment in plan.assignments
+        if assignment.key in {key for key, _digest in decoded_tuple}
+    )
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("epoch_id") != plan.epoch_id
+        or payload.get("run_kind") != plan.run_kind
+        or tuple(key for key, _digest in decoded_tuple) != plan_order
+        or len({key for key, _digest in decoded_tuple})
+        != len(decoded_tuple)
+        or payload.get("bootstrap_tombstone_receipt_sha256")
+        != bootstrap_sha256
+        or payload.get("codex_homes_absent") is not True
+        or payload.get("bootstrap_absent") is not True
+    ):
+        raise ValueError("resume coordinator teardown receipt is stale")
+    assignment_by_key = {
+        assignment.key: assignment for assignment in plan.assignments
+    }
+    for key, expected_digest in decoded_tuple:
+        assignment = assignment_by_key.get(key)
+        if assignment is None:
+            raise ValueError("resume teardown names an unknown case")
+        paths = paths_for_case(lease._run_root, assignment)
+        verified = read_verified_tombstone_receipt(
+            plan=plan, assignment=assignment, paths=paths
+        )
+        if verified.sha256 != expected_digest:
+            raise ValueError("resume teardown tombstone changed")
+    for assignment in plan.assignments:
+        try:
+            paths_for_case(
+                lease._run_root, assignment
+            ).codex_home.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("resume case Codex home still exists")
+    coordinator_descriptor, _metadata = _open_private_directory(
+        Path(coordinator_root), "resume coordinator root"
+    )
+    coordinator_slot = _DescriptorSlot(coordinator_descriptor)
+    primary: BaseException | None = None
+    try:
+        for name in ("teardown.json", "stop-launches.json"):
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=coordinator_slot.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ValueError("resume coordinator terminal is unsafe")
+            os.unlink(name, dir_fd=coordinator_slot.descriptor)
+        os.fsync(coordinator_slot.descriptor)
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [coordinator_slot],
+        primary=primary,
+        label="resume coordinator reset or close failed",
+    )
+    cleanup = Path(coordinator_root) / "cleanup"
+    cleanup_descriptor, _metadata = _open_private_directory(
+        cleanup, "resume bootstrap cleanup"
+    )
+    cleanup_slot = _DescriptorSlot(cleanup_descriptor)
+    primary = None
+    try:
+        inventory = _directory_inventory(
+            cleanup, "resume bootstrap cleanup"
+        )
+        if inventory != (
+            "bootstrap-ownership.json",
+            "bootstrap-tombstone.json",
+        ):
+            raise ValueError("resume bootstrap proof is incomplete")
+        for name in inventory:
+            metadata = os.stat(
+                name,
+                dir_fd=cleanup_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ValueError("resume bootstrap proof is unsafe")
+            os.unlink(name, dir_fd=cleanup_slot.descriptor)
+        os.fsync(cleanup_slot.descriptor)
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [cleanup_slot],
+        primary=primary,
+        label="resume bootstrap proof reset or close failed",
+    )
+    return prepare_auth_bootstrap(
+        source_codex_home=source_codex_home,
+        coordinator_root=Path(coordinator_root),
+        plan=plan,
+    )
+
+
+def build_production_case_driver(
+    *,
+    snapshot_root: Path,
+    transport_config: ResolvedTransportConfig,
+    transport_runner: CaseTransport | None = None,
+) -> CaseDriver:
+    from scripts import run_observing_workflows_eval_worker as worker
+
+    return worker.build_production_case_driver(
+        snapshot_root=snapshot_root,
+        transport_config=transport_config,
+        transport_runner=transport_runner,
+    )
+
+
+def build_production_runtime_factory(
+    *,
+    snapshot_root: Path,
+    transport_config: ResolvedTransportConfig,
+    plan: EpochPlan,
+) -> RuntimeFactory:
+    from scripts import run_observing_workflows_eval_worker as worker
+
+    return worker.build_production_runtime_factory(
+        snapshot_root=snapshot_root,
+        transport_config=transport_config,
+        plan=plan,
+    )
+
+
+def production_worker_dependencies(
+    *,
+    snapshot_root: Path,
+    transport_config: ResolvedTransportConfig,
+    plan: EpochPlan,
+) -> WorkerDependencies:
+    from scripts import run_observing_workflows_eval_worker as worker
+
+    return worker.production_worker_dependencies(
+        snapshot_root=snapshot_root,
+        transport_config=transport_config,
+        plan=plan,
+    )
+
+
+def _production_integrity_runner(
+    command: Sequence[str],
+    environment: Mapping[str, str],
+    *,
+    expected_records: int,
+) -> dict[str, object]:
+    completed = subprocess.run(
+        tuple(command),
+        env=dict(environment),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("captured integrity command failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("captured integrity command returned invalid JSON") from None
+    if type(payload) is not dict:
+        raise ValueError("captured integrity command returned invalid result")
+    return payload
+
+
+def production_coordinator_dependencies(
+    *, snapshot_root: Path
+) -> CoordinatorDependencies:
+    snapshot = Path(snapshot_root)
+
+    def worker_command_factory(
+        lane: LaneName,
+        plan: EpochPlan,
+        options: ParallelOptions,
+        bound_snapshot_root: Path,
+    ) -> Sequence[str]:
+        if (
+            type(lane) is not str
+            or lane not in ("E1", "E2", "E3", "APP")
+            or type(plan) is not EpochPlan
+            or type(options) is not ParallelOptions
+            or Path(bound_snapshot_root) != snapshot
+        ):
+            raise ValueError("worker command inputs are invalid")
+        return (
+            sys.executable,
+            "-m",
+            "scripts.run_observing_workflows_eval_worker",
+            "--lane",
+            lane,
+            "--run-root",
+            str(options.run_root),
+            "--snapshot-root",
+            str(snapshot),
+            "--epoch-id",
+            plan.epoch_id,
+        )
+
+    return CoordinatorDependencies(
+        worker_command_factory=worker_command_factory,
+        integrity_runner=_production_integrity_runner,
+    )
+
+
+def run_worker(
+    *,
+    lane: LaneName,
+    plan: EpochPlan,
+    run_root: Path,
+    snapshot_root: Path,
+    dependencies: WorkerDependencies | None = None,
+) -> Path:
+    from scripts import run_observing_workflows_eval_worker as worker
+
+    return worker.run_worker(
+        lane=lane,
+        plan=plan,
+        run_root=run_root,
+        snapshot_root=snapshot_root,
+        dependencies=dependencies,
+    )
+
+
+def worker_main(argv: Sequence[str] | None = None) -> int:
+    from scripts import run_observing_workflows_eval_worker as worker
+
+    return worker.worker_main(argv)
+
+
+def _snapshot_rows_for_parallel_plan(
+    snapshot_root: Path,
+) -> tuple[tuple[str, str], ...]:
+    root = Path(snapshot_root)
+    if not root.is_dir():
+        raise ValueError("parallel snapshot root is unavailable")
+    rows = _capture_directory_rows(root)
+    return tuple(
+        (row[0], row[4])
+        for row in rows
+        if row[1] == "file"
+    )
+
+
+_PARALLEL_EVALUATOR_ORIGINS = (
+    "wiki_cli.py",
+    "wiki_observations.py",
+    "scripts/run_observing_workflows_task9_eval.py",
+    "scripts/run_observing_workflows_eval_worker.py",
+    "scripts/workflow_eval_sharding.py",
+    "tests/observing_workflows_eval_harness.py",
+    "tests/run_observing_workflows_eval.py",
+)
+_PARALLEL_ARCHIVE_RELATIVE = PurePosixPath(
+    "evidence/dist/workflow-observatory-0.2.0-recovery.zip"
+)
+
+
+def _verified_parallel_archive_inputs(
+    repository_root: Path,
+) -> tuple[
+    Path,
+    tuple[str, str, str],
+    dict[str, object],
+    bytes,
+]:
+    from scripts.package_workflow_observatory import (
+        ARCHIVE_ROOT,
+        INVENTORY_MEMBER,
+        PackageError,
+        verify_archive,
+    )
+
+    archive_path = Path(repository_root) / _PARALLEL_ARCHIVE_RELATIVE
+    try:
+        archive_sha256 = verify_archive(archive_path)
+        with zipfile.ZipFile(archive_path) as bundle:
+            inventory_bytes = bundle.read(INVENTORY_MEMBER)
+        inventory = json.loads(inventory_bytes)
+    except (OSError, ValueError, PackageError, zipfile.BadZipFile) as error:
+        raise ValueError(
+            "verified evaluation archive is unavailable"
+        ) from error
+    if (
+        type(inventory) is not dict
+        or inventory.get("archive_root") != ARCHIVE_ROOT
+        or type(inventory.get("marketplace_files")) is not dict
+        or type(inventory.get("repository_evidence")) is not dict
+        or type(inventory.get("members")) is not dict
+    ):
+        raise ValueError("verified evaluation archive inventory is invalid")
+    marketplace = inventory["marketplace_files"]
+    repository_evidence = inventory["repository_evidence"]
+    marketplace_rows = tuple(
+        (entry["member"], entry["packaged_sha256"])
+        for _origin, entry in sorted(marketplace.items())
+    )
+    try:
+        evaluator_rows = tuple(
+            (
+                repository_evidence[origin]["member"],
+                repository_evidence[origin]["packaged_sha256"],
+            )
+            for origin in _PARALLEL_EVALUATOR_ORIGINS
+        )
+    except (KeyError, TypeError):
+        raise ValueError(
+            "verified archive lacks an evaluator member"
+        ) from None
+    return (
+        archive_path,
+        (
+            archive_sha256,
+            component_digest(marketplace_rows),
+            component_digest(evaluator_rows),
+        ),
+        inventory,
+        inventory_bytes,
+    )
+
+
+def _materialize_parallel_snapshot(
+    *,
+    repository_root: Path,
+    snapshot_root: Path,
+    expected_digests: tuple[str, str, str],
+) -> None:
+    (
+        archive_path,
+        archive_digests,
+        inventory,
+        inventory_bytes,
+    ) = _verified_parallel_archive_inputs(repository_root)
+    if archive_digests != expected_digests:
+        raise RuntimeError(
+            "verified archive changed before materialization"
+        )
+    try:
+        snapshot_root.lstat()
+    except FileNotFoundError:
+        snapshot_root.mkdir(mode=0o700)
+        snapshot_root.chmod(0o700)
+        try:
+            with zipfile.ZipFile(archive_path) as bundle:
+                for info in bundle.infolist():
+                    relative = PurePosixPath(info.filename)
+                    destination_relative = PurePosixPath(*relative.parts[1:])
+                    destination = snapshot_root / destination_relative
+                    destination.parent.mkdir(
+                        parents=True, mode=0o700, exist_ok=True
+                    )
+                    destination.write_bytes(bundle.read(info))
+                    destination.chmod(0o444)
+            directories = sorted(
+                (
+                    path
+                    for path in snapshot_root.rglob("*")
+                    if path.is_dir()
+                ),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            )
+            for directory in directories:
+                directory.chmod(0o555)
+            snapshot_root.chmod(0o555)
+        except BaseException:
+            try:
+                snapshot_root.chmod(0o700)
+                for path in snapshot_root.rglob("*"):
+                    try:
+                        path.chmod(0o700 if path.is_dir() else 0o600)
+                    except OSError:
+                        pass
+                shutil.rmtree(snapshot_root)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        raise ValueError("parallel snapshot is unavailable") from None
+    _validate_snapshot_root(snapshot_root)
+    expected_rows = tuple(
+        sorted(
+            (
+                member.removeprefix(
+                    f"{inventory['archive_root']}/"
+                ),
+                digest,
+            )
+            for member, digest in inventory["members"].items()
+        )
+    ) + (
+        (
+            "SHA256SUMS.json",
+            hashlib.sha256(inventory_bytes).hexdigest(),
+        ),
+    )
+    actual_rows = tuple(
+        sorted(
+            (relative, digest)
+            for relative, kind, _mode, _size, digest in (
+                _capture_directory_rows(snapshot_root)
+            )
+            if kind == "file"
+        )
+    )
+    if tuple(sorted(expected_rows)) != actual_rows:
+        raise ValueError(
+            "materialized snapshot differs from archive inventory"
+        )
+
+
+def _parallel_recovery_is_cleanup_only(
+    *,
+    has_ownership: bool,
+    has_tombstone: bool,
+    has_teardown: bool,
+    has_stop_launches: bool,
+    resume_requested: bool,
+) -> bool:
+    return (
+        (has_tombstone and not has_teardown)
+        or (has_stop_launches and not has_teardown)
+        or (has_ownership and not resume_requested)
+    )
+
+
+def _parallel_plan_inputs(
+    *,
+    repository_root: Path,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    options: ParallelOptions,
+) -> tuple[
+    EpochPlan,
+    ResolvedTransportConfig,
+    Path,
+    dict[str, list[dict[str, object]]],
+    tuple[str, str, str],
+]:
+    if type(options) is not ParallelOptions:
+        raise TypeError("options must be exact ParallelOptions")
+    if type(manifests) is not dict or set(manifests) != {
+        "forward",
+        "lifecycle",
+    }:
+        raise ValueError("parallel manifests must contain exact modes")
+    manifest_snapshot = _capture_resume_manifest_snapshot(manifests)
+    frozen_manifests = _decode_resume_manifest_snapshot(manifest_snapshot)
+    transport_config = resolve_transport_config(
+        codex_executable=options.codex_executable,
+        source_codex_home=options.source_codex_home,
+        requested_model=options.requested_model,
+        requested_reasoning_effort=options.requested_reasoning_effort,
+    )
+    run_root = canonical_run_root(options.run_root)
+    if run_root.is_relative_to(repository_root):
+        raise ValueError("parallel run root must be outside the repository")
+    snapshot_root = (
+        run_root / "coordinator/captured-snapshot"
+    )
+    _archive_path, capture_digests, _inventory, _inventory_bytes = (
+        _verified_parallel_archive_inputs(repository_root)
+    )
+    archive_digest, marketplace_digest, evaluator_digest = capture_digests
+    fingerprints = InputFingerprints(
+        schema_version=1,
+        epoch_id="",
+        run_kind=options.run_kind,
+        archive_sha256=archive_digest,
+        marketplace_sha256=marketplace_digest,
+        evaluator_sha256=evaluator_digest,
+        transport_config_sha256=hashlib.sha256(
+            transport_config_bytes(transport_config)
+        ).hexdigest(),
+        forward_manifest_sha256=hashlib.sha256(
+            manifest_snapshot[0]
+        ).hexdigest(),
+        lifecycle_manifest_sha256=hashlib.sha256(
+            manifest_snapshot[1]
+        ).hexdigest(),
+    )
+    plan = build_epoch_plan(
+        run_kind=options.run_kind,
+        manifests=frozen_manifests,
+        fingerprints=fingerprints,
+    )
+    return (
+        plan,
+        transport_config,
+        snapshot_root,
+        frozen_manifests,
+        capture_digests,
+    )
+
+
+def _encode_epoch_plan_record(plan: EpochPlan) -> dict[str, object]:
+    return asdict(plan)
+
+
+def _encode_resume_plan_record(resume: ResumePlan) -> dict[str, object]:
+    if type(resume) is not ResumePlan:
+        raise TypeError("resume plan must be exact")
+    return {
+        "schema_version": 1,
+        "run_kind": resume.run_kind,
+        "reusable": [asdict(key) for key in resume.reusable],
+        "pending": [asdict(key) for key in resume.pending],
+        "invalid": [asdict(key) for key in resume.invalid],
+    }
+
+
+def _decode_resume_plan_record(
+    payload: object, *, plan: EpochPlan
+) -> ResumePlan:
+    if type(payload) is not dict or set(payload) != {
+        "schema_version",
+        "run_kind",
+        "reusable",
+        "pending",
+        "invalid",
+    }:
+        raise ValueError("sealed resume plan has invalid fields")
+    groups: dict[str, tuple[CaseKey, ...]] = {}
+    for name in ("reusable", "pending", "invalid"):
+        encoded = payload.get(name)
+        if type(encoded) is not list:
+            raise ValueError("sealed resume plan group is invalid")
+        groups[name] = tuple(
+            _decode_case_key(item, "sealed resume plan")
+            for item in encoded
+        )
+    resume = ResumePlan(
+        run_kind=payload.get("run_kind"),
+        reusable=groups["reusable"],
+        pending=groups["pending"],
+        invalid=groups["invalid"],
+    )
+    all_keys = resume.reusable + resume.pending + resume.invalid
+    if (
+        payload.get("schema_version") != 1
+        or type(payload.get("schema_version")) is not int
+        or resume.run_kind != plan.run_kind
+        or len(set(all_keys)) != len(all_keys)
+        or set(all_keys)
+        != {assignment.key for assignment in plan.assignments}
+    ):
+        raise ValueError("sealed resume plan differs from the epoch plan")
+    return resume
+
+
+def _decode_epoch_plan_record(payload: object) -> EpochPlan:
+    if type(payload) is not dict or set(payload) != {
+        "schema_version",
+        "epoch_id",
+        "run_kind",
+        "fingerprints",
+        "assignments",
+    }:
+        raise ValueError("sealed epoch plan has invalid fields")
+    fingerprints_payload = payload.get("fingerprints")
+    assignments_payload = payload.get("assignments")
+    if type(fingerprints_payload) is not dict or type(assignments_payload) is not list:
+        raise ValueError("sealed epoch plan has invalid structure")
+    _require_exact_fields(
+        fingerprints_payload, InputFingerprints, "sealed input fingerprints"
+    )
+    fingerprints = InputFingerprints(**fingerprints_payload)
+    assignments: list[CaseAssignment] = []
+    for item in assignments_payload:
+        if type(item) is not dict or set(item) != {
+            "key",
+            "lane",
+            "route",
+            "manifest_sha256",
+        }:
+            raise ValueError("sealed assignment has invalid fields")
+        assignment = dict(item)
+        assignment["key"] = _decode_case_key(
+            assignment["key"], "sealed assignment"
+        )
+        assignments.append(CaseAssignment(**assignment))
+    plan = EpochPlan(
+        schema_version=payload["schema_version"],
+        epoch_id=payload["epoch_id"],
+        run_kind=payload["run_kind"],
+        fingerprints=fingerprints,
+        assignments=tuple(assignments),
+    )
+    if (
+        type(plan.schema_version) is not int
+        or plan.schema_version != 1
+        or plan.epoch_id != fingerprints.epoch_id
+        or plan.run_kind != fingerprints.run_kind
+        or not _is_sha256(plan.epoch_id)
+    ):
+        raise ValueError("sealed epoch plan identity is invalid")
+    return plan
+
+
+def _parallel_worker_environment() -> dict[str, str]:
+    allowed = (
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SYSTEMROOT",
+    )
+    environment = {
+        name: os.environ[name]
+        for name in allowed
+        if name in os.environ
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    if any(
+        "result" in name.lower()
+        or "persist" in name.lower()
+        or "writer" in name.lower()
+        for name in environment
+    ):
+        raise RuntimeError("worker environment exposed persistence state")
+    return environment
+
+
+def _worker_lifetime_paths(
+    run_root: Path, lane: LaneName
+) -> tuple[Path, Path]:
+    coordinator = Path(run_root) / "coordinator"
+    return (
+        coordinator / "worker-leases" / f"{lane}.lock",
+        coordinator / "process-groups" / f"{lane}.json",
+    )
+
+
+def _acquire_worker_lifetime_lock(
+    run_root: Path, lane: LaneName
+) -> tuple[_DescriptorSlot, Path]:
+    lock_path, record_path = _worker_lifetime_paths(run_root, lane)
+    for directory in (lock_path.parent, record_path.parent):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        metadata = directory.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise ValueError("worker lifetime directory is unsafe")
+    slot = _DescriptorSlot(
+        os.open(
+            lock_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    )
+    primary: BaseException | None = None
+    try:
+        metadata = os.fstat(slot.descriptor)
+        named = lock_path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+            or (metadata.st_dev, metadata.st_ino)
+            != (named.st_dev, named.st_ino)
+        ):
+            raise ValueError("worker lifetime lock is unsafe")
+        fcntl.flock(slot.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label="worker lifetime lock acquisition or close failed",
+        )
+    return slot, record_path
+
+
+def _durable_process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        raise RuntimeError(
+            "durable worker group quiescence is indeterminate"
+        ) from None
+    return True
+
+
+def _recover_durable_worker_groups(
+    *, run_root: Path, plan: EpochPlan
+) -> None:
+    lease_root = Path(run_root) / "coordinator/worker-leases"
+    record_root = Path(run_root) / "coordinator/process-groups"
+    for root, label in (
+        (lease_root, "worker lifetime"),
+        (record_root, "worker process-group"),
+    ):
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise ValueError(f"{label} directory is unsafe")
+    allowed_locks = {f"{lane}.lock" for lane in ("E1", "E2", "E3", "APP")}
+    allowed_records = {
+        f"{lane}.json" for lane in ("E1", "E2", "E3", "APP")
+    }
+    lock_names = (
+        set(entry.name for entry in os.scandir(lease_root))
+        if lease_root.exists()
+        else set()
+    )
+    record_names = (
+        set(entry.name for entry in os.scandir(record_root))
+        if record_root.exists()
+        else set()
+    )
+    if not lock_names <= allowed_locks or not record_names <= allowed_records:
+        raise ValueError("worker lifetime namespace contains an unknown entry")
+    for lane in ("E1", "E2", "E3", "APP"):
+        lock_path, record_path = _worker_lifetime_paths(run_root, lane)
+        record: dict[str, object] | None = None
+        if record_path.name in record_names:
+            payload, _content = _read_canonical_record(
+                record_path,
+                "worker process-group record",
+                byte_cap=4096,
+            )
+            if type(payload) is not dict or set(payload) != {
+                "schema_version",
+                "epoch_id",
+                "run_kind",
+                "lane",
+                "pid",
+                "pgid",
+            }:
+                raise ValueError("worker process-group record is invalid")
+            if (
+                payload.get("schema_version") != 1
+                or type(payload.get("schema_version")) is not int
+                or payload.get("epoch_id") != plan.epoch_id
+                or payload.get("run_kind") != plan.run_kind
+                or payload.get("lane") != lane
+                or type(payload.get("pid")) is not int
+                or payload["pid"] <= 0
+                or type(payload.get("pgid")) is not int
+                or payload["pgid"] <= 0
+            ):
+                raise ValueError("worker process-group record is stale")
+            record = payload
+        if lock_path.name not in lock_names:
+            if record is not None:
+                raise ValueError("worker process group lacks its lifetime lock")
+            continue
+        slot = _DescriptorSlot(
+            os.open(
+                lock_path,
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        )
+        primary: BaseException | None = None
+        locked_elsewhere = False
+        try:
+            metadata = os.fstat(slot.descriptor)
+            named = lock_path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.geteuid()
+                or (metadata.st_dev, metadata.st_ino)
+                != (named.st_dev, named.st_ino)
+            ):
+                raise ValueError("worker lifetime lock changed")
+            try:
+                fcntl.flock(
+                    slot.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            except BlockingIOError:
+                locked_elsewhere = True
+            if locked_elsewhere and record is None:
+                raise RuntimeError(
+                    "unrecorded worker may still be running"
+                )
+            if record is not None:
+                pgid = record["pgid"]
+                group_exists = _durable_process_group_exists(pgid)
+                if group_exists and not locked_elsewhere:
+                    try:
+                        leader_group = os.getpgid(record["pid"])
+                    except ProcessLookupError:
+                        raise RuntimeError(
+                            "unlocked durable worker group identity is "
+                            "indeterminate"
+                        ) from None
+                    if leader_group != pgid:
+                        raise RuntimeError(
+                            "durable worker group identity changed"
+                        )
+                if group_exists:
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 5.0
+                    while (
+                        _durable_process_group_exists(pgid)
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    if _durable_process_group_exists(pgid):
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        deadline = time.monotonic() + 5.0
+                        while (
+                            _durable_process_group_exists(pgid)
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                if _durable_process_group_exists(pgid):
+                    raise RuntimeError(
+                        "durable worker process group survived cancellation"
+                    )
+            if locked_elsewhere:
+                try:
+                    fcntl.flock(
+                        slot.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                except BlockingIOError:
+                    raise RuntimeError(
+                        "worker lifetime lock survived cancellation"
+                    ) from None
+        except BaseException as error:
+            primary = error
+        _retire_task_descriptors(
+            [slot],
+            primary=primary,
+            label="worker lifetime recovery or close failed",
+        )
+
+
+def _drain_worker_stream(stream: object) -> None:
+    if stream is None:
+        return
+    for _line in stream:
+        pass
+
+
+def _launch_parallel_workers(
+    *,
+    machine: CoordinatorStateMachine,
+    plan: EpochPlan,
+    options: ParallelOptions,
+    snapshot_root: Path,
+    dependencies: CoordinatorDependencies,
+    resume: ResumePlan,
+) -> None:
+    if not callable(dependencies.worker_command_factory):
+        raise TypeError("worker command factory must be callable")
+    for lane in ("E1", "E2", "E3", "APP"):
+        lifetime_slot, group_record_path = (
+            _acquire_worker_lifetime_lock(options.run_root, lane)
+        )
+        process: subprocess.Popen | None = None
+        try:
+            command = tuple(
+                dependencies.worker_command_factory(
+                    lane, plan, options, snapshot_root
+                )
+            ) + (
+                "--resume-plan-hex",
+                canonical_config_bytes(
+                    _encode_resume_plan_record(resume)
+                ).hex(),
+            )
+        except BaseException as error:
+            _retire_task_descriptors(
+                [lifetime_slot],
+                primary=error,
+                label="worker lifetime command or close failed",
+            )
+            raise AssertionError(
+                "worker command failure unexpectedly returned"
+            )
+        if not command or any(type(part) is not str for part in command):
+            error = ValueError(
+                "worker command must be a nonempty string sequence"
+            )
+            _retire_task_descriptors(
+                [lifetime_slot],
+                primary=error,
+                label="worker command validation or close failed",
+            )
+            raise AssertionError(
+                "invalid worker command unexpectedly returned"
+            )
+        lowered = "\0".join(command).lower()
+        if any(
+            forbidden in lowered
+            for forbidden in (
+                "result-destination",
+                "result_destination",
+                "writer-authority",
+                "commit-capability",
+            )
+        ):
+            error = RuntimeError(
+                "worker command exposed persistence state"
+            )
+            _retire_task_descriptors(
+                [lifetime_slot],
+                primary=error,
+                label="worker command isolation or close failed",
+            )
+            raise AssertionError(
+                "unsafe worker command unexpectedly returned"
+            )
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=snapshot_root / "evidence",
+                env=_parallel_worker_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=(lifetime_slot.descriptor,),
+            )
+            pgid = os.getpgid(process.pid)
+            _atomic_write_record(
+                group_record_path,
+                {
+                    "schema_version": 1,
+                    "epoch_id": plan.epoch_id,
+                    "run_kind": plan.run_kind,
+                    "lane": lane,
+                    "pid": process.pid,
+                    "pgid": pgid,
+                },
+            )
+            process.pgid = pgid
+        except BaseException as error:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5.0)
+                except BaseException:
+                    pass
+            _retire_task_descriptors(
+                [lifetime_slot],
+                primary=error,
+                label="worker launch or lifetime close failed",
+            )
+            raise AssertionError(
+                "worker launch failure unexpectedly returned"
+            )
+        _retire_task_descriptors(
+            [lifetime_slot],
+            primary=None,
+            label="worker lifetime handoff close failed",
+        )
+        process.worker_root = (
+            options.run_root / "app-server"
+            if lane == "APP"
+            else options.run_root / "workers" / lane
+        )
+        readers = tuple(
+            threading.Thread(
+                target=_drain_worker_stream,
+                args=(stream,),
+                daemon=True,
+            )
+            for stream in (process.stdout, process.stderr)
+        )
+        process._coordinator_readers = readers
+        for reader in readers:
+            reader.start()
+        machine.register_worker(lane, process)
+
+
+def _supervise_parallel_workers(
+    *,
+    machine: CoordinatorStateMachine,
+    options: ParallelOptions,
+) -> None:
+    sequences = {
+        lane: machine._ledger._state.last_sequence[lane] + 1
+        for lane in ("E1", "E2", "E3", "APP")
+    }
+    stopped: set[LaneName] = set()
+    while len(stopped) != 4:
+        progressed = False
+        for lane in ("E1", "E2", "E3", "APP"):
+            if lane in stopped:
+                continue
+            process = machine._workers[lane]
+            worker_root = Path(process.worker_root)
+            try:
+                message = wait_for_progress(
+                    worker_root=worker_root,
+                    expected_lane=lane,
+                    expected_seq=sequences[lane],
+                    timeout=0.05,
+                )
+            except TimeoutError:
+                poll = getattr(process, "poll")
+                if poll() is not None:
+                    machine._ledger.worker_exited(lane)
+                    machine.cancel(
+                        f"worker {lane} exited before durable terminal"
+                    )
+                    raise RuntimeError(
+                        f"worker {lane} exited before durable terminal"
+                    )
+                continue
+            decision = machine.accept_progress(message)
+            progressed = True
+            sequences[lane] += 1
+            if message.type == "worker-stopped":
+                return_code = process.wait(timeout=5.0)
+                machine._join_readers(process)
+                if type(return_code) is not int or return_code != 0:
+                    machine.cancel(
+                        f"worker {lane} failed after durable stop"
+                    )
+                    raise RuntimeError(
+                        f"worker {lane} exited unsuccessfully"
+                    )
+                stopped.add(lane)
+            if decision == "abort":
+                raise RuntimeError("worker progress requested abort")
+        if not progressed and machine.stop_launches:
+            active = [
+                lane
+                for lane, process in machine._workers.items()
+                if getattr(process, "poll")() is None
+            ]
+            if not active:
+                raise RuntimeError(
+                    "token launch ceiling left the epoch incomplete"
+                )
+
+
+def _reconcile_retry_cleanup_backup(paths: CasePaths) -> None:
+    backup = paths.root / "cleanup-attempt-1"
+    try:
+        backup_metadata = backup.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError("retry cleanup backup is unavailable") from None
+    if (
+        stat.S_ISLNK(backup_metadata.st_mode)
+        or not stat.S_ISDIR(backup_metadata.st_mode)
+        or stat.S_IMODE(backup_metadata.st_mode) != 0o700
+        or backup_metadata.st_uid != os.geteuid()
+    ):
+        raise ValueError("retry cleanup backup is unsafe")
+    backup_inventory = _directory_inventory(
+        backup, "retry cleanup backup"
+    )
+    if backup_inventory != ("ownership.json", "tombstone.json"):
+        raise ValueError("retry cleanup backup is incomplete")
+    for name in backup_inventory:
+        metadata = (backup / name).lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise ValueError("retry cleanup backup proof is unsafe")
+    try:
+        cleanup_metadata = paths.cleanup.lstat()
+    except FileNotFoundError:
+        cleanup_inventory: tuple[str, ...] = ()
+        cleanup_missing = True
+    except OSError:
+        raise ValueError("retry cleanup namespace is unavailable") from None
+    else:
+        cleanup_missing = False
+        if (
+            stat.S_ISLNK(cleanup_metadata.st_mode)
+            or not stat.S_ISDIR(cleanup_metadata.st_mode)
+            or stat.S_IMODE(cleanup_metadata.st_mode) != 0o700
+            or cleanup_metadata.st_uid != os.geteuid()
+        ):
+            raise ValueError("retry cleanup namespace is unsafe")
+        cleanup_inventory = _directory_inventory(
+            paths.cleanup, "retry cleanup namespace"
+        )
+    if cleanup_inventory:
+        if cleanup_inventory not in (
+            ("ownership.json",),
+            ("ownership.json", "tombstone.json"),
+        ):
+            raise ValueError("retry cleanup namespace is invalid")
+        return
+    descriptor, _metadata = _open_private_directory(
+        paths.root, "retry case root"
+    )
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    try:
+        if not cleanup_missing:
+            os.rmdir("cleanup", dir_fd=slot.descriptor)
+        os.rename(
+            "cleanup-attempt-1",
+            "cleanup",
+            src_dir_fd=slot.descriptor,
+            dst_dir_fd=slot.descriptor,
+        )
+        os.fsync(slot.descriptor)
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [slot],
+        primary=primary,
+        label="retry cleanup restoration or close failed",
+    )
+
+
+def _cleanup_parallel_epoch(
+    *,
+    machine: CoordinatorStateMachine,
+    lease: RunCoordinatorLease,
+    plan: EpochPlan,
+    bootstrap: InstalledAuthBootstrap | None,
+    authority: QuiescentRunAuthority | None = None,
+) -> tuple[TeardownReceipt, Path]:
+    if authority is None:
+        authority = machine.workers_stopped()
+        machine.begin_teardown()
+    else:
+        _validate_quiescent_cleanup_access(
+            lease=lease,
+            authority=authority,
+            plan=plan,
+            run_root=lease._run_root,
+        )
+    cases_root = lease._run_root / "cases"
+    expected_case_names = {
+        paths_for_case(lease._run_root, assignment).root.name
+        for assignment in plan.assignments
+    }
+    try:
+        cases_metadata = cases_root.lstat()
+    except FileNotFoundError:
+        case_entries: tuple[object, ...] = ()
+    except OSError:
+        raise ValueError("case namespace is unavailable") from None
+    else:
+        if (
+            stat.S_ISLNK(cases_metadata.st_mode)
+            or not stat.S_ISDIR(cases_metadata.st_mode)
+            or stat.S_IMODE(cases_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("case namespace is unsafe")
+        try:
+            case_entries = tuple(os.scandir(cases_root))
+        except OSError:
+            raise ValueError("case namespace is unavailable") from None
+    if len(case_entries) > len(plan.assignments):
+        raise ValueError("case namespace exceeds the frozen plan")
+    for entry in case_entries:
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError:
+            raise ValueError("case namespace entry is unavailable") from None
+        if (
+            entry.name not in expected_case_names
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError("case namespace contains an unknown root")
+    tombstones: list[tuple[CaseKey, TombstoneReceipt]] = []
+    for assignment in plan.assignments:
+        paths = paths_for_case(lease._run_root, assignment)
+        _reconcile_retry_cleanup_backup(paths)
+        try:
+            paths.cleanup.lstat()
+        except FileNotFoundError:
+            try:
+                paths.codex_home.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise ValueError(
+                    "case Codex-home absence is indeterminate"
+                ) from None
+            else:
+                raise ValueError(
+                    "case Codex home exists without cleanup ownership"
+                )
+            continue
+        except OSError:
+            raise ValueError("case cleanup namespace is unavailable") from None
+        receipt = recover_case_auth_cleanup(
+            plan=plan,
+            assignment=assignment,
+            paths=paths,
+            lease=lease,
+            authority=authority,
+        )
+        teardown_case_auth(
+            paths=paths,
+            receipt=receipt,
+            lease=lease,
+            authority=authority,
+        )
+        tombstones.append((assignment.key, receipt))
+    if bootstrap is None:
+        bootstrap_receipt = recover_auth_bootstrap_cleanup(
+            plan=plan,
+            coordinator_root=lease._run_root / "coordinator",
+            lease=lease,
+            authority=authority,
+        )
+    else:
+        bootstrap_receipt = cleanup_auth_bootstrap(
+            installed=bootstrap,
+            lease=lease,
+            authority=authority,
+        )
+    teardown_auth_bootstrap(
+        coordinator_root=lease._run_root / "coordinator",
+        receipt=bootstrap_receipt,
+        lease=lease,
+        authority=authority,
+    )
+    receipt = write_teardown_receipt(
+        plan=plan,
+        run_root=lease._run_root,
+        tombstones=tuple(tombstones),
+        bootstrap=bootstrap_receipt,
+        lease=lease,
+        authority=authority,
+    )
+    machine.mark_torn_down(receipt)
+    return receipt, lease._run_root / "coordinator/teardown.json"
+
+
+def _write_or_verify_coordinator_record(
+    path: Path,
+    payload: Mapping[str, object],
+    label: str,
+) -> None:
+    expected = canonical_config_bytes(payload)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _atomic_write_record(path, payload)
+        return
+    except OSError:
+        raise ValueError(f"{label} is unavailable") from None
+    current_payload, current = _read_canonical_record(path, label)
+    if current != expected or current_payload != dict(payload):
+        raise ValueError(f"{label} differs from the sealed coordinator record")
+
+
+def _entry_exists_no_follow(path: Path, label: str) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise ValueError(f"{label} is unavailable") from None
+    return True
+
+
+def run_parallel_evaluation(
+    *,
+    repository_root: Path,
+    manifests: dict[EvalMode, list[dict[str, object]]],
+    result_destinations: dict[EvalMode, Path] | None,
+    options: ParallelOptions,
+    dependencies: CoordinatorDependencies | None = None,
+) -> ParallelRunResult:
+    repository, _identity = _canonical_git_repository_root(repository_root)
+    if type(options) is not ParallelOptions:
+        raise TypeError("options must be exact ParallelOptions")
+    if options.run_kind in ("diagnostic", "discovery"):
+        if result_destinations is not None:
+            raise ValueError(
+                "diagnostic and discovery require result_destinations=None"
+            )
+    elif options.run_kind == "formal":
+        if type(result_destinations) is not dict:
+            raise ValueError("formal parallel evaluation requires destinations")
+    else:
+        raise ValueError("invalid parallel run kind")
+    (
+        plan,
+        transport_config,
+        snapshot_root,
+        frozen_manifests,
+        capture_digests,
+    ) = (
+        _parallel_plan_inputs(
+            repository_root=repository,
+            manifests=manifests,
+            options=options,
+        )
+    )
+    run_root = canonical_run_root(options.run_root)
+    bound_options = replace(options, run_root=run_root)
+    coordinator_dependencies = (
+        production_coordinator_dependencies(snapshot_root=snapshot_root)
+        if dependencies is None
+        else dependencies
+    )
+    if type(coordinator_dependencies) is not CoordinatorDependencies:
+        raise TypeError("dependencies must be exact CoordinatorDependencies")
+    if not callable(coordinator_dependencies.integrity_runner):
+        raise TypeError("coordinator integrity runner must be callable")
+
+    run_lease: RunCoordinatorLease | None = None
+    writer_lease: ResultWriterLease | None = None
+    writer_authority: ResultWriterAuthority | None = None
+    machine: CoordinatorStateMachine | None = None
+    bootstrap: InstalledAuthBootstrap | None = None
+    body_error: BaseException | None = None
+    result: ParallelRunResult | None = None
+    try:
+        run_lease = RunCoordinatorLease.acquire(
+            run_root=run_root,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+        )
+        guard = CoordinatorGuard.capture(repository)
+        machine = CoordinatorStateMachine.create(
+            plan, bound_options, guard
+        )
+        machine._bind_run_lease(run_lease)
+        if plan.run_kind == "formal":
+            writer_lease = ResultWriterLease.acquire(
+                repository,
+                "parallel-coordinator",
+                "formal",
+                run_lease=run_lease,
+            )
+            writer_authority = writer_lease.authority()
+
+        coordinator_root = run_root / "coordinator"
+        _materialize_parallel_snapshot(
+            repository_root=repository,
+            snapshot_root=snapshot_root,
+            expected_digests=capture_digests,
+        )
+        _write_or_verify_coordinator_record(
+            coordinator_root / "epoch-plan.json",
+            _encode_epoch_plan_record(plan),
+            "sealed epoch plan",
+        )
+        _write_or_verify_coordinator_record(
+            coordinator_root / "transport-config.json",
+            asdict(transport_config),
+            "sealed transport config",
+        )
+        cleanup_root = coordinator_root / "cleanup"
+        ownership_path = cleanup_root / "bootstrap-ownership.json"
+        tombstone_path = cleanup_root / "bootstrap-tombstone.json"
+        teardown_path = coordinator_root / "teardown.json"
+        stop_launches_path = coordinator_root / "stop-launches.json"
+        has_ownership = _entry_exists_no_follow(
+            ownership_path, "bootstrap ownership"
+        )
+        has_tombstone = _entry_exists_no_follow(
+            tombstone_path, "bootstrap tombstone"
+        )
+        has_teardown = _entry_exists_no_follow(
+            teardown_path, "coordinator teardown receipt"
+        )
+        has_stop_launches = _entry_exists_no_follow(
+            stop_launches_path, "coordinator stop marker"
+        )
+        cleanup_only = _parallel_recovery_is_cleanup_only(
+            has_ownership=has_ownership,
+            has_tombstone=has_tombstone,
+            has_teardown=has_teardown,
+            has_stop_launches=has_stop_launches,
+            resume_requested=bound_options.resume_run_root is not None,
+        )
+
+        if cleanup_only:
+            if not has_ownership:
+                raise ValueError(
+                    "cleanup-only recovery lacks bootstrap ownership"
+                )
+        elif has_ownership and not has_tombstone:
+            bootstrap = _reopen_auth_bootstrap(
+                plan=plan, coordinator_root=coordinator_root
+            )
+        elif not has_ownership:
+            bootstrap = prepare_auth_bootstrap(
+                source_codex_home=bound_options.source_codex_home,
+                coordinator_root=coordinator_root,
+                plan=plan,
+            )
+
+        launch_resume = ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=tuple(
+                assignment.key for assignment in plan.assignments
+            ),
+            invalid=(),
+        )
+        teardown_authority: QuiescentRunAuthority | None = None
+        if (
+            not cleanup_only
+            and bound_options.resume_run_root is not None
+        ):
+            resume_authority = machine.workers_stopped()
+            if has_teardown:
+                bootstrap = _rearm_bootstrap_before_resume(
+                    plan=plan,
+                    coordinator_root=coordinator_root,
+                    source_codex_home=bound_options.source_codex_home,
+                    lease=run_lease,
+                    authority=resume_authority,
+                )
+            resume = _classify_resume_under_quiescence(
+                plan=plan,
+                run_root=run_root,
+                current_fingerprints=plan.fingerprints,
+                manifests=frozen_manifests,
+                lease=run_lease,
+                authority=resume_authority,
+            )
+            resume_last_sequence, resume_completed = (
+                _resume_protocol_bindings(
+                    plan=plan,
+                    run_root=run_root,
+                    manifests=frozen_manifests,
+                )
+            )
+            machine._seed_resume_protocol(
+                total_tokens=_resume_token_total(
+                    plan=plan,
+                    run_root=run_root,
+                    manifests=frozen_manifests,
+                ),
+                last_sequence=resume_last_sequence,
+                completed_attempts=resume_completed,
+            )
+            if resume.invalid or (
+                machine.stop_launches and resume.pending
+            ):
+                machine._cancel_reason = (
+                    "resume snapshot is invalid or token-limited"
+                )
+                machine._stop_launches = True
+                cleanup_only = True
+                teardown_authority = resume_authority
+            else:
+                launch_resume = resume
+                machine._resume_to_launch(resume_authority)
+
+        if not cleanup_only:
+            guard.checkpoint("before parallel worker launch")
+            _launch_parallel_workers(
+                machine=machine,
+                plan=plan,
+                options=bound_options,
+                snapshot_root=snapshot_root,
+                dependencies=coordinator_dependencies,
+                resume=launch_resume,
+            )
+            _supervise_parallel_workers(
+                machine=machine,
+                options=bound_options,
+            )
+        elif machine.phase == "preflight":
+            machine.cancel("cleanup-only coordinator")
+
+        _teardown, teardown_path = _cleanup_parallel_epoch(
+            machine=machine,
+            lease=run_lease,
+            plan=plan,
+            bootstrap=bootstrap,
+            authority=teardown_authority,
+        )
+        if machine.phase == "failed":
+            result = ParallelRunResult(
+                run_kind=plan.run_kind,
+                run_root=run_root,
+                status="failed",
+                validated=None,
+            )
+        elif plan.run_kind == "diagnostic":
+            result = ParallelRunResult(
+                run_kind=plan.run_kind,
+                run_root=run_root,
+                status="diagnostic",
+                validated=None,
+            )
+        else:
+            machine.begin_validation()
+            case_paths = {
+                assignment.key: paths_for_case(run_root, assignment)
+                for assignment in plan.assignments
+            }
+            shard_paths = {
+                lane: (
+                    run_root / "app-server/sealed/shard-commit.json"
+                    if lane == "APP"
+                    else run_root
+                    / "workers"
+                    / lane
+                    / "sealed/shard-commit.json"
+                )
+                for lane in ("E1", "E2", "E3", "APP")
+            }
+            validated = validate_epoch_for_aggregation(
+                plan=plan,
+                run_root=run_root,
+                snapshot_root=snapshot_root,
+                manifests=frozen_manifests,
+                shard_paths=shard_paths,
+                case_paths=case_paths,
+                integrity_runner=coordinator_dependencies.integrity_runner,
+                guard=guard,
+                current_fingerprints=plan.fingerprints,
+                teardown_receipt=teardown_path,
+            )
+            machine.mark_validated(validated)
+            if plan.run_kind == "discovery":
+                result = ParallelRunResult(
+                    run_kind=plan.run_kind,
+                    run_root=run_root,
+                    status="validated",
+                    validated=validated,
+                )
+            else:
+                if writer_authority is None or result_destinations is None:
+                    raise AssertionError(
+                        "formal coordinator lacks writer authority"
+                    )
+                commit = validated.claim_formal_commit()
+                machine.mark_commit_ready(commit)
+                persist_validated_epoch(
+                    commit,
+                    authority=writer_authority,
+                    destinations=result_destinations,
+                    guard=guard,
+                )
+                machine.mark_committed()
+                result = ParallelRunResult(
+                    run_kind=plan.run_kind,
+                    run_root=run_root,
+                    status="committed",
+                    validated=validated,
+                )
+    except BaseException as error:
+        body_error = error
+        if is_indeterminate_descriptor_close(error):
+            close_errors: list[BaseException] = []
+            if (
+                bootstrap is not None
+                and bootstrap.descriptor_close_state == "owned"
+            ):
+                close_error = _retire_descriptor_capability(bootstrap)
+                if close_error is not None:
+                    close_errors.append(close_error)
+                bootstrap = None
+            _raise_task_failures(
+                primary=error,
+                close_errors=close_errors,
+                label=(
+                    "parallel coordinator indeterminate failure or "
+                    "bootstrap close failed"
+                ),
+            )
+            raise AssertionError(
+                "indeterminate coordinator failure unexpectedly returned"
+            )
+        if machine is not None:
+            try:
+                if machine._phase in ("preflight", "running"):
+                    machine.cancel("parallel coordinator failure")
+                if (
+                    run_lease is not None
+                    and machine._phase == "cancelling"
+                    and machine._active_authority is None
+                ):
+                    _cleanup_parallel_epoch(
+                        machine=machine,
+                        lease=run_lease,
+                        plan=plan,
+                        bootstrap=bootstrap,
+                    )
+            except BaseException as cleanup_error:
+                if is_indeterminate_descriptor_close(cleanup_error):
+                    raise cleanup_error from error
+        if machine is not None and machine._phase != "committed":
+            machine._stop_launches = True
+            machine._phase = "failed"
+        result = ParallelRunResult(
+            run_kind=plan.run_kind,
+            run_root=run_root,
+            status="failed",
+            validated=None,
+        )
+    finally:
+        close_errors: list[BaseException] = []
+        if writer_lease is not None:
+            try:
+                writer_lease.close()
+            except BaseException as error:
+                close_errors.append(error)
+        if run_lease is not None:
+            try:
+                run_lease.close()
+            except BaseException as error:
+                close_errors.append(error)
+        if close_errors:
+            errors = (
+                ([body_error] if body_error is not None else [])
+                + close_errors
+            )
+            if len(errors) == 1:
+                raise errors[0]
+            group_type = (
+                ExceptionGroup
+                if all(isinstance(error, Exception) for error in errors)
+                else BaseExceptionGroup
+            )
+            raise group_type(
+                "parallel coordinator body or lease close failed",
+                errors,
+            )
+    if result is None:
+        raise AssertionError("parallel coordinator produced no result")
+    return result

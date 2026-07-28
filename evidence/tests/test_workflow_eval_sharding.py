@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -12944,6 +12945,1113 @@ sharding.wait_for_ack(worker_root, message, 0.05)
             task9_eval.TokenUsage,
             "transport and progress must use one bounded TokenUsage type",
         )
+
+
+class CoordinatorStateTests(unittest.TestCase):
+    class FakeReader:
+        def __init__(self, events, label):
+            self.events = events
+            self.label = label
+            self.joined = False
+
+        def join(self, timeout=None):
+            self.events.append(("reader-joined", self.label))
+            self.joined = True
+
+        def is_alive(self):
+            return not self.joined
+
+    class FakeProcess:
+        def __init__(self, lane, root, events, pid):
+            self.lane = lane
+            self.pid = pid
+            self.pgid = pid + 1000
+            self.returncode = None
+            self.events = events
+            self.worker_root = root
+            self._coordinator_readers = (
+                CoordinatorStateTests.FakeReader(events, lane),
+            )
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.events.append(("process-waited", self.lane))
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("coordinator must cancel the process group")
+
+        def kill(self):
+            raise AssertionError("coordinator must kill the process group")
+
+    class FakeLedger:
+        def __init__(self, malformed_lane=None, decisions=None):
+            self.malformed_lane = malformed_lane
+            self.decisions = {} if decisions is None else dict(decisions)
+
+        def accept_progress(self, message):
+            if message.lane == self.malformed_lane:
+                raise ValueError("malformed lane progress")
+            return self.decisions.get(message.lane, "continue")
+
+        def worker_exited(self, _lane):
+            return "abort"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.repository = (self.root / "repository").resolve()
+        subprocess.run(
+            ["git", "init", "-q", str(self.repository)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.plan = sharding.build_epoch_plan(
+            run_kind="discovery",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("discovery"),
+        )
+        self.run_root = self.root / "run"
+        self.source_codex_home = self.root / "source-codex-home"
+        self.source_codex_home.mkdir(mode=0o700)
+        (self.source_codex_home / "auth.json").write_bytes(b'{"token":"secret"}')
+        (self.source_codex_home / "auth.json").chmod(0o600)
+        self.codex_executable = self.root / "codex"
+        self.codex_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.codex_executable.chmod(0o700)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _require_state_machine(self):
+        self.assertTrue(
+            all(
+                hasattr(sharding, name)
+                for name in (
+                    "CoordinatorPhase",
+                    "QuiescentRunAuthority",
+                    "CoordinatorStateMachine",
+                    "ParallelOptions",
+                    "WorkerDependencies",
+                    "CoordinatorDependencies",
+                    "ParallelRunResult",
+                    "build_production_case_driver",
+                    "build_production_runtime_factory",
+                    "production_worker_dependencies",
+                    "production_coordinator_dependencies",
+                    "run_worker",
+                    "worker_main",
+                    "run_parallel_evaluation",
+                )
+            ),
+            "coordinator state machine is absent",
+        )
+
+    def _options(self, *, run_kind="discovery", max_total_tokens=None):
+        self._require_state_machine()
+        return sharding.ParallelOptions(
+            run_kind=run_kind,
+            run_root=self.run_root,
+            source_codex_home=self.source_codex_home,
+            codex_executable=self.codex_executable,
+            max_total_tokens=max_total_tokens,
+        )
+
+    def _new_machine(self, *, plan=None, options=None):
+        self._require_state_machine()
+        plan = self.plan if plan is None else plan
+        options = self._options() if options is None else options
+        guard = sharding.CoordinatorGuard.capture(self.repository)
+        return sharding.CoordinatorStateMachine.create(
+            plan, options, guard
+        ), guard
+
+    def _lane_message(self, lane, *, seq=1, progress_type="shard-terminal"):
+        status = "success" if progress_type == "shard-terminal" else None
+        return sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane=lane,
+            seq=seq,
+            type=progress_type,
+            case=None,
+            attempt=None,
+            status=status,
+            classification=None,
+            model_started=None,
+            usage=None,
+            attempt_terminal_sha256=None,
+            case_commit_sha256=None,
+            shard_commit_sha256=(
+                hashlib.sha256(lane.encode("ascii")).hexdigest()
+                if progress_type == "shard-terminal"
+                else None
+            ),
+            tombstone_receipt_sha256=None,
+        )
+
+    def _register_fake_lanes(self, machine, events):
+        processes = {}
+        for index, lane in enumerate(("E1", "E2", "E3", "APP"), start=1):
+            worker_root = (
+                self.run_root / "app-server"
+                if lane == "APP"
+                else self.run_root / "workers" / lane
+            )
+            process = self.FakeProcess(
+                lane, worker_root, events, pid=4100 + index
+            )
+            processes[lane] = process
+            machine.register_worker(lane, process)
+        return processes
+
+    def _prepare_case_and_bootstrap(self):
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        bootstrap = sharding.prepare_auth_bootstrap(
+            source_codex_home=self.source_codex_home,
+            coordinator_root=self.run_root / "coordinator",
+            plan=self.plan,
+        )
+        assignment = self.plan.assignments[0]
+        paths = sharding.paths_for_case(self.run_root, assignment)
+        for path in (
+            paths.root,
+            paths.cleanup,
+            paths.attempts,
+            paths.staging,
+            paths.workspace.parent,
+            paths.store,
+            paths.audit,
+            paths.payload,
+            paths.output,
+            paths.home,
+            paths.tmp,
+            paths.config,
+            paths.cache,
+            paths.sealed,
+        ):
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+            path.chmod(0o700)
+        installed = sharding.install_case_auth(
+            bootstrap=bootstrap.path,
+            plan=self.plan,
+            assignment=assignment,
+            paths=paths,
+        )
+        evidence = paths.sealed / "retained-evidence.txt"
+        evidence.write_text("retain me", encoding="utf-8")
+        evidence.chmod(0o600)
+        return lease, bootstrap, assignment, paths, installed, evidence
+
+    def test_terminal_checkpoint_precedes_ack_and_failure_cancels_all(self):
+        machine, _guard = self._new_machine()
+        events = []
+        processes = self._register_fake_lanes(machine, events)
+        machine._ledger = self.FakeLedger(malformed_lane="E2")
+
+        real_checkpoint = sharding.CoordinatorGuard.checkpoint
+
+        def checkpoint(guard, reason):
+            events.append(("checkpoint", reason))
+            return real_checkpoint(guard, reason)
+
+        def ack(_worker_root, message, decision):
+            events.append(("ack", message.lane, decision))
+            return self.run_root / f"{message.lane}.ack"
+
+        def killpg(pgid, sig):
+            events.append(("killpg", pgid, sig))
+
+        with mock.patch.object(
+            sharding.CoordinatorGuard, "checkpoint", new=checkpoint
+        ), mock.patch.object(
+            sharding, "write_ack", side_effect=ack
+        ), mock.patch.object(
+            sharding.os, "getpgid", side_effect=lambda pid: pid + 1000
+        ), mock.patch.object(
+            sharding.os, "killpg", side_effect=killpg
+        ):
+            for lane in ("APP", "E3", "E1"):
+                self.assertEqual(
+                    "continue",
+                    machine.accept_progress(self._lane_message(lane)),
+                )
+            with self.assertRaisesRegex(ValueError, "malformed lane"):
+                machine.accept_progress(self._lane_message("E2"))
+
+        for lane in ("APP", "E3", "E1"):
+            checkpoint_index = next(
+                index
+                for index, event in enumerate(events)
+                if event[0] == "checkpoint" and lane in event[1]
+            )
+            ack_index = events.index(("ack", lane, "continue"))
+            self.assertLess(checkpoint_index, ack_index)
+        self.assertEqual(
+            {process.pid + 1000 for process in processes.values()},
+            {event[1] for event in events if event[0] == "killpg"},
+        )
+        self.assertTrue(
+            all(
+                reader.joined
+                for process in processes.values()
+                for reader in process._coordinator_readers
+            )
+        )
+        self.assertEqual("cancelling", machine.phase)
+
+    def test_cancel_recovers_active_case_before_failed(self):
+        self._require_state_machine()
+        (
+            lease,
+            bootstrap,
+            assignment,
+            paths,
+            installed,
+            evidence,
+        ) = self._prepare_case_and_bootstrap()
+        try:
+            close_error = sharding._retire_descriptor_capability(installed)
+            self.assertIsNone(close_error)
+            machine, _guard = self._new_machine()
+            machine.cancel("worker exited before tombstone")
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+
+            recovered = sharding.recover_case_auth_cleanup(
+                plan=self.plan,
+                assignment=assignment,
+                paths=paths,
+                lease=lease,
+                authority=authority,
+            )
+            self.assertEqual("coordinator-recovery", recovered.producer)
+            sharding.teardown_case_auth(
+                paths=paths,
+                receipt=recovered,
+                lease=lease,
+                authority=authority,
+            )
+            bootstrap_receipt = sharding.cleanup_auth_bootstrap(
+                installed=bootstrap,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.teardown_auth_bootstrap(
+                coordinator_root=self.run_root / "coordinator",
+                receipt=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            receipt = sharding.write_teardown_receipt(
+                plan=self.plan,
+                run_root=self.run_root,
+                tombstones=((assignment.key, recovered),),
+                bootstrap=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            self.assertTrue(
+                (self.run_root / "coordinator" / "teardown.json").is_file()
+            )
+            machine.mark_torn_down(receipt)
+            self.assertEqual("failed", machine.phase)
+            self.assertFalse(paths.codex_home.exists())
+            self.assertTrue(paths.root.is_dir())
+            self.assertEqual("retain me", evidence.read_text(encoding="utf-8"))
+        finally:
+            if lease.active:
+                lease.close()
+
+    def test_teardown_requires_ordered_leases_and_quiescent_authority(self):
+        self._require_state_machine()
+        lease, _bootstrap, assignment, paths, installed, _evidence = (
+            self._prepare_case_and_bootstrap()
+        )
+        try:
+            with self.assertRaises(RuntimeError):
+                sharding.RunCoordinatorLease.acquire(
+                    run_root=self.run_root,
+                    epoch_id=self.plan.epoch_id,
+                    run_kind=self.plan.run_kind,
+                )
+            with self.assertRaises((TypeError, RuntimeError)):
+                sharding.teardown_case_auth(
+                    paths=paths,
+                    receipt=mock.sentinel.receipt,
+                    lease=lease,
+                    authority=mock.sentinel.authority,
+                )
+            with self.assertRaises(RuntimeError):
+                sharding.ResultWriterLease.acquire(
+                    self.repository,
+                    "serial-coordinator",
+                    "formal",
+                )
+
+            machine, _guard = self._new_machine()
+            with self.assertRaises(RuntimeError):
+                machine.begin_teardown()
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+            close_error = sharding._retire_descriptor_capability(installed)
+            self.assertIsNone(close_error)
+            receipt = sharding.recover_case_auth_cleanup(
+                plan=self.plan,
+                assignment=assignment,
+                paths=paths,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.teardown_case_auth(
+                paths=paths,
+                receipt=receipt,
+                lease=lease,
+                authority=authority,
+            )
+            self.assertFalse(authority.consumed)
+        finally:
+            if lease.active:
+                lease.close()
+
+        writer = sharding.ResultWriterLease.acquire(
+            self.repository,
+            "serial-coordinator",
+            "formal",
+        )
+        try:
+            with self.assertRaises(RuntimeError):
+                sharding.RunCoordinatorLease.acquire(
+                    run_root=self.root / "reverse-run",
+                    epoch_id="f" * 64,
+                    run_kind="formal",
+                )
+        finally:
+            writer.close()
+
+    def test_interrupted_bootstrap_cleanup_recovers_before_teardown(self):
+        self._require_state_machine()
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            installed = sharding.prepare_auth_bootstrap(
+                source_codex_home=self.source_codex_home,
+                coordinator_root=self.run_root / "coordinator",
+                plan=self.plan,
+            )
+            close_error = sharding._retire_descriptor_capability(installed)
+            self.assertIsNone(close_error)
+            self.assertFalse(
+                (
+                    self.run_root
+                    / "coordinator/cleanup/bootstrap-tombstone.json"
+                ).exists()
+            )
+            machine, _guard = self._new_machine()
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+            recovered = sharding.recover_auth_bootstrap_cleanup(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                lease=lease,
+                authority=authority,
+            )
+            self.assertEqual("coordinator-recovery", recovered.producer)
+            sharding.teardown_auth_bootstrap(
+                coordinator_root=self.run_root / "coordinator",
+                receipt=recovered,
+                lease=lease,
+                authority=authority,
+            )
+            teardown = sharding.write_teardown_receipt(
+                plan=self.plan,
+                run_root=self.run_root,
+                tombstones=(),
+                bootstrap=recovered,
+                lease=lease,
+                authority=authority,
+            )
+            self.assertTrue(authority.consumed)
+            self.assertFalse(installed.path.exists())
+            self.assertTrue(
+                (self.run_root / "coordinator/teardown.json").is_file()
+            )
+            machine.mark_torn_down(teardown)
+            self.assertEqual("tearing-down", machine.phase)
+        finally:
+            if lease.active:
+                lease.close()
+
+    def test_indeterminate_close_requires_fresh_cleanup_only_coordinator(self):
+        self._require_state_machine()
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        installed = sharding.prepare_auth_bootstrap(
+            source_codex_home=self.source_codex_home,
+            coordinator_root=self.run_root / "coordinator",
+            plan=self.plan,
+        )
+        machine, _guard = self._new_machine()
+        authority = machine.workers_stopped()
+        machine.begin_teardown()
+        real_close = sharding.os.close
+        target = installed.descriptor
+
+        def close_then_raise(descriptor):
+            real_close(descriptor)
+            if descriptor == target:
+                raise OSError("indeterminate bootstrap close")
+
+        with mock.patch.object(
+            sharding.os, "close", side_effect=close_then_raise
+        ):
+            with self.assertRaisesRegex(
+                OSError, "indeterminate bootstrap close"
+            ) as caught:
+                sharding.cleanup_auth_bootstrap(
+                    installed=installed,
+                    lease=lease,
+                    authority=authority,
+                )
+        self.assertTrue(
+            sharding.is_indeterminate_descriptor_close(caught.exception)
+        )
+        self.assertTrue(
+            (
+                self.run_root / "coordinator/cleanup/bootstrap-tombstone.json"
+            ).is_file()
+        )
+        self.assertTrue(installed.path.is_dir())
+
+        with mock.patch.object(
+            sharding, "_read_canonical_record"
+        ) as read_spy, mock.patch.object(
+            sharding.os, "rmdir"
+        ) as remove_spy, mock.patch.object(
+            sharding, "_atomic_write_record"
+        ) as write_spy:
+            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                sharding.recover_auth_bootstrap_cleanup(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    lease=lease,
+                    authority=authority,
+                )
+            read_spy.assert_not_called()
+            remove_spy.assert_not_called()
+            write_spy.assert_not_called()
+        lease.close()
+        with self.assertRaisesRegex(RuntimeError, "lease process is poisoned"):
+            sharding.RunCoordinatorLease.acquire(
+                run_root=self.run_root,
+                epoch_id=self.plan.epoch_id,
+                run_kind=self.plan.run_kind,
+            )
+        # The remaining assertions model a new interpreter after process exit.
+        sharding._LEASE_PROCESS_POISON = None
+        self.addCleanup(
+            setattr, sharding, "_LEASE_PROCESS_POISON", None
+        )
+
+        fresh_lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        recovered = None
+        teardown = None
+        try:
+            fresh_machine, _guard = self._new_machine()
+            fresh_authority = fresh_machine.workers_stopped()
+            fresh_machine.begin_teardown()
+            recovered = sharding.recover_auth_bootstrap_cleanup(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                lease=fresh_lease,
+                authority=fresh_authority,
+            )
+            self.assertEqual("coordinator", recovered.producer)
+            sharding.teardown_auth_bootstrap(
+                coordinator_root=self.run_root / "coordinator",
+                receipt=recovered,
+                lease=fresh_lease,
+                authority=fresh_authority,
+            )
+            teardown = sharding.write_teardown_receipt(
+                plan=self.plan,
+                run_root=self.run_root,
+                tombstones=(),
+                bootstrap=recovered,
+                lease=fresh_lease,
+                authority=fresh_authority,
+            )
+            fresh_machine.mark_torn_down(teardown)
+            self.assertFalse(installed.path.exists())
+            self.assertTrue(fresh_authority.consumed)
+            self.assertEqual({}, fresh_machine._workers)
+        finally:
+            if fresh_lease.active:
+                fresh_lease.close()
+
+        verifying_lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            verifying_machine, _guard = self._new_machine()
+            verifying_authority = verifying_machine.workers_stopped()
+            verifying_machine.begin_teardown()
+            self.assertEqual(
+                teardown,
+                sharding.write_teardown_receipt(
+                    plan=self.plan,
+                    run_root=self.run_root,
+                    tombstones=(),
+                    bootstrap=recovered,
+                    lease=verifying_lease,
+                    authority=verifying_authority,
+                ),
+            )
+            self.assertTrue(verifying_authority.consumed)
+            self.assertEqual({}, verifying_machine._workers)
+        finally:
+            if verifying_lease.active:
+                verifying_lease.close()
+
+    def test_phase_transition_matrix_and_single_use_authority(self):
+        machine, _guard = self._new_machine()
+        self.assertEqual(
+            (
+                "preflight",
+                "running",
+                "cancelling",
+                "tearing-down",
+                "validating",
+                "validated",
+                "commit-ready",
+                "committed",
+                "failed",
+            ),
+            get_args(sharding.CoordinatorPhase),
+        )
+        self.assertEqual(
+            [
+                "run_kind",
+                "run_root",
+                "source_codex_home",
+                "codex_executable",
+                "requested_model",
+                "requested_reasoning_effort",
+                "resume_run_root",
+                "max_total_tokens",
+            ],
+            [field.name for field in fields(sharding.ParallelOptions)],
+        )
+        self.assertEqual(
+            ["runtime_factory", "case_driver"],
+            [field.name for field in fields(sharding.WorkerDependencies)],
+        )
+        self.assertEqual(
+            ["worker_command_factory", "integrity_runner"],
+            [field.name for field in fields(sharding.CoordinatorDependencies)],
+        )
+        self.assertEqual(
+            ["run_kind", "run_root", "status", "validated"],
+            [field.name for field in fields(sharding.ParallelRunResult)],
+        )
+        expected_signatures = {
+            "build_production_case_driver": (
+                "snapshot_root",
+                "transport_config",
+                "transport_runner",
+            ),
+            "build_production_runtime_factory": (
+                "snapshot_root",
+                "transport_config",
+                "plan",
+            ),
+            "production_worker_dependencies": (
+                "snapshot_root",
+                "transport_config",
+                "plan",
+            ),
+            "production_coordinator_dependencies": ("snapshot_root",),
+            "run_worker": (
+                "lane",
+                "plan",
+                "run_root",
+                "snapshot_root",
+                "dependencies",
+            ),
+            "worker_main": ("argv",),
+            "run_parallel_evaluation": (
+                "repository_root",
+                "manifests",
+                "result_destinations",
+                "options",
+                "dependencies",
+            ),
+        }
+        for name, expected in expected_signatures.items():
+            with self.subTest(interface=name):
+                self.assertEqual(
+                    expected,
+                    tuple(
+                        inspect.signature(
+                            getattr(sharding, name)
+                        ).parameters
+                    ),
+                )
+        with self.assertRaises(RuntimeError):
+            machine.begin_validation()
+        with self.assertRaises(RuntimeError):
+            machine.mark_committed()
+        authority = machine.workers_stopped()
+        with self.assertRaises(RuntimeError):
+            machine.workers_stopped()
+        machine.begin_teardown()
+        self.assertFalse(authority.consumed)
+        with self.assertRaises((TypeError, RuntimeError)):
+            sharding.QuiescentRunAuthority()
+
+    def test_option_a_resume_classification_holds_launch_authority(self):
+        machine, _guard = self._new_machine()
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            authority = machine.workers_stopped()
+            observed = []
+
+            def classify(**kwargs):
+                observed.append(
+                    (
+                        authority.consumed,
+                        lease.active,
+                        machine.phase,
+                    )
+                )
+                return sharding.ResumePlan(
+                    run_kind=self.plan.run_kind,
+                    reusable=(),
+                    pending=tuple(
+                        assignment.key
+                        for assignment in self.plan.assignments
+                    ),
+                    invalid=(),
+                )
+
+            with mock.patch.object(
+                sharding, "plan_resume", side_effect=classify
+            ):
+                resume = sharding._classify_resume_under_quiescence(
+                    plan=self.plan,
+                    run_root=self.run_root,
+                    current_fingerprints=self.plan.fingerprints,
+                    manifests=self.manifests,
+                    lease=lease,
+                    authority=authority,
+                )
+            self.assertEqual(
+                [(False, True, "tearing-down")],
+                observed,
+            )
+            self.assertEqual(self.plan.run_kind, resume.run_kind)
+            machine._resume_to_launch(authority)
+            self.assertTrue(authority.consumed)
+            with self.assertRaises(RuntimeError):
+                machine._resume_to_launch(authority)
+        finally:
+            if lease.active:
+                lease.close()
+
+    def test_worker_command_has_no_persistence_surface(self):
+        self._require_state_machine()
+        dependencies = sharding.production_coordinator_dependencies(
+            snapshot_root=self.root / "snapshot"
+        )
+        command = tuple(
+            dependencies.worker_command_factory(
+                "E1", self.plan, self._options(), self.root / "snapshot"
+            )
+        )
+        rendered = "\0".join(command).lower()
+        for forbidden in (
+            "result_destination",
+            "result-destination",
+            "persist",
+            "commit-capability",
+            "writer-authority",
+        ):
+            self.assertNotIn(forbidden, rendered)
+        signature = inspect.signature(sharding.worker_main)
+        self.assertEqual(["argv"], list(signature.parameters))
+        self.assertIsNone(signature.parameters["argv"].default)
+
+    def test_resume_protocol_and_stop_marker_boundaries_are_durable(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        worker_root = self.run_root / "workers/E1"
+        self.run_root.mkdir(mode=0o700)
+        worker_root.parent.mkdir(mode=0o700)
+        worker_root.mkdir(mode=0o700)
+        message = self._lane_message(
+            "E1", seq=1, progress_type="lane-ready"
+        )
+        sharding.write_progress(worker_root, message)
+        sharding.write_ack(worker_root, message, "continue")
+        self.assertEqual(
+            2, worker._next_worker_sequence(worker_root, "E1")
+        )
+        self.assertTrue(
+            sharding._parallel_recovery_is_cleanup_only(
+                has_ownership=True,
+                has_tombstone=False,
+                has_teardown=False,
+                has_stop_launches=True,
+                resume_requested=True,
+            )
+        )
+        self.assertFalse(
+            sharding._parallel_recovery_is_cleanup_only(
+                has_ownership=True,
+                has_tombstone=True,
+                has_teardown=True,
+                has_stop_launches=True,
+                resume_requested=True,
+            )
+        )
+
+    def test_production_capture_fingerprints_complete_evaluator_boundary(self):
+        self.assertIn(
+            "wiki_cli.py", sharding._PARALLEL_EVALUATOR_ORIGINS
+        )
+        self.assertIn(
+            "wiki_observations.py", sharding._PARALLEL_EVALUATOR_ORIGINS
+        )
+        self.assertNotIn(
+            "tests/skill_evals/observing_workflows_cases.json",
+            sharding._PARALLEL_EVALUATOR_ORIGINS,
+        )
+        repository = Path(__file__).resolve().parents[2]
+        _archive, digests, inventory, _inventory_bytes = (
+            sharding._verified_parallel_archive_inputs(repository)
+        )
+        evaluator_rows = tuple(
+            (
+                inventory["repository_evidence"][origin]["member"],
+                inventory["repository_evidence"][origin][
+                    "packaged_sha256"
+                ],
+            )
+            for origin in sharding._PARALLEL_EVALUATOR_ORIGINS
+        )
+        self.assertEqual(
+            sharding.component_digest(evaluator_rows), digests[2]
+        )
+
+    def test_top_level_resume_honors_uncommitted_stop_marker(self):
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            sharding.prepare_auth_bootstrap(
+                source_codex_home=self.source_codex_home,
+                coordinator_root=self.run_root / "coordinator",
+                plan=self.plan,
+            )
+            sharding._atomic_write_record(
+                self.run_root / "coordinator/stop-launches.json",
+                {
+                    "schema_version": 1,
+                    "epoch_id": self.plan.epoch_id,
+                    "run_kind": self.plan.run_kind,
+                    "reason_sha256": "a" * 64,
+                },
+            )
+        finally:
+            lease.close()
+        transport_config = RuntimeIsolationTests._transport_config(
+            self.codex_executable
+        )
+        snapshot_root = self.run_root / "coordinator/captured-snapshot"
+        options = replace(
+            self._options(), resume_run_root=self.run_root
+        )
+        dependencies = sharding.CoordinatorDependencies(
+            worker_command_factory=mock.Mock(
+                side_effect=AssertionError("worker launch was attempted")
+            ),
+            integrity_runner=mock.Mock(),
+        )
+        with mock.patch.object(
+            sharding,
+            "_parallel_plan_inputs",
+            return_value=(
+                self.plan,
+                transport_config,
+                snapshot_root,
+                self.manifests,
+                ("a" * 64, "b" * 64, "c" * 64),
+            ),
+        ), mock.patch.object(
+            sharding, "_materialize_parallel_snapshot"
+        ), mock.patch.object(
+            sharding, "_launch_parallel_workers"
+        ) as launch:
+            result = sharding.run_parallel_evaluation(
+                repository_root=self.repository,
+                manifests=self.manifests,
+                result_destinations=None,
+                options=options,
+                dependencies=dependencies,
+            )
+        launch.assert_not_called()
+        self.assertEqual("failed", result.status)
+        self.assertTrue(
+            (self.run_root / "coordinator/teardown.json").is_file()
+        )
+
+    def test_prebootstrap_cancel_does_not_commit_stop_marker(self):
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        try:
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            machine.cancel("pre-bootstrap failure")
+            self.assertFalse(
+                (
+                    self.run_root / "coordinator/stop-launches.json"
+                ).exists()
+            )
+        finally:
+            lease.close()
+
+    def test_fresh_quiescence_cancels_durable_worker_group(self):
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        lifetime_slot, record_path = (
+            sharding._acquire_worker_lifetime_lock(
+                self.run_root, "E1"
+            )
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ],
+            start_new_session=True,
+            pass_fds=(lifetime_slot.descriptor,),
+        )
+        waiter = threading.Thread(target=process.wait)
+        waiter.start()
+        try:
+            pgid = os.getpgid(process.pid)
+            sharding._atomic_write_record(
+                record_path,
+                {
+                    "schema_version": 1,
+                    "epoch_id": self.plan.epoch_id,
+                    "run_kind": self.plan.run_kind,
+                    "lane": "E1",
+                    "pid": process.pid,
+                    "pgid": pgid,
+                },
+            )
+            sharding._retire_task_descriptors(
+                [lifetime_slot],
+                primary=None,
+                label="test worker lifetime close failed",
+            )
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            self.assertFalse(authority.consumed)
+            waiter.join(5.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsNotNone(process.returncode)
+        finally:
+            if lifetime_slot.descriptor >= 0:
+                sharding._retire_task_descriptors(
+                    [lifetime_slot],
+                    primary=None,
+                    label="test worker lifetime cleanup failed",
+                )
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            if lease.active:
+                lease.close()
+
+    def test_interrupted_retry_reset_restores_prior_cleanup_proof(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        (
+            lease,
+            bootstrap,
+            assignment,
+            paths,
+            installed,
+            _evidence,
+        ) = self._prepare_case_and_bootstrap()
+        manifest_case = self.manifests[assignment.key.mode][
+            assignment.key.ordinal - 1
+        ]
+        paths.root.parent.chmod(0o700)
+        try:
+            sharding.write_attempt_start(
+                plan=self.plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+            )
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+            receipt = worker.cleanup_case_auth(
+                installed=installed,
+                paths=paths,
+            )
+            sharding.teardown_case_auth(
+                paths=paths,
+                receipt=receipt,
+                lease=lease,
+                authority=authority,
+            )
+            failure_text = "pre-model infrastructure failure"
+            sharding.write_attempt_terminal(
+                plan=self.plan,
+                paths=paths,
+                assignment=assignment,
+                attempt=1,
+                manifest_case=manifest_case,
+                status="failed",
+                classification="pre-model-infrastructure",
+                model_started=False,
+                cleanup_passed=True,
+                usage=None,
+                failure={
+                    "classification": "pre-model-infrastructure",
+                    "type": "RuntimeError",
+                    "chars": len(failure_text),
+                    "sha256": hashlib.sha256(
+                        failure_text.encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+            worker._reset_case_for_retry(
+                plan=self.plan,
+                assignment=assignment,
+                manifest_case=manifest_case,
+                paths=paths,
+            )
+            self.assertEqual((), tuple(paths.cleanup.iterdir()))
+            self.assertTrue(
+                (paths.root / "cleanup-attempt-1").is_dir()
+            )
+            sharding._reconcile_retry_cleanup_backup(paths)
+            self.assertFalse(
+                (paths.root / "cleanup-attempt-1").exists()
+            )
+            self.assertEqual(
+                receipt,
+                sharding.read_tombstone_receipt(
+                    plan=self.plan,
+                    assignment=assignment,
+                    paths=paths,
+                ),
+            )
+        finally:
+            if bootstrap.descriptor_close_state == "owned":
+                sharding._retire_descriptor_capability(bootstrap)
+            if lease.active:
+                lease.close()
+
+    def test_token_ceiling_is_a_launch_ceiling(self):
+        machine, _guard = self._new_machine(
+            options=self._options(max_total_tokens=10)
+        )
+        events = []
+        process = self.FakeProcess(
+            "E1",
+            self.run_root / "workers/E1",
+            events,
+            pid=4301,
+        )
+        machine.register_worker("E1", process)
+        started = sharding.ProgressMessage(
+            schema_version=1,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+            lane="E1",
+            seq=1,
+            type="case-started",
+            case=self.plan.assignments[0].key,
+            attempt=1,
+            status=None,
+            classification=None,
+            model_started=None,
+            usage=None,
+            attempt_terminal_sha256=None,
+            case_commit_sha256=None,
+            shard_commit_sha256=None,
+            tombstone_receipt_sha256=None,
+        )
+        terminal = replace(
+            started,
+            seq=2,
+            type="case-terminal",
+            status="success",
+            classification="success",
+            model_started=True,
+            usage=sharding.TokenUsage(10, 0, 5, 0, 15),
+            attempt_terminal_sha256="a" * 64,
+            case_commit_sha256="b" * 64,
+            tombstone_receipt_sha256="c" * 64,
+        )
+        with mock.patch.object(sharding, "write_ack"):
+            self.assertEqual("continue", machine.accept_progress(started))
+            self.assertEqual(
+                "stop-launches", machine.accept_progress(terminal)
+            )
+        self.assertTrue(machine.stop_launches)
+        self.assertEqual(15, machine.total_tokens)
 
 
 if __name__ == "__main__":
