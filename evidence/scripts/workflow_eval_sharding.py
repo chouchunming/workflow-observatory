@@ -5357,12 +5357,99 @@ def _fingerprints_are_complete(fingerprints: InputFingerprints) -> bool:
     )
 
 
-def _frozen_manifest_sha256(rows: list[dict[str, object]]) -> str:
-    content = (
-        json.dumps(rows, ensure_ascii=True, indent=2).encode("ascii")
-        + b"\n"
-    )
-    return hashlib.sha256(content).hexdigest()
+def _capture_exact_manifest_value(
+    value: object,
+    *,
+    label: str,
+    active: set[int],
+) -> object:
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if type(value) is list:
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{label} contains a cycle")
+        active.add(identity)
+        try:
+            return [
+                _capture_exact_manifest_value(
+                    item,
+                    label=f"{label} item",
+                    active=active,
+                )
+                for item in tuple(value)
+            ]
+        finally:
+            active.remove(identity)
+    if type(value) is dict:
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{label} contains a cycle")
+        active.add(identity)
+        try:
+            items = tuple(value.items())
+            if any(type(key) is not str for key, _item in items):
+                raise ValueError(f"{label} keys must be exact strings")
+            return {
+                key: _capture_exact_manifest_value(
+                    item,
+                    label=f"{label}.{key}",
+                    active=active,
+                )
+                for key, item in items
+            }
+        finally:
+            active.remove(identity)
+    raise ValueError(f"{label} contains a custom or unsupported value")
+
+
+def _capture_resume_manifest_snapshot(
+    manifests: dict[EvalMode, list[dict[str, object]]],
+) -> tuple[bytes, bytes]:
+    items = tuple(manifests.items())
+    if (
+        any(type(key) is not str for key, _rows in items)
+        or {key for key, _rows in items} != {"forward", "lifecycle"}
+        or len(items) != 2
+    ):
+        raise ValueError(
+            "resume manifests must contain forward and lifecycle"
+        )
+    rows_by_mode = dict(items)
+    captured: list[bytes] = []
+    for mode in ("forward", "lifecycle"):
+        rows = rows_by_mode[mode]
+        if type(rows) is not list:
+            raise ValueError("resume manifest values must be exact lists")
+        frozen_rows = _capture_exact_manifest_value(
+            rows,
+            label=f"{mode} manifest",
+            active=set(),
+        )
+        if type(frozen_rows) is not list or any(
+            type(row) is not dict for row in frozen_rows
+        ):
+            raise ValueError("resume manifest rows must be exact dicts")
+        captured.append(
+            json.dumps(
+                frozen_rows,
+                ensure_ascii=True,
+                indent=2,
+                allow_nan=False,
+            ).encode("ascii")
+            + b"\n"
+        )
+    return captured[0], captured[1]
+
+
+def _decode_resume_manifest_snapshot(
+    snapshot: tuple[bytes, bytes],
+) -> dict[EvalMode, list[dict[str, object]]]:
+    forward = json.loads(snapshot[0])
+    lifecycle = json.loads(snapshot[1])
+    if type(forward) is not list or type(lifecycle) is not list:
+        raise AssertionError("resume manifest snapshot decoded incorrectly")
+    return {"forward": forward, "lifecycle": lifecycle}
 
 
 def _resume_all_invalid(plan: EpochPlan) -> ResumePlan:
@@ -5738,6 +5825,12 @@ def plan_resume(
         )
     if type(run_root) is not type(Path(".")):
         raise TypeError("run_root must be an exact Path")
+    if type(manifests) is not dict:
+        raise TypeError("manifests must be an exact dict")
+    try:
+        manifest_snapshot = _capture_resume_manifest_snapshot(manifests)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        manifest_snapshot = None
     canonical_root = canonical_run_root(run_root)
     if type(plan.assignments) is not tuple or any(
         type(assignment) is not CaseAssignment
@@ -5746,12 +5839,7 @@ def plan_resume(
         raise ValueError("plan assignments must be an exact tuple")
     if not plan.assignments:
         raise ValueError("plan assignments must not be empty")
-    if type(manifests) is not dict:
-        raise TypeError("manifests must be an exact dict")
-    if set(manifests) != {"forward", "lifecycle"} or any(
-        type(manifests.get(mode)) is not list
-        for mode in ("forward", "lifecycle")
-    ):
+    if manifest_snapshot is None:
         return _resume_all_invalid(plan)
     if (
         type(plan.schema_version) is not int
@@ -5765,16 +5853,19 @@ def plan_resume(
         or current_fingerprints != plan.fingerprints
         or plan.fingerprints.epoch_id != plan.epoch_id
         or plan.fingerprints.run_kind != plan.run_kind
-        or _frozen_manifest_sha256(manifests["forward"])
+        or hashlib.sha256(manifest_snapshot[0]).hexdigest()
         != current_fingerprints.forward_manifest_sha256
-        or _frozen_manifest_sha256(manifests["lifecycle"])
+        or hashlib.sha256(manifest_snapshot[1]).hexdigest()
         != current_fingerprints.lifecycle_manifest_sha256
     ):
         return _resume_all_invalid(plan)
     try:
+        validation_manifests = _decode_resume_manifest_snapshot(
+            manifest_snapshot
+        )
         rebuilt = build_epoch_plan(
             run_kind=plan.run_kind,
-            manifests=manifests,
+            manifests=validation_manifests,
             fingerprints=current_fingerprints,
         )
     except (TypeError, ValueError):
@@ -5790,11 +5881,12 @@ def plan_resume(
         _require_lease_process_healthy()
         return _resume_all_invalid(plan)
 
+    frozen_manifests = _decode_resume_manifest_snapshot(manifest_snapshot)
     reusable: list[CaseKey] = []
     pending: list[CaseKey] = []
     invalid: list[CaseKey] = []
     for assignment in plan.assignments:
-        manifest_rows = manifests[assignment.key.mode]
+        manifest_rows = frozen_manifests[assignment.key.mode]
         index = assignment.key.ordinal - 1
         if index < 0 or index >= len(manifest_rows):
             invalid.append(assignment.key)

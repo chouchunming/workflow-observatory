@@ -5012,20 +5012,26 @@ class RetryResumeTests(unittest.TestCase):
         classification,
         model_started,
         cleanup_passed=True,
+        manifest_case=None,
     ):
+        bound_manifest_case = (
+            self.manifest_case
+            if manifest_case is None
+            else manifest_case
+        )
         sharding.write_attempt_start(
             plan=self.plan,
             paths=self.paths,
             assignment=self.assignment,
             attempt=attempt,
-            manifest_case=self.manifest_case,
+            manifest_case=bound_manifest_case,
         )
         sharding.write_attempt_terminal(
             plan=self.plan,
             paths=self.paths,
             assignment=self.assignment,
             attempt=attempt,
-            manifest_case=self.manifest_case,
+            manifest_case=bound_manifest_case,
             status=status,
             classification=classification,
             model_started=model_started,
@@ -5038,7 +5044,7 @@ class RetryResumeTests(unittest.TestCase):
             ),
         )
 
-    def _seal_success(self, attempt):
+    def _seal_success(self, attempt, *, manifest_case=None):
         sharding.seal_case(
             plan=self.plan,
             paths=self.paths,
@@ -5046,7 +5052,11 @@ class RetryResumeTests(unittest.TestCase):
             attempt=attempt,
             result=self.result,
             evidence=self.evidence,
-            manifest_case=self.manifest_case,
+            manifest_case=(
+                self.manifest_case
+                if manifest_case is None
+                else manifest_case
+            ),
         )
 
     def _resume(self):
@@ -5149,6 +5159,90 @@ class RetryResumeTests(unittest.TestCase):
         )
         self.assertEqual((), resume.reusable)
         self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_freezes_manifest_before_rebuild_and_ordinal_lookup(self):
+        forged_manifest_case = json.loads(
+            json.dumps(self.manifest_case)
+        )
+        forged_manifest_case["turns"][0]["prompt"] += " Forged substitution."
+        self._write_attempt(
+            1,
+            status="success",
+            classification="success",
+            model_started=True,
+            manifest_case=forged_manifest_case,
+        )
+        self._seal_success(1, manifest_case=forged_manifest_case)
+        real_build_epoch_plan = sharding.build_epoch_plan
+        substituted = False
+
+        def substitute_after_rebuild(**kwargs):
+            nonlocal substituted
+            rebuilt = real_build_epoch_plan(**kwargs)
+            self.manifests["forward"][0] = forged_manifest_case
+            substituted = True
+            return rebuilt
+
+        with mock.patch.object(
+            sharding,
+            "build_epoch_plan",
+            side_effect=substitute_after_rebuild,
+        ):
+            resume = self._resume()
+
+        self.assertTrue(substituted)
+        self.assertEqual((), resume.reusable)
+        self.assertNotIn(self.assignment.key, resume.pending)
+        self.assertEqual((self.assignment.key,), resume.invalid)
+
+    def test_resume_snapshot_rejects_custom_mutable_manifest_shapes(self):
+        class CustomList(list):
+            pass
+
+        class CustomDict(dict):
+            pass
+
+        mutations = (
+            (
+                "manifest list subclass",
+                lambda value: value.__setitem__(
+                    "forward", CustomList(value["forward"])
+                ),
+            ),
+            (
+                "manifest row subclass",
+                lambda value: value["forward"].__setitem__(
+                    0, CustomDict(value["forward"][0])
+                ),
+            ),
+            (
+                "nested list subclass",
+                lambda value: value["forward"][0].__setitem__(
+                    "turns", CustomList(value["forward"][0]["turns"])
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label):
+                candidate = json.loads(json.dumps(self.manifests))
+                mutate(candidate)
+
+                resume = sharding.plan_resume(
+                    plan=self.plan,
+                    run_root=self.run_root,
+                    current_fingerprints=self.plan.fingerprints,
+                    manifests=candidate,
+                )
+
+                self.assertEqual((), resume.reusable)
+                self.assertEqual((), resume.pending)
+                self.assertEqual(
+                    tuple(
+                        assignment.key
+                        for assignment in self.plan.assignments
+                    ),
+                    resume.invalid,
+                )
 
     def test_retry_decision_contract_is_table_driven(self):
         cases = (

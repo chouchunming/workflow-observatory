@@ -1468,6 +1468,14 @@ when the plan epoch and whole-manifest hashes still match. Any row/digest
 mismatch places the case in `invalid` and prevents model launch or sealed-result
 reuse.
 
+Architecture resolution A makes `plan_resume` pure classification over one
+caller-proved quiescent snapshot; `ResumePlan` is data, not launch authority.
+Task 10 freezes the exact `forward` and `lifecycle` inputs once at entry and
+uses only that canonical local snapshot for whole-manifest validation, ordinal
+selection, and row digests. Task 12 owns worker shutdown, quiescent authority,
+and resume-to-launch linearization, including the rule that evidence cannot
+mutate between classification and launch/reuse.
+
 `validate_epoch_for_aggregation` receives every shard/case path and callable it
 needs. In strict order it revalidates capture/config/manifests, four shard
 commits, 28 case commits, attempt truth, 24/4 routes, every store and invalidated
