@@ -104,7 +104,7 @@ MAX_PROTOCOL_RECORDS = 35
 MAX_PROTOCOL_CRASH_TEMPS = 19
 MAX_PROTOCOL_PENDING_MARKERS = 19
 MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
-PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 0.2
+PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 5.0
 PROTOCOL_WORKER_LOCK_POLL_SECONDS = 0.01
 MAX_RETIRED_PROOF_RECORDS = 128
 MAX_RETIRED_PROOF_TRANSACTION_BYTES = 32 * 1024
@@ -9849,7 +9849,7 @@ def _bounded_protocol_lock_deadline(
         or not math.isfinite(operation_deadline)
     ):
         raise ValueError("protocol operation deadline is invalid")
-    return min(default_deadline, float(operation_deadline))
+    return float(operation_deadline)
 
 
 def _lock_protocol_worker(

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import get_args, get_type_hints
 import unittest
 from unittest import mock
@@ -12376,6 +12377,10 @@ sharding.wait_for_ack(worker_root, message, 0.05)
             try:
                 with mock.patch.object(
                     sharding,
+                    "PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS",
+                    0.2,
+                ), mock.patch.object(
+                    sharding,
                     "_open_protocol_worker_directory",
                     side_effect=capture_worker,
                 ):
@@ -12509,6 +12514,64 @@ sharding.wait_for_ack(worker_root, message, 0.05)
                 (worker_root / "progress" / "000001.json").read_bytes()
             ).hexdigest(),
         )
+
+    def test_ack_publisher_waits_past_old_local_window_for_shared_prefix_reader(
+        self,
+    ):
+        overall_deadline = time.monotonic() + 1.0
+        self.assertEqual(
+            overall_deadline,
+            sharding._bounded_protocol_lock_deadline(overall_deadline),
+        )
+        ready = self._lane_message(seq=1, progress_type="lane-ready")
+        run_root = self.root / "ack-growing-prefix-window" / "run"
+        run_root.mkdir(parents=True, mode=0o700)
+        run_root.chmod(0o700)
+        worker_root = self._worker_root(run_root)
+        sharding.write_progress(worker_root, ready)
+
+        holder = os.open(
+            worker_root,
+            os.O_RDONLY
+            | sharding._required_os_flag("O_DIRECTORY")
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        sharding.fcntl.flock(
+            holder,
+            sharding.fcntl.LOCK_SH | sharding.fcntl.LOCK_NB,
+        )
+        results = []
+        errors = []
+        started = threading.Event()
+
+        def publish_ack():
+            started.set()
+            try:
+                results.append(
+                    sharding.write_ack(worker_root, ready, "continue")
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=publish_ack)
+        before = time.monotonic()
+        try:
+            thread.start()
+            self.assertTrue(started.wait(1.0))
+            time.sleep(0.3)
+            sharding.fcntl.flock(holder, sharding.fcntl.LOCK_UN)
+            thread.join(2.0)
+        finally:
+            os.close(holder)
+        elapsed = time.monotonic() - before
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(
+            [worker_root / "acks/000001.json"], results
+        )
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 1.5)
 
     def test_acked_usage_is_bounded_idempotent_and_stops_future_launches(self):
         self.assertTrue(
