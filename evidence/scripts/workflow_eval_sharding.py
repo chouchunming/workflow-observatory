@@ -459,6 +459,19 @@ def _retain_verified_unlink_proof(
     return proof
 
 
+def _retirement_phase_temp_final_name(name: str) -> str | None:
+    if type(name) is not str:
+        return None
+    match = re.fullmatch(
+        r"\.(?P<final>transaction-[0-9a-f]{64}-"
+        r"(prepared|complete)\.json)\.tmp-[0-9]+-[0-9a-f]{32}",
+        name,
+    )
+    if match is None:
+        return None
+    return match.group("final")
+
+
 def _validate_retired_proof_archive(
     archive_slot: _DescriptorSlot,
     *,
@@ -491,11 +504,7 @@ def _validate_retired_proof_archive(
                     r"transaction-[0-9a-f]{64}-(prepared|complete)\.json",
                     name,
                 )
-                or re.fullmatch(
-                    r"\.transaction-[0-9a-f]{64}-(prepared|complete)"
-                    r"\.json\.tmp-[0-9]+-[0-9a-f]{32}",
-                    name,
-                )
+                or _retirement_phase_temp_final_name(name) is not None
             )
             or "/" in name
         ):
@@ -910,7 +919,7 @@ def _reconcile_retirement_member(
     cleanup_slot: _DescriptorSlot,
     archive_slot: _DescriptorSlot,
     fault_injector: _RetirementFaultInjector | None,
-) -> None:
+) -> _RetainedUnlinkProof:
     parent_slot = (
         coordinator_slot
         if member["source_parent"] == "coordinator"
@@ -961,12 +970,13 @@ def _reconcile_retirement_member(
                 )
         except BaseException as error:
             primary = error
-        _retire_task_descriptors(
-            [archived.slot],
-            primary=primary,
-            label="archived transaction member or close failed",
-        )
-        return
+        if primary is not None:
+            _retire_task_descriptors(
+                [archived.slot],
+                primary=primary,
+                label="archived transaction member or close failed",
+            )
+        return archived
 
     active = _retain_transaction_member(
         parent_slot=parent_slot,
@@ -975,6 +985,7 @@ def _reconcile_retirement_member(
         label="active proof transaction member",
     )
     primary = None
+    retained: _RetainedUnlinkProof | None = None
     try:
         _rename_exclusive_at(
             source_slot=parent_slot,
@@ -1023,13 +1034,106 @@ def _reconcile_retirement_member(
             fault_injector,
             f"member-{index}-archive-fsync",
         )
+        metadata = os.fstat(active.slot.descriptor)
+        retained = replace(
+            active,
+            parent_slot=archive_slot,
+            name=archive_name,
+            label="retired proof transaction member",
+            ctime_ns=metadata.st_ctime_ns,
+        )
+        named = os.stat(
+            archive_name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if _stat_identity(named) != retained.identity:
+            raise ValueError(
+                "retirement transaction member changed after move"
+            )
+        _read_retained_unlink_content(
+            retained,
+            byte_cap=max(retained.size, 1),
+            require_original_ctime=True,
+        )
     except BaseException as error:
         primary = error
-    _retire_task_descriptors(
-        [active.slot],
-        primary=primary,
-        label="active transaction member move or close failed",
-    )
+    if primary is not None:
+        _retire_task_descriptors(
+            [active.slot],
+            primary=primary,
+            label="active transaction member move or close failed",
+        )
+    if retained is None:
+        raise AssertionError(
+            "active transaction member produced no retained capability"
+        )
+    return retained
+
+
+def _validate_retirement_archive_proof_set(
+    *,
+    archive_slot: _DescriptorSlot,
+    proofs: Sequence[_RetainedUnlinkProof],
+) -> None:
+    frozen = tuple(proofs)
+    if (
+        not frozen
+        or type(archive_slot) is not _DescriptorSlot
+        or any(
+            type(proof) is not _RetainedUnlinkProof
+            or proof.parent_slot is not archive_slot
+            for proof in frozen
+        )
+        or len({proof.name for proof in frozen}) != len(frozen)
+    ):
+        raise ValueError("retirement archive proof set is invalid")
+    before = os.fstat(archive_slot.descriptor)
+    inventory = tuple(sorted(os.listdir(archive_slot.descriptor)))
+    for proof in frozen:
+        named = os.stat(
+            proof.name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if _stat_identity(named) != proof.identity:
+            raise ValueError(
+                "retirement transaction "
+                f"{'member' if 'member' in proof.label else 'record'} "
+                "changed"
+            )
+        _read_retained_unlink_content(
+            proof,
+            byte_cap=max(proof.size, 1),
+            require_original_ctime=True,
+        )
+    after = os.fstat(archive_slot.descriptor)
+    if (
+        _stat_identity(before) != _stat_identity(after)
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or tuple(sorted(os.listdir(archive_slot.descriptor))) != inventory
+    ):
+        raise ValueError(
+            "retirement archive changed during proof-set validation"
+        )
+    for proof in frozen:
+        named = os.stat(
+            proof.name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if _stat_identity(named) != proof.identity:
+            raise ValueError(
+                "retirement transaction "
+                f"{'member' if 'member' in proof.label else 'record'} "
+                "changed"
+            )
+        _read_retained_unlink_content(
+            proof,
+            byte_cap=max(proof.size, 1),
+            require_original_ctime=True,
+        )
 
 
 def _retain_retirement_phase_record(
@@ -1037,7 +1141,14 @@ def _retain_retirement_phase_record(
     archive_slot: _DescriptorSlot,
     name: str,
     plan: "EpochPlan",
+    expected_name: str | None = None,
 ) -> tuple[dict[str, object], _RetainedUnlinkProof]:
+    if expected_name is not None and (
+        type(expected_name) is not str
+        or not expected_name
+        or "/" in expected_name
+    ):
+        raise TypeError("retirement transaction expected name is invalid")
     proof = _retain_verified_unlink_proof(
         parent_slot=archive_slot,
         name=name,
@@ -1063,7 +1174,7 @@ def _retain_retirement_phase_record(
             )
         decoded = _decode_retirement_transaction(
             payload,
-            expected_name=name,
+            expected_name=name if expected_name is None else expected_name,
             plan=plan,
         )
     except BaseException as error:
@@ -1079,6 +1190,115 @@ def _retain_retirement_phase_record(
     return decoded, proof
 
 
+def _promote_retirement_phase_temps(
+    *,
+    plan: "EpochPlan",
+    archive_slot: _DescriptorSlot,
+    inventory: Sequence[str],
+) -> None:
+    for temporary_name in inventory:
+        final_name = _retirement_phase_temp_final_name(temporary_name)
+        if final_name is None:
+            continue
+        temporary, temporary_proof = _retain_retirement_phase_record(
+            archive_slot=archive_slot,
+            name=temporary_name,
+            plan=plan,
+            expected_name=final_name,
+        )
+        final_proof: _RetainedUnlinkProof | None = None
+        primary: BaseException | None = None
+        try:
+            try:
+                os.stat(
+                    final_name,
+                    dir_fd=archive_slot.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                _rename_exclusive_at(
+                    source_slot=archive_slot,
+                    source_name=temporary_name,
+                    destination_slot=archive_slot,
+                    destination_name=final_name,
+                )
+                named = os.stat(
+                    final_name,
+                    dir_fd=archive_slot.descriptor,
+                    follow_symlinks=False,
+                )
+                if _stat_identity(named) != temporary_proof.identity:
+                    try:
+                        os.stat(
+                            temporary_name,
+                            dir_fd=archive_slot.descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        _rename_exclusive_at(
+                            source_slot=archive_slot,
+                            source_name=final_name,
+                            destination_slot=archive_slot,
+                            destination_name=temporary_name,
+                        )
+                    raise ValueError(
+                        "retirement transaction temp changed during promotion"
+                    )
+                _read_retained_unlink_content(
+                    temporary_proof,
+                    byte_cap=max(temporary_proof.size, 1),
+                    require_original_ctime=False,
+                )
+                os.fsync(archive_slot.descriptor)
+                named = os.stat(
+                    final_name,
+                    dir_fd=archive_slot.descriptor,
+                    follow_symlinks=False,
+                )
+                if _stat_identity(named) != temporary_proof.identity:
+                    raise ValueError(
+                        "retirement transaction temp changed after promotion"
+                    )
+            else:
+                final, final_proof = _retain_retirement_phase_record(
+                    archive_slot=archive_slot,
+                    name=final_name,
+                    plan=plan,
+                )
+                if (
+                    final != temporary
+                    or final_proof.content != temporary_proof.content
+                ):
+                    raise ValueError(
+                        "retirement transaction temp conflicts with its phase"
+                    )
+                for proof in (temporary_proof, final_proof):
+                    named = os.stat(
+                        proof.name,
+                        dir_fd=archive_slot.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _stat_identity(named) != proof.identity:
+                        raise ValueError(
+                            "retirement transaction phase changed"
+                        )
+                    _read_retained_unlink_content(
+                        proof,
+                        byte_cap=max(proof.size, 1),
+                        require_original_ctime=True,
+                    )
+        except BaseException as error:
+            primary = error
+        slots = [temporary_proof.slot]
+        if final_proof is not None:
+            slots.append(final_proof.slot)
+        _retire_task_descriptors(
+            slots,
+            primary=primary,
+            label="retirement transaction temp promotion or close failed",
+        )
+
+
 def _reconcile_retired_proof_transactions_retained(
     *,
     plan: "EpochPlan",
@@ -1087,6 +1307,15 @@ def _reconcile_retired_proof_transactions_retained(
     archive_slot: _DescriptorSlot,
     fault_injector: _RetirementFaultInjector | None = None,
 ) -> bool:
+    inventory = _validate_retired_proof_archive(
+        archive_slot,
+        additional_records=0,
+    )
+    _promote_retirement_phase_temps(
+        plan=plan,
+        archive_slot=archive_slot,
+        inventory=inventory,
+    )
     inventory = _validate_retired_proof_archive(
         archive_slot,
         additional_records=0,
@@ -1114,6 +1343,7 @@ def _reconcile_retired_proof_transactions_retained(
     if complete_names - expected_complete_names:
         raise ValueError("retirement transaction completion is orphaned")
     retained_records: list[_RetainedUnlinkProof] = []
+    retained_members: list[_RetainedUnlinkProof] = []
     referenced_members: set[str] = set()
     primary: BaseException | None = None
     try:
@@ -1129,6 +1359,7 @@ def _reconcile_retired_proof_transactions_retained(
                 "-complete.json",
             )
             complete: dict[str, object] | None = None
+            complete_proof: _RetainedUnlinkProof | None = None
             if complete_name in complete_names:
                 complete, complete_proof = (
                     _retain_retirement_phase_record(
@@ -1146,6 +1377,7 @@ def _reconcile_retired_proof_transactions_retained(
                     raise ValueError(
                         "retirement transaction phases differ"
                     )
+            member_start = len(retained_members)
             for index, member in enumerate(prepared["members"]):
                 referenced_members.add(str(member["archive_name"]))
                 named = os.stat(
@@ -1157,23 +1389,34 @@ def _reconcile_retired_proof_transactions_retained(
                     raise ValueError(
                         "retirement transaction record changed"
                     )
-                _reconcile_retirement_member(
-                    member=member,
-                    index=index,
-                    coordinator_slot=coordinator_slot,
-                    cleanup_slot=cleanup_slot,
-                    archive_slot=archive_slot,
-                    fault_injector=fault_injector,
+                retained_members.append(
+                    _reconcile_retirement_member(
+                        member=member,
+                        index=index,
+                        coordinator_slot=coordinator_slot,
+                        cleanup_slot=cleanup_slot,
+                        archive_slot=archive_slot,
+                        fault_injector=fault_injector,
+                    )
                 )
             for index, member in enumerate(prepared["members"]):
-                _reconcile_retirement_member(
-                    member=member,
-                    index=index,
-                    coordinator_slot=coordinator_slot,
-                    cleanup_slot=cleanup_slot,
-                    archive_slot=archive_slot,
-                    fault_injector=None,
+                retained_members.append(
+                    _reconcile_retirement_member(
+                        member=member,
+                        index=index,
+                        coordinator_slot=coordinator_slot,
+                        cleanup_slot=cleanup_slot,
+                        archive_slot=archive_slot,
+                        fault_injector=None,
+                    )
                 )
+            final_members = retained_members[
+                member_start + len(prepared["members"]):
+            ]
+            _validate_retirement_archive_proof_set(
+                archive_slot=archive_slot,
+                proofs=(prepared_proof, *final_members),
+            )
             if complete is None:
                 complete_payload = {
                     **prepared,
@@ -1192,6 +1435,7 @@ def _reconcile_retired_proof_transactions_retained(
                     )
                 )
                 retained_records.append(durable_proof)
+                complete_proof = durable_proof
                 if (
                     durable != complete_payload
                     or durable_proof.content != content
@@ -1199,20 +1443,29 @@ def _reconcile_retired_proof_transactions_retained(
                     raise ValueError(
                         "retirement completion differs after publication"
                     )
-        for record in retained_records:
-            named = os.stat(
-                record.name,
-                dir_fd=archive_slot.descriptor,
-                follow_symlinks=False,
-            )
-            if _stat_identity(named) != record.identity:
-                raise ValueError(
-                    "retirement transaction record changed"
+            if complete_proof is None:
+                raise AssertionError(
+                    "retirement completion has no retained capability"
                 )
-            _read_retained_unlink_content(
-                record,
-                byte_cap=max(record.size, 1),
-                require_original_ctime=True,
+            _validate_retirement_archive_proof_set(
+                archive_slot=archive_slot,
+                proofs=(
+                    prepared_proof,
+                    complete_proof,
+                    *final_members,
+                ),
+            )
+            transaction_members = retained_members[member_start:]
+            _retire_task_descriptors(
+                [proof.slot for proof in transaction_members],
+                primary=None,
+                label="retirement member-set close failed",
+            )
+            del retained_members[member_start:]
+        if retained_records:
+            _validate_retirement_archive_proof_set(
+                archive_slot=archive_slot,
+                proofs=retained_records,
             )
         unreferenced_members = {
             name
@@ -1226,7 +1479,8 @@ def _reconcile_retired_proof_transactions_retained(
     except BaseException as error:
         primary = error
     _retire_task_descriptors(
-        [record.slot for record in retained_records],
+        [record.slot for record in retained_records]
+        + [member.slot for member in retained_members],
         primary=primary,
         label="retirement reconciliation or record close failed",
     )
@@ -1279,6 +1533,7 @@ def _retire_retained_proofs(
         cleanup_slot=cleanup_slot,
     )
     retained_records: list[_RetainedUnlinkProof] = []
+    retained_members: list[_RetainedUnlinkProof] = []
     primary: BaseException | None = None
     try:
         prepared_content = _publish_retirement_phase_record(
@@ -1319,30 +1574,32 @@ def _retire_retained_proofs(
                 byte_cap=max(prepared_proof.size, 1),
                 require_original_ctime=True,
             )
-            _reconcile_retirement_member(
-                member=member,
-                index=index,
-                coordinator_slot=coordinator_slot,
-                cleanup_slot=cleanup_slot,
-                archive_slot=archive_slot,
-                fault_injector=fault_injector,
+            retained_members.append(
+                _reconcile_retirement_member(
+                    member=member,
+                    index=index,
+                    coordinator_slot=coordinator_slot,
+                    cleanup_slot=cleanup_slot,
+                    archive_slot=archive_slot,
+                    fault_injector=fault_injector,
+                )
             )
         for index, member in enumerate(prepared["members"]):
-            _reconcile_retirement_member(
-                member=member,
-                index=index,
-                coordinator_slot=coordinator_slot,
-                cleanup_slot=cleanup_slot,
-                archive_slot=archive_slot,
-                fault_injector=None,
+            retained_members.append(
+                _reconcile_retirement_member(
+                    member=member,
+                    index=index,
+                    coordinator_slot=coordinator_slot,
+                    cleanup_slot=cleanup_slot,
+                    archive_slot=archive_slot,
+                    fault_injector=None,
+                )
             )
-        named = os.stat(
-            prepared_proof.name,
-            dir_fd=archive_slot.descriptor,
-            follow_symlinks=False,
+        final_members = retained_members[len(prepared["members"]):]
+        _validate_retirement_archive_proof_set(
+            archive_slot=archive_slot,
+            proofs=(prepared_proof, *final_members),
         )
-        if _stat_identity(named) != prepared_proof.identity:
-            raise ValueError("retirement transaction record changed")
         complete = {
             **prepared,
             "phase": "complete",
@@ -1360,27 +1617,24 @@ def _retire_retained_proofs(
             ),
             plan=plan,
         )
-        try:
-            if durable != complete or durable_proof.content != content:
-                raise ValueError(
-                    "retirement completion differs after publication"
-                )
-        except BaseException as error:
-            _retire_task_descriptors(
-                [durable_proof.slot],
-                primary=error,
-                label="retirement completion validation or close failed",
+        retained_records.append(durable_proof)
+        if durable != complete or durable_proof.content != content:
+            raise ValueError(
+                "retirement completion differs after publication"
             )
-        else:
-            _retire_task_descriptors(
-                [durable_proof.slot],
-                primary=None,
-                label="retirement completion close failed",
-            )
+        _validate_retirement_archive_proof_set(
+            archive_slot=archive_slot,
+            proofs=(
+                prepared_proof,
+                durable_proof,
+                *final_members,
+            ),
+        )
     except BaseException as error:
         primary = error
     _retire_task_descriptors(
         [record.slot for record in retained_records]
+        + [member.slot for member in retained_members]
         + [proof.slot for proof in frozen],
         primary=primary,
         label="retained proof retirement or descriptor close failed",
