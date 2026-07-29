@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict
 import json
 import os
@@ -13,6 +14,35 @@ from typing import Sequence
 from scripts import run_observing_workflows_eval_worker as worker
 from scripts import workflow_eval_sharding as sharding
 from scripts.run_observing_workflows_task9_eval import CaseExecution
+
+
+@contextmanager
+def _worker_writer_poison(run_root: Path, lane: str):
+    original_acquire = sharding.ResultWriterLease.__dict__["acquire"]
+
+    def poisoned_acquire(cls, *_args, **_kwargs):
+        violations = (
+            run_root / "coordinator/worker-writer-violations"
+        )
+        violations.mkdir(parents=True, mode=0o700, exist_ok=True)
+        violations.chmod(0o700)
+        sharding._atomic_write_record(
+            violations / f"{lane}.json",
+            {
+                "lane": lane,
+                "pid": os.getpid(),
+                "type": "result-writer-acquire",
+            },
+        )
+        raise AssertionError(
+            "worker attempted to acquire result writer lease"
+        )
+
+    sharding.ResultWriterLease.acquire = classmethod(poisoned_acquire)
+    try:
+        yield
+    finally:
+        sharding.ResultWriterLease.acquire = original_acquire
 
 
 class _NoModelRuntimeFactory:
@@ -111,7 +141,7 @@ class _NoModelCaseDriver:
         worker._prepare_case_directories(paths)
         staged = sharding.stage_marketplace_for_case(
             read_only_snapshot=self._marketplace,
-            destination=paths.staging / "workflow-observatory",
+            destination=paths.staging / "marketplace",
         )
         worker._write_portable_store_config(paths.home, paths.store)
         installed = sharding.install_case_auth(
@@ -226,14 +256,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             collision_case_id=collision_case_id,
         ),
     )
-    worker._run_worker_impl(
-        lane=arguments.lane,
-        plan=plan,
-        run_root=run_root,
-        snapshot_root=arguments.snapshot_root,
-        resume=resume,
-        dependencies=dependencies,
-    )
+    with _worker_writer_poison(run_root, arguments.lane):
+        worker._run_worker_impl(
+            lane=arguments.lane,
+            plan=plan,
+            run_root=run_root,
+            snapshot_root=arguments.snapshot_root,
+            resume=resume,
+            dependencies=dependencies,
+        )
     return 0
 
 

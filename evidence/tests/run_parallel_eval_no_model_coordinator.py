@@ -44,6 +44,7 @@ class _IntegrityProbe:
         self.environment_roots: list[str] = []
         self.teardown_preceded_validation = True
         self.bootstrap_absent_during_validation = True
+        self.production_integrity_delegations = 0
 
     def __call__(self, command, environment, *, expected_records):
         teardown = self._run_root / "coordinator/teardown.json"
@@ -80,7 +81,13 @@ class _IntegrityProbe:
         if Path(payload["root"]) != case_root:
             raise ValueError("case environment marker is stale")
         self.environment_roots.append(str(case_root))
-        return {"records": expected_records, "invalidated": 0}
+        result = sharding._production_integrity_runner(
+            command,
+            environment,
+            expected_records=expected_records,
+        )
+        self.production_integrity_delegations += 1
+        return result
 
 
 def _inject_active_ownership(
@@ -131,7 +138,9 @@ def _process_summary(
     plan: sharding.EpochPlan,
     result: sharding.ParallelRunResult,
     probe: _IntegrityProbe,
-    writer_calls: int,
+    writer_lease_acquisitions: int,
+    writer_authority_issuances: int,
+    transport_binding_paths: list[str],
 ) -> dict[str, object]:
     lane_pids = {}
     all_workers_joined = True
@@ -192,6 +201,17 @@ def _process_summary(
             tombstone.read_text(encoding="ascii")
         ).get("producer")
     replacement = first_paths.codex_home / "replacement-marker"
+    worker_violation_root = (
+        run_root / "coordinator/worker-writer-violations"
+    )
+    worker_writer_violations = (
+        sorted(
+            str(path.relative_to(run_root))
+            for path in worker_violation_root.rglob("*")
+        )
+        if worker_violation_root.exists()
+        else []
+    )
     return {
         "status": result.status,
         "sealed_keys": sealed_keys,
@@ -199,7 +219,8 @@ def _process_summary(
         "all_workers_joined": all_workers_joined,
         "lane_case_keys": lane_case_keys,
         "aggregate": aggregate,
-        "writer_calls": writer_calls,
+        "writer_lease_acquisitions": writer_lease_acquisitions,
+        "writer_authority_issuances": writer_authority_issuances,
         "validation_environment_count": len(probe.environment_roots),
         "validation_environment_roots": probe.environment_roots,
         "teardown_preceded_validation": (
@@ -208,6 +229,19 @@ def _process_summary(
         "bootstrap_absent_during_validation": (
             probe.bootstrap_absent_during_validation
         ),
+        "production_integrity_delegations": (
+            probe.production_integrity_delegations
+        ),
+        "sealed_codex_executable_path": (
+            transport_binding_paths[0]
+            if (
+                transport_binding_paths
+                and len(set(transport_binding_paths)) == 1
+            )
+            else None
+        ),
+        "transport_binding_launch_count": len(transport_binding_paths),
+        "worker_writer_violations": worker_writer_violations,
         "recovery_producer": recovery_producer,
         "collision_replacement_retained": replacement.is_file(),
     }
@@ -256,6 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     probe = _IntegrityProbe(run_root)
     captured_plan: list[sharding.EpochPlan] = []
+    transport_binding_paths: list[str] = []
 
     def worker_command_factory(
         lane, plan, bound_options, snapshot_root
@@ -264,6 +299,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             captured_plan.append(plan)
         elif captured_plan[0] != plan:
             raise ValueError("test coordinator observed multiple plans")
+        transport_payload, transport_content = sharding._read_canonical_record(
+            bound_options.run_root / "coordinator/transport-config.json",
+            "test coordinator sealed transport config",
+            byte_cap=64 * 1024,
+        )
+        try:
+            sealed_transport = sharding.ResolvedTransportConfig(
+                **transport_payload
+            )
+        except TypeError:
+            raise ValueError(
+                "test coordinator sealed transport fields changed"
+            ) from None
+        if (
+            sharding.transport_config_bytes(sealed_transport)
+            != transport_content
+        ):
+            raise ValueError(
+                "test coordinator sealed transport bytes changed"
+            )
+        sealed_executable = sharding.verify_codex_executable(
+            sealed_transport
+        )
+        expected_executable = arguments.codex_executable.resolve(
+            strict=True
+        )
+        if sealed_executable != expected_executable:
+            raise ValueError(
+                "test coordinator did not seal the configured sentinel"
+            )
+        transport_binding_paths.append(str(sealed_executable))
         worker_root = (
             bound_options.run_root / "app-server"
             if lane == "APP"
@@ -294,16 +360,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         worker_command_factory=worker_command_factory,
         integrity_runner=probe,
     )
-    writer_calls = 0
+    writer_lease_acquisitions = 0
+    writer_authority_issuances = 0
     original_acquire = sharding.ResultWriterLease.__dict__["acquire"]
-    original_function = original_acquire.__func__
+    original_acquire_function = original_acquire.__func__
+    original_authority = sharding.ResultWriterLease.__dict__["authority"]
 
     def counted_acquire(cls, *args, **kwargs):
-        nonlocal writer_calls
-        writer_calls += 1
-        return original_function(cls, *args, **kwargs)
+        nonlocal writer_lease_acquisitions
+        lease = original_acquire_function(cls, *args, **kwargs)
+        writer_lease_acquisitions += 1
+        return lease
+
+    def counted_authority(self, *args, **kwargs):
+        nonlocal writer_authority_issuances
+        authority = original_authority(self, *args, **kwargs)
+        writer_authority_issuances += 1
+        return authority
 
     sharding.ResultWriterLease.acquire = classmethod(counted_acquire)
+    sharding.ResultWriterLease.authority = counted_authority
     try:
         result = sharding.run_parallel_evaluation(
             repository_root=repository_root,
@@ -325,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     finally:
         sharding.ResultWriterLease.acquire = original_acquire
+        sharding.ResultWriterLease.authority = original_authority
 
     plan_payload, _content = sharding._read_canonical_record(
         run_root / "coordinator/epoch-plan.json",
@@ -341,7 +418,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         plan=plan,
         result=result,
         probe=probe,
-        writer_calls=writer_calls,
+        writer_lease_acquisitions=writer_lease_acquisitions,
+        writer_authority_issuances=writer_authority_issuances,
+        transport_binding_paths=transport_binding_paths,
     )
     sys.stdout.write(
         json.dumps(

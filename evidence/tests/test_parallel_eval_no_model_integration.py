@@ -6,7 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
+from tests import run_parallel_eval_no_model_coordinator as coordinator_runner
+from tests import run_parallel_eval_no_model_worker as worker_runner
+from scripts import workflow_eval_sharding as sharding
 
 EVIDENCE_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = (
@@ -22,6 +26,85 @@ def _key(payload):
         f"{payload['mode']}:{payload['ordinal']}:"
         f"{payload['case_id']}"
     )
+
+
+class NoModelHarnessUnitTests(unittest.TestCase):
+    def test_integrity_probe_delegates_to_production_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            coordinator = run_root / "coordinator"
+            coordinator.mkdir()
+            (coordinator / "teardown.json").write_text(
+                "{}\n", encoding="ascii"
+            )
+            case_root = run_root / "case"
+            for name in (
+                "workspace",
+                "store",
+                "home",
+                "tmp",
+                "config",
+                "cache",
+                "output",
+            ):
+                (case_root / name).mkdir(parents=True, exist_ok=True)
+            (case_root / "output/no-model-environment.json").write_text(
+                json.dumps({"root": str(case_root)}) + "\n",
+                encoding="ascii",
+            )
+            command = ("python", "captured-cli.py", "integrity")
+            environment = {
+                "HOME": str(case_root / "home"),
+                "CODEX_HOME": str(case_root / "codex-home"),
+            }
+            parsed = {"records": 7, "invalidated": 3}
+            probe = coordinator_runner._IntegrityProbe(run_root)
+
+            with mock.patch.object(
+                coordinator_runner.sharding,
+                "_production_integrity_runner",
+                return_value=parsed,
+            ) as production_runner:
+                result = probe(
+                    command,
+                    environment,
+                    expected_records=7,
+                )
+
+            self.assertIs(parsed, result)
+            production_runner.assert_called_once_with(
+                command,
+                environment,
+                expected_records=7,
+            )
+
+    def test_worker_writer_poison_records_and_rejects_acquisition(self):
+        poison = getattr(worker_runner, "_worker_writer_poison", None)
+        self.assertIsNotNone(poison)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            with poison(run_root, "E1"):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "worker attempted to acquire result writer lease",
+                ):
+                    sharding.ResultWriterLease.acquire(
+                        run_root,
+                        "parallel-coordinator",
+                        "formal",
+                    )
+            marker = (
+                run_root
+                / "coordinator/worker-writer-violations/E1.json"
+            )
+            self.assertEqual(
+                {
+                    "lane": "E1",
+                    "pid": os.getpid(),
+                    "type": "result-writer-acquire",
+                },
+                json.loads(marker.read_text(encoding="ascii")),
+            )
 
 
 class ParallelNoModelIntegrationTests(unittest.TestCase):
@@ -69,14 +152,18 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.sentinel_marker = self.root / "sentinel-codex-invoked"
         sentinel_bin = self.root / "sentinel-bin"
         sentinel_bin.mkdir()
-        sentinel = sentinel_bin / "codex"
-        sentinel.write_text(
+        self.sentinel_codex = (sentinel_bin / "codex").resolve()
+        self.sentinel_codex.write_text(
             "#!/bin/sh\n"
+            'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+            "  printf '%s\\n' 'codex-cli no-model-sentinel'\n"
+            "  exit 0\n"
+            "fi\n"
             f"printf invoked > {self.sentinel_marker}\n"
             "exit 97\n",
             encoding="utf-8",
         )
-        sentinel.chmod(0o700)
+        self.sentinel_codex.chmod(0o700)
         self.environment = dict(os.environ)
         self.environment["PATH"] = (
             str(sentinel_bin)
@@ -97,7 +184,7 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
             "--source-codex-home",
             str(self.source_codex_home),
             "--codex-executable",
-            sys.executable,
+            str(self.sentinel_codex),
             "--run-kind",
             run_kind,
             "--forward-result",
@@ -124,7 +211,26 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
             summary = json.loads(completed.stdout)
         except json.JSONDecodeError:
             self.fail(completed.stdout + completed.stderr)
+        self.assertEqual(
+            str(self.sentinel_codex),
+            summary.get("sealed_codex_executable_path"),
+        )
+        self.assertEqual(
+            4, summary.get("transport_binding_launch_count")
+        )
+        self.assertEqual([], summary.get("worker_writer_violations"))
+        self.assertEqual(
+            0 if extra else 28,
+            summary.get("production_integrity_delegations"),
+            summary,
+        )
         return run_root, summary
+
+    def _result_inventory(self):
+        return sorted(
+            str(path.relative_to(self.results))
+            for path in self.results.rglob("*")
+        )
 
     def test_real_processes_cover_all_28_cases(self):
         run_root, summary = self._run_coordinator("formal")
@@ -146,7 +252,8 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertEqual(4, len(set(lane_pids.values())))
         self.assertTrue(summary["all_workers_joined"])
         self.assertNotIn(os.getpid(), lane_pids.values())
-        self.assertEqual(1, summary["writer_calls"])
+        self.assertEqual(1, summary.get("writer_lease_acquisitions"))
+        self.assertEqual(1, summary.get("writer_authority_issuances"))
 
         expected_lane_counts = {"E1": 8, "E2": 8, "E3": 8, "APP": 4}
         for lane in LANES:
@@ -259,7 +366,8 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertEqual("validated", summary["status"], summary)
         self.assertEqual(28, len(summary["sealed_keys"]))
         self.assertEqual({"forward": 20, "lifecycle": 8}, summary["aggregate"])
-        self.assertEqual(0, summary["writer_calls"])
+        self.assertEqual(0, summary.get("writer_lease_acquisitions"))
+        self.assertEqual(0, summary.get("writer_authority_issuances"))
         self.assertEqual(4, len(set(summary["lane_pids"].values())))
         self.assertTrue(summary["all_workers_joined"])
         self.assertEqual(28, summary["validation_environment_count"])
@@ -268,9 +376,7 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertTrue(
             (run_root / "coordinator/teardown.json").is_file()
         )
-        self.assertFalse(
-            (self.results / "observing_workflows_results_commit.json").exists()
-        )
+        self.assertEqual([".keep"], self._result_inventory())
         self.assertFalse(self.sentinel_marker.exists())
 
     def test_recovery_scrubs_active_ownership_only_case(self):
@@ -279,6 +385,8 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual("failed", summary["status"], summary)
+        self.assertEqual(1, summary.get("writer_lease_acquisitions"))
+        self.assertEqual(1, summary.get("writer_authority_issuances"))
         self.assertEqual(4, len(set(summary["lane_pids"].values())))
         self.assertTrue(summary["all_workers_joined"])
         self.assertLess(len(summary["sealed_keys"]), 28)
@@ -303,9 +411,7 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertFalse((case_root / "codex-home").exists())
         self.assertTrue(tombstone["scrubbed"])
         self.assertEqual("expected", tombstone["canonical_binding"])
-        self.assertFalse(
-            (self.results / "observing_workflows_results_commit.json").exists()
-        )
+        self.assertEqual([".keep"], self._result_inventory())
         self.assertFalse(self.sentinel_marker.exists())
 
     def test_namespace_collision_fails_closed_and_retains_replacement(self):
@@ -314,6 +420,8 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual("failed", summary["status"], summary)
+        self.assertEqual(1, summary.get("writer_lease_acquisitions"))
+        self.assertEqual(1, summary.get("writer_authority_issuances"))
         self.assertTrue(summary["collision_replacement_retained"])
         self.assertEqual(4, len(set(summary["lane_pids"].values())))
         self.assertTrue(summary["all_workers_joined"])
@@ -327,9 +435,7 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertEqual(
             "replacement\n", replacement.read_text(encoding="ascii")
         )
-        self.assertFalse(
-            (self.results / "observing_workflows_results_commit.json").exists()
-        )
+        self.assertEqual([".keep"], self._result_inventory())
         self.assertFalse(self.sentinel_marker.exists())
 
     def test_production_worker_cli_exposes_no_test_driver_flag(self):
