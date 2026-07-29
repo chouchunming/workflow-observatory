@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
@@ -13587,113 +13587,89 @@ class CoordinatorStateTests(unittest.TestCase):
                 lease.close()
 
     def test_retained_proof_retirement_never_deletes_replacement(self):
-        proof_names = (
-            "teardown.json",
-            "stop-launches.json",
-            "bootstrap-ownership.json",
-            "bootstrap-tombstone.json",
+        relative_proofs = (
+            PurePosixPath("coordinator/teardown.json"),
+            PurePosixPath("coordinator/stop-launches.json"),
+            PurePosixPath(
+                "coordinator/cleanup/bootstrap-ownership.json"
+            ),
+            PurePosixPath(
+                "coordinator/cleanup/bootstrap-tombstone.json"
+            ),
         )
-        original = b'{"proof":"original"}'
         replacement = b'{"proof":"replacement"}'
-        for index, name in enumerate(proof_names):
-            with self.subTest(name=name):
-                parent = self.root / f"retained-proof-{index}"
-                parent.mkdir(mode=0o700)
-                path = parent / name
-                path.write_bytes(original)
-                path.chmod(0o600)
-                descriptor, _metadata = sharding._open_private_directory(
-                    parent, f"{name} test parent"
+        for index, relative in enumerate(relative_proofs):
+            with self.subTest(name=relative.name):
+                self._prepare_retirement_crash_scenario(
+                    f"retirement-replacement-{index}"
                 )
-                parent_slot = sharding._DescriptorSlot(descriptor)
-                archive = self.root / f"retained-proof-archive-{index}"
-                archive.mkdir(mode=0o700)
-                archive_descriptor, _metadata = (
-                    sharding._open_private_directory(
-                        archive, f"{name} test archive"
-                    )
-                )
-                archive_slot = sharding._DescriptorSlot(archive_descriptor)
-                try:
-                    proof = sharding._retain_verified_unlink_proof(
-                        parent_slot=parent_slot,
-                        name=name,
-                        expected_content=original,
-                        label=f"{name} test proof",
-                        byte_cap=4096,
-                    )
-                    real_rename = sharding._rename_exclusive_at
-                    injected = False
+                path = self.run_root / relative
+                lease, authority = self._fresh_retirement_authority()
+                real_rename = sharding._rename_exclusive_at
+                injected = False
 
-                    def replace_before_rename(
-                        *,
-                        source_slot,
-                        source_name,
-                        destination_slot,
-                        destination_name,
-                    ):
-                        nonlocal injected
-                        if not injected and source_name == name:
+                def replace_before_rename(
+                    *,
+                    source_slot,
+                    source_name,
+                    destination_slot,
+                    destination_name,
+                ):
+                    nonlocal injected
+                    if not injected and source_name == relative.name:
+                        named = os.stat(
+                            source_name,
+                            dir_fd=source_slot.descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            named.st_dev,
+                            named.st_ino,
+                        ) == (
+                            path.stat().st_dev,
+                            path.stat().st_ino,
+                        ):
                             injected = True
                             path.unlink()
                             path.write_bytes(replacement)
                             path.chmod(0o600)
-                        return real_rename(
-                            source_slot=source_slot,
-                            source_name=source_name,
-                            destination_slot=destination_slot,
-                            destination_name=destination_name,
-                        )
+                    return real_rename(
+                        source_slot=source_slot,
+                        source_name=source_name,
+                        destination_slot=destination_slot,
+                        destination_name=destination_name,
+                    )
 
+                try:
                     with mock.patch.object(
                         sharding,
                         "_rename_exclusive_at",
                         side_effect=replace_before_rename,
                     ):
                         with self.assertRaisesRegex(
-                            ValueError, "changed before retirement"
+                            ValueError, "changed during move"
                         ):
-                            sharding._retire_retained_proofs(
-                                (proof,),
-                                archive_slot=archive_slot,
+                            sharding._rearm_bootstrap_before_resume(
+                                plan=self.plan,
+                                coordinator_root=(
+                                    self.run_root / "coordinator"
+                                ),
+                                source_codex_home=self.source_codex_home,
+                                lease=lease,
+                                authority=authority,
                             )
                     self.assertEqual(replacement, path.read_bytes())
-                    self.assertEqual((name,), tuple(
-                        entry.name for entry in parent.iterdir()
-                    ))
-                    self.assertEqual((), tuple(archive.iterdir()))
                 finally:
-                    sharding._retire_task_descriptors(
-                        [archive_slot, parent_slot],
-                        primary=None,
-                        label="retained proof parent close failed",
-                    )
+                    if lease.active:
+                        lease.close()
 
     def test_retained_proof_retirement_has_no_final_unlink_window(self):
-        parent = self.root / "retained-proof-no-final-unlink"
-        archive = self.root / "retained-proof-no-final-unlink-archive"
-        parent.mkdir(mode=0o700)
-        archive.mkdir(mode=0o700)
-        path = parent / "teardown.json"
-        original = b'{"proof":"original"}'
-        path.write_bytes(original)
-        path.chmod(0o600)
-        parent_descriptor, _metadata = sharding._open_private_directory(
-            parent, "retained proof test parent"
+        expected = self._prepare_retirement_crash_scenario(
+            "retirement-no-final-unlink"
         )
-        archive_descriptor, _metadata = sharding._open_private_directory(
-            archive, "retained proof test archive"
-        )
-        parent_slot = sharding._DescriptorSlot(parent_descriptor)
-        archive_slot = sharding._DescriptorSlot(archive_descriptor)
+        lease, authority = self._fresh_retirement_authority()
+        bootstrap = None
         try:
-            proof = sharding._retain_verified_unlink_proof(
-                parent_slot=parent_slot,
-                name=path.name,
-                expected_content=original,
-                label="retained proof",
-                byte_cap=4096,
-            )
             with mock.patch.object(
                 sharding.os,
                 "unlink",
@@ -13701,20 +13677,34 @@ class CoordinatorStateTests(unittest.TestCase):
                     "retirement must not have a final unlink race"
                 ),
             ):
-                sharding._retire_retained_proofs(
-                    (proof,),
-                    archive_slot=archive_slot,
+                bootstrap = sharding._rearm_bootstrap_before_resume(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    source_codex_home=self.source_codex_home,
+                    lease=lease,
+                    authority=authority,
                 )
-            self.assertFalse(path.exists())
-            archived = tuple(archive.iterdir())
-            self.assertEqual(1, len(archived))
-            self.assertEqual(original, archived[0].read_bytes())
-        finally:
-            sharding._retire_task_descriptors(
-                [archive_slot, parent_slot],
-                primary=None,
-                label="retained proof test descriptors close failed",
+            archive = self.run_root / "coordinator/retired-proofs"
+            members = tuple(
+                path.read_bytes()
+                for path in archive.iterdir()
+                if re.fullmatch(
+                    r"[0-9a-f]{64}-[0-9]{2}-.+",
+                    path.name,
+                )
             )
+            self.assertEqual(
+                sorted(expected.values()),
+                sorted(members),
+            )
+        finally:
+            if (
+                bootstrap is not None
+                and bootstrap.descriptor_close_state == "owned"
+            ):
+                sharding._retire_descriptor_capability(bootstrap)
+            if lease.active:
+                lease.close()
 
     def test_rearm_retires_only_retained_verified_proofs(self):
         from scripts import run_observing_workflows_eval_worker as worker
@@ -13799,13 +13789,13 @@ class CoordinatorStateTests(unittest.TestCase):
                 (self.run_root / "coordinator/stop-launches.json").exists()
             )
             retired = tuple(
-                (
-                    self.run_root / "coordinator/retired-proofs" / entry
-                ).read_bytes()
+                entry
                 for entry in sorted(
-                    os.listdir(
-                        self.run_root / "coordinator/retired-proofs"
-                    )
+                    os.listdir(self.run_root / "coordinator/retired-proofs")
+                )
+                if re.fullmatch(
+                    r"[0-9a-f]{64}-[0-9]{2}-.+",
+                    entry,
                 )
             )
             self.assertEqual(4, len(retired))
@@ -13828,6 +13818,570 @@ class CoordinatorStateTests(unittest.TestCase):
                 )
             if resumed_lease.active:
                 resumed_lease.close()
+
+    def _prepare_retirement_crash_scenario(
+        self,
+        label,
+        *,
+        include_stop=True,
+    ):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        self.run_root = self.root / label / "run"
+        self.source_codex_home = self.root / label / "source-codex-home"
+        self.source_codex_home.mkdir(parents=True, mode=0o700)
+        auth = self.source_codex_home / "auth.json"
+        auth.write_bytes(b'{"token":"secret"}')
+        auth.chmod(0o600)
+        (
+            lease,
+            bootstrap,
+            assignment,
+            paths,
+            installed,
+            _evidence,
+        ) = self._prepare_case_and_bootstrap()
+        try:
+            machine, _guard = self._new_machine()
+            machine._bind_run_lease(lease)
+            authority = machine.workers_stopped()
+            machine.begin_teardown()
+            case_receipt = worker.cleanup_case_auth(
+                installed=installed,
+                paths=paths,
+            )
+            sharding.teardown_case_auth(
+                paths=paths,
+                receipt=case_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            bootstrap_receipt = sharding.cleanup_auth_bootstrap(
+                installed=bootstrap,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.teardown_auth_bootstrap(
+                coordinator_root=self.run_root / "coordinator",
+                receipt=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+            sharding.write_teardown_receipt(
+                plan=self.plan,
+                run_root=self.run_root,
+                tombstones=((assignment.key, case_receipt),),
+                bootstrap=bootstrap_receipt,
+                lease=lease,
+                authority=authority,
+            )
+        finally:
+            if lease.active:
+                lease.close()
+        if include_stop:
+            sharding._atomic_write_record(
+                self.run_root / "coordinator/stop-launches.json",
+                {
+                    "schema_version": 1,
+                    "epoch_id": self.plan.epoch_id,
+                    "run_kind": self.plan.run_kind,
+                    "reason_sha256": "a" * 64,
+                },
+            )
+        proof_paths = [
+            self.run_root / "coordinator/teardown.json",
+            self.run_root
+            / "coordinator/cleanup/bootstrap-ownership.json",
+            self.run_root
+            / "coordinator/cleanup/bootstrap-tombstone.json",
+        ]
+        if include_stop:
+            proof_paths.insert(
+                1,
+                self.run_root / "coordinator/stop-launches.json",
+            )
+        return {
+            path.name: path.read_bytes()
+            for path in proof_paths
+        }
+
+    def _fresh_retirement_authority(self):
+        lease = sharding.RunCoordinatorLease.acquire(
+            run_root=self.run_root,
+            epoch_id=self.plan.epoch_id,
+            run_kind=self.plan.run_kind,
+        )
+        machine, _guard = self._new_machine()
+        machine._bind_run_lease(lease)
+        return lease, machine.workers_stopped()
+
+    def _crash_retirement_at(self, cut):
+        pid = os.fork()
+        if pid == 0:
+            child_lease = None
+            try:
+                child_lease, authority = self._fresh_retirement_authority()
+
+                def terminate(point):
+                    if point == cut:
+                        os._exit(77)
+
+                sharding._rearm_bootstrap_before_resume(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    source_codex_home=self.source_codex_home,
+                    lease=child_lease,
+                    authority=authority,
+                    retirement_fault_injector=terminate,
+                )
+            except BaseException:
+                os._exit(99)
+            finally:
+                if child_lease is not None and child_lease.active:
+                    child_lease.close()
+            os._exit(0)
+        _child, status = os.waitpid(pid, 0)
+        self.assertEqual(77, os.waitstatus_to_exitcode(status))
+
+    def test_retirement_recovers_every_durable_crash_cut(self):
+        cuts = (
+            "prepared-file-fsync",
+            "prepared-rename",
+            "prepared-directory-fsync",
+            "member-0-rename",
+            "member-0-source-fsync",
+            "member-0-archive-fsync",
+            "member-1-rename",
+            "member-1-source-fsync",
+            "member-1-archive-fsync",
+            "member-2-rename",
+            "member-2-source-fsync",
+            "member-2-archive-fsync",
+            "member-3-rename",
+            "member-3-source-fsync",
+            "member-3-archive-fsync",
+            "complete-file-fsync",
+            "complete-rename",
+            "complete-directory-fsync",
+        )
+        for index, cut in enumerate(cuts):
+            with self.subTest(cut=cut):
+                expected = self._prepare_retirement_crash_scenario(
+                    f"retirement-crash-{index}"
+                )
+                self._crash_retirement_at(cut)
+                lease, authority = self._fresh_retirement_authority()
+                bootstrap = None
+                try:
+                    bootstrap = sharding._rearm_bootstrap_before_resume(
+                        plan=self.plan,
+                        coordinator_root=self.run_root / "coordinator",
+                        source_codex_home=self.source_codex_home,
+                        lease=lease,
+                        authority=authority,
+                    )
+                    archive = (
+                        self.run_root / "coordinator/retired-proofs"
+                    )
+                    names = tuple(sorted(os.listdir(archive)))
+                    prepared = tuple(
+                        name
+                        for name in names
+                        if name.endswith("-prepared.json")
+                    )
+                    complete = tuple(
+                        name
+                        for name in names
+                        if name.endswith("-complete.json")
+                    )
+                    members = tuple(
+                        name
+                        for name in names
+                        if re.fullmatch(
+                            r"[0-9a-f]{64}-[0-9]{2}-.+",
+                            name,
+                        )
+                    )
+                    self.assertGreaterEqual(len(prepared), 1)
+                    self.assertEqual(len(prepared), len(complete))
+                    self.assertEqual(4, len(members))
+                    self.assertEqual(
+                        sorted(expected.values()),
+                        sorted((archive / name).read_bytes() for name in members),
+                    )
+                    self.assertTrue(bootstrap.path.is_dir())
+                    self.assertTrue(
+                        (
+                            self.run_root
+                            / "coordinator/cleanup/bootstrap-ownership.json"
+                        ).is_file()
+                    )
+                finally:
+                    if (
+                        bootstrap is not None
+                        and bootstrap.descriptor_close_state == "owned"
+                    ):
+                        sharding._retire_descriptor_capability(bootstrap)
+                    if lease.active:
+                        lease.close()
+
+    def test_retirement_transaction_rejects_mismatched_bindings(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-mismatched-binding"
+        )
+        self._crash_retirement_at("prepared-directory-fsync")
+        archive = self.run_root / "coordinator/retired-proofs"
+        prepared = next(
+            path
+            for path in archive.iterdir()
+            if path.name.endswith("-prepared.json")
+        )
+        payload = json.loads(prepared.read_text(encoding="ascii"))
+        payload["members"][0]["content_sha256"] = "0" * 64
+        prepared.write_bytes(sharding.canonical_config_bytes(payload))
+        prepared.chmod(0o600)
+        active_before = {
+            path.relative_to(self.run_root): path.read_bytes()
+            for path in (
+                self.run_root / "coordinator/teardown.json",
+                self.run_root / "coordinator/stop-launches.json",
+                self.run_root
+                / "coordinator/cleanup/bootstrap-ownership.json",
+                self.run_root
+                / "coordinator/cleanup/bootstrap-tombstone.json",
+            )
+        }
+        lease, authority = self._fresh_retirement_authority()
+        try:
+            with self.assertRaisesRegex(ValueError, "transaction"):
+                sharding._rearm_bootstrap_before_resume(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    source_codex_home=self.source_codex_home,
+                    lease=lease,
+                    authority=authority,
+                )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(
+            active_before,
+            {
+                path.relative_to(self.run_root): path.read_bytes()
+                for path in (
+                    self.run_root / "coordinator/teardown.json",
+                    self.run_root / "coordinator/stop-launches.json",
+                    self.run_root
+                    / "coordinator/cleanup/bootstrap-ownership.json",
+                    self.run_root
+                    / "coordinator/cleanup/bootstrap-tombstone.json",
+                )
+            },
+        )
+
+    def test_retirement_transaction_allows_absent_stop_marker(self):
+        expected = self._prepare_retirement_crash_scenario(
+            "retirement-without-stop",
+            include_stop=False,
+        )
+        lease, authority = self._fresh_retirement_authority()
+        bootstrap = None
+        try:
+            bootstrap = sharding._rearm_bootstrap_before_resume(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                source_codex_home=self.source_codex_home,
+                lease=lease,
+                authority=authority,
+            )
+            archive = self.run_root / "coordinator/retired-proofs"
+            members = tuple(
+                path.read_bytes()
+                for path in archive.iterdir()
+                if re.fullmatch(
+                    r"[0-9a-f]{64}-[0-9]{2}-.+",
+                    path.name,
+                )
+            )
+            self.assertEqual(
+                sorted(expected.values()),
+                sorted(members),
+            )
+            self.assertEqual(3, len(members))
+        finally:
+            if (
+                bootstrap is not None
+                and bootstrap.descriptor_close_state == "owned"
+            ):
+                sharding._retire_descriptor_capability(bootstrap)
+            if lease.active:
+                lease.close()
+
+    def test_retirement_transaction_reserves_the_bounded_archive(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-archive-cap"
+        )
+        archive = self.run_root / "coordinator/retired-proofs"
+        archive.mkdir(mode=0o700)
+        archive.chmod(0o700)
+        for index in range(sharding.MAX_RETIRED_PROOF_RECORDS - 5):
+            record = archive / f"{index:032x}-legacy.json"
+            record.write_bytes(b"{}")
+            record.chmod(0o600)
+        active = self.run_root / "coordinator/teardown.json"
+        expected = active.read_bytes()
+        lease, authority = self._fresh_retirement_authority()
+        try:
+            with self.assertRaisesRegex(ValueError, "record cap"):
+                sharding._rearm_bootstrap_before_resume(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    source_codex_home=self.source_codex_home,
+                    lease=lease,
+                    authority=authority,
+                )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(expected, active.read_bytes())
+        self.assertFalse(any(
+            path.name.endswith("-prepared.json")
+            for path in archive.iterdir()
+        ))
+
+    def test_retirement_rechecks_prepared_record_before_first_move(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-prepared-record-replacement"
+        )
+        active_paths = (
+            self.run_root / "coordinator/teardown.json",
+            self.run_root / "coordinator/stop-launches.json",
+            self.run_root
+            / "coordinator/cleanup/bootstrap-ownership.json",
+            self.run_root
+            / "coordinator/cleanup/bootstrap-tombstone.json",
+        )
+        active_before = {
+            path.relative_to(self.run_root): path.read_bytes()
+            for path in active_paths
+        }
+        replacement = b'{"replacement":true}'
+        lease, authority = self._fresh_retirement_authority()
+
+        def replace_prepared(point):
+            if point != "prepared-directory-fsync":
+                return
+            archive = self.run_root / "coordinator/retired-proofs"
+            prepared = next(
+                path
+                for path in archive.iterdir()
+                if path.name.endswith("-prepared.json")
+            )
+            prepared.write_bytes(replacement)
+            prepared.chmod(0o600)
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError,
+                "transaction.*(changed|invalid)|canonical ASCII JSON",
+            ):
+                sharding._rearm_bootstrap_before_resume(
+                    plan=self.plan,
+                    coordinator_root=self.run_root / "coordinator",
+                    source_codex_home=self.source_codex_home,
+                    lease=lease,
+                    authority=authority,
+                    retirement_fault_injector=replace_prepared,
+                )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(
+            active_before,
+            {
+                path.relative_to(self.run_root): path.read_bytes()
+                for path in active_paths
+            },
+        )
+        prepared = next(
+            path
+            for path in (
+                self.run_root / "coordinator/retired-proofs"
+            ).iterdir()
+            if path.name.endswith("-prepared.json")
+        )
+        self.assertEqual(replacement, prepared.read_bytes())
+
+    def test_completed_retirement_preserves_reused_active_names(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-active-name-reuse"
+        )
+        lease, authority = self._fresh_retirement_authority()
+        bootstrap = None
+        try:
+            bootstrap = sharding._rearm_bootstrap_before_resume(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                source_codex_home=self.source_codex_home,
+                lease=lease,
+                authority=authority,
+            )
+        finally:
+            if (
+                bootstrap is not None
+                and bootstrap.descriptor_close_state == "owned"
+            ):
+                sharding._retire_descriptor_capability(bootstrap)
+            if lease.active:
+                lease.close()
+        ownership = (
+            self.run_root / "coordinator/cleanup/bootstrap-ownership.json"
+        )
+        expected = ownership.read_bytes()
+        lease, authority = self._fresh_retirement_authority()
+        try:
+            sharding._reconcile_retired_proof_archive_before_resume(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                lease=lease,
+                authority=authority,
+            )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(expected, ownership.read_bytes())
+
+    def test_reconciliation_rechecks_complete_record_before_bootstrap(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-complete-record-replacement"
+        )
+        lease, authority = self._fresh_retirement_authority()
+        bootstrap = None
+        try:
+            bootstrap = sharding._rearm_bootstrap_before_resume(
+                plan=self.plan,
+                coordinator_root=self.run_root / "coordinator",
+                source_codex_home=self.source_codex_home,
+                lease=lease,
+                authority=authority,
+            )
+        finally:
+            if (
+                bootstrap is not None
+                and bootstrap.descriptor_close_state == "owned"
+            ):
+                sharding._retire_descriptor_capability(bootstrap)
+            if lease.active:
+                lease.close()
+        ownership = (
+            self.run_root / "coordinator/cleanup/bootstrap-ownership.json"
+        )
+        expected_ownership = ownership.read_bytes()
+        archive = self.run_root / "coordinator/retired-proofs"
+        complete = next(
+            path
+            for path in archive.iterdir()
+            if path.name.endswith("-complete.json")
+        )
+        replacement = b'{"replacement":true}'
+        real_reconcile = sharding._reconcile_retirement_member
+        calls = 0
+
+        def replace_after_last_member(**kwargs):
+            nonlocal calls
+            result = real_reconcile(**kwargs)
+            calls += 1
+            if calls == 4:
+                complete.write_bytes(replacement)
+                complete.chmod(0o600)
+            return result
+
+        lease, authority = self._fresh_retirement_authority()
+        try:
+            with mock.patch.object(
+                sharding,
+                "_reconcile_retirement_member",
+                side_effect=replace_after_last_member,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "transaction record changed",
+                ):
+                    sharding._reconcile_retired_proof_archive_before_resume(
+                        plan=self.plan,
+                        coordinator_root=self.run_root / "coordinator",
+                        lease=lease,
+                        authority=authority,
+                    )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(replacement, complete.read_bytes())
+        self.assertEqual(expected_ownership, ownership.read_bytes())
+
+    def test_reconciliation_rechecks_archived_member_before_completion(self):
+        self._prepare_retirement_crash_scenario(
+            "retirement-archived-member-replacement"
+        )
+        self._crash_retirement_at("member-0-archive-fsync")
+        archive = self.run_root / "coordinator/retired-proofs"
+        archived = next(
+            path
+            for path in archive.iterdir()
+            if re.fullmatch(
+                r"[0-9a-f]{64}-00-.+",
+                path.name,
+            )
+        )
+        replacement = b'{"replacement":true}'
+        real_read = sharding._read_retained_unlink_content
+        injected = False
+
+        def replace_after_descriptor_read(
+            proof,
+            *,
+            byte_cap,
+            require_original_ctime,
+        ):
+            nonlocal injected
+            content = real_read(
+                proof,
+                byte_cap=byte_cap,
+                require_original_ctime=require_original_ctime,
+            )
+            if not injected and proof.name == archived.name:
+                injected = True
+                archived.unlink()
+                archived.write_bytes(replacement)
+                archived.chmod(0o600)
+            return content
+
+        lease, authority = self._fresh_retirement_authority()
+        try:
+            with mock.patch.object(
+                sharding,
+                "_read_retained_unlink_content",
+                side_effect=replace_after_descriptor_read,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "member.*changed",
+                ):
+                    sharding._rearm_bootstrap_before_resume(
+                        plan=self.plan,
+                        coordinator_root=self.run_root / "coordinator",
+                        source_codex_home=self.source_codex_home,
+                        lease=lease,
+                        authority=authority,
+                    )
+        finally:
+            if lease.active:
+                lease.close()
+        self.assertEqual(replacement, archived.read_bytes())
+        self.assertFalse(any(
+            path.name.endswith("-complete.json")
+            for path in archive.iterdir()
+        ))
 
     def test_terminal_checkpoint_precedes_ack_and_failure_cancels_all(self):
         machine, _guard = self._new_machine()

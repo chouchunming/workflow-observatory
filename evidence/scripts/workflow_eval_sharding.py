@@ -71,6 +71,7 @@ FaultPoint = Literal[
     "after-shard-commit",
 ]
 FaultInjector = Callable[[FaultPoint], None]
+_RetirementFaultInjector = Callable[[str], None]
 ProgressType = Literal[
     "lane-ready",
     "case-started",
@@ -106,6 +107,7 @@ MAX_PROTOCOL_IDENTITY_CRASH_TEMPS = 19
 PROTOCOL_WORKER_LOCK_TIMEOUT_SECONDS = 0.2
 PROTOCOL_WORKER_LOCK_POLL_SECONDS = 0.01
 MAX_RETIRED_PROOF_RECORDS = 128
+MAX_RETIRED_PROOF_TRANSACTION_BYTES = 32 * 1024
 MAX_SEAL_COUNTER = 1_000_000
 MAX_SEAL_ELAPSED_MILLISECONDS = 3_600_000
 MAX_SEAL_FAILURE_CHARS = 2**63 - 1
@@ -482,7 +484,19 @@ def _validate_retired_proof_archive(
     for name in inventory:
         if (
             type(name) is not str
-            or not re.fullmatch(r"[0-9a-f]{32}-.+", name)
+            or not (
+                re.fullmatch(r"[0-9a-f]{32}-.+", name)
+                or re.fullmatch(r"[0-9a-f]{64}-[0-9]{2}-.+", name)
+                or re.fullmatch(
+                    r"transaction-[0-9a-f]{64}-(prepared|complete)\.json",
+                    name,
+                )
+                or re.fullmatch(
+                    r"\.transaction-[0-9a-f]{64}-(prepared|complete)"
+                    r"\.json\.tmp-[0-9]+-[0-9a-f]{32}",
+                    name,
+                )
+            )
             or "/" in name
         ):
             raise ValueError("retired proof archive has an invalid record")
@@ -510,137 +524,864 @@ def _validate_retired_proof_archive(
     return inventory
 
 
+def _invoke_retirement_fault(
+    fault_injector: _RetirementFaultInjector | None,
+    point: str,
+) -> None:
+    if fault_injector is None:
+        return
+    if not callable(fault_injector):
+        raise TypeError("retirement fault injector must be callable or None")
+    fault_injector(point)
+
+
+def _validate_retirement_directory_slots(
+    *,
+    coordinator_slot: _DescriptorSlot,
+    cleanup_slot: _DescriptorSlot,
+    archive_slot: _DescriptorSlot,
+) -> None:
+    if any(
+        type(slot) is not _DescriptorSlot
+        for slot in (coordinator_slot, cleanup_slot, archive_slot)
+    ):
+        raise TypeError("retirement directory slots are invalid")
+    for slot, label in (
+        (coordinator_slot, "retirement coordinator"),
+        (cleanup_slot, "retirement cleanup"),
+        (archive_slot, "retirement archive"),
+    ):
+        _validate_owned_entry(
+            os.fstat(slot.descriptor),
+            label=label,
+            kind="directory",
+            mode=0o700,
+        )
+    cleanup_named = os.stat(
+        "cleanup",
+        dir_fd=coordinator_slot.descriptor,
+        follow_symlinks=False,
+    )
+    archive_named = os.stat(
+        "retired-proofs",
+        dir_fd=coordinator_slot.descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        _stat_identity(cleanup_named)
+        != _stat_identity(os.fstat(cleanup_slot.descriptor))
+        or _stat_identity(archive_named)
+        != _stat_identity(os.fstat(archive_slot.descriptor))
+    ):
+        raise RuntimeError("retirement directory binding changed")
+
+
+def _retirement_transaction_id(
+    *,
+    epoch_id: str,
+    run_kind: RunKind,
+    members: Sequence[Mapping[str, object]],
+) -> str:
+    seed_members = []
+    for member in members:
+        seed_members.append(
+            {
+                field: member[field]
+                for field in (
+                    "source_parent",
+                    "source_name",
+                    "device",
+                    "inode",
+                    "size",
+                    "content_sha256",
+                )
+            }
+        )
+    return hashlib.sha256(
+        canonical_config_bytes(
+            {
+                "schema_version": 1,
+                "epoch_id": epoch_id,
+                "run_kind": run_kind,
+                "members": seed_members,
+            }
+        )
+    ).hexdigest()
+
+
+def _build_retirement_transaction(
+    *,
+    plan: "EpochPlan",
+    proofs: Sequence[_RetainedUnlinkProof],
+    coordinator_slot: _DescriptorSlot,
+    cleanup_slot: _DescriptorSlot,
+) -> dict[str, object]:
+    members: list[dict[str, object]] = []
+    for proof in proofs:
+        if proof.parent_slot is coordinator_slot:
+            source_parent = "coordinator"
+        elif proof.parent_slot is cleanup_slot:
+            source_parent = "cleanup"
+        else:
+            raise ValueError("retirement proof parent is not canonical")
+        _read_retained_unlink_content(
+            proof,
+            byte_cap=max(proof.size, 1),
+            require_original_ctime=True,
+        )
+        members.append(
+            {
+                "source_parent": source_parent,
+                "source_name": proof.name,
+                "device": proof.identity[0],
+                "inode": proof.identity[1],
+                "size": proof.size,
+                "content_sha256": hashlib.sha256(proof.content).hexdigest(),
+            }
+        )
+    transaction_id = _retirement_transaction_id(
+        epoch_id=plan.epoch_id,
+        run_kind=plan.run_kind,
+        members=members,
+    )
+    bound_members = [
+        {
+            **member,
+            "archive_name": (
+                f"{transaction_id}-{index:02d}-{member['source_name']}"
+            ),
+        }
+        for index, member in enumerate(members)
+    ]
+    return {
+        "schema_version": 1,
+        "epoch_id": plan.epoch_id,
+        "run_kind": plan.run_kind,
+        "transaction_id": transaction_id,
+        "phase": "prepared",
+        "members": bound_members,
+    }
+
+
+def _retirement_phase_record_name(
+    transaction_id: str,
+    phase: Literal["prepared", "complete"],
+) -> str:
+    return f"transaction-{transaction_id}-{phase}.json"
+
+
+def _decode_retirement_transaction(
+    payload: object,
+    *,
+    expected_name: str,
+    plan: "EpochPlan",
+) -> dict[str, object]:
+    if type(payload) is not dict or set(payload) != {
+        "schema_version",
+        "epoch_id",
+        "run_kind",
+        "transaction_id",
+        "phase",
+        "members",
+    }:
+        raise ValueError("retirement transaction fields are invalid")
+    transaction_id = payload.get("transaction_id")
+    phase = payload.get("phase")
+    members = payload.get("members")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("epoch_id") != plan.epoch_id
+        or payload.get("run_kind") != plan.run_kind
+        or not _is_sha256(transaction_id)
+        or type(phase) is not str
+        or phase not in ("prepared", "complete")
+        or type(members) is not list
+        or not members
+        or len(members) > 4
+        or expected_name
+        != _retirement_phase_record_name(transaction_id, phase)
+    ):
+        raise ValueError("retirement transaction identity is invalid")
+    decoded_members: list[dict[str, object]] = []
+    for index, member in enumerate(members):
+        if type(member) is not dict or set(member) != {
+            "source_parent",
+            "source_name",
+            "archive_name",
+            "device",
+            "inode",
+            "size",
+            "content_sha256",
+        }:
+            raise ValueError("retirement transaction member is invalid")
+        source_parent = member.get("source_parent")
+        source_name = member.get("source_name")
+        archive_name = member.get("archive_name")
+        if (
+            type(source_parent) is not str
+            or source_parent not in ("coordinator", "cleanup")
+            or type(source_name) is not str
+            or not source_name
+            or "/" in source_name
+            or source_name in {".", ".."}
+            or type(archive_name) is not str
+            or archive_name
+            != f"{transaction_id}-{index:02d}-{source_name}"
+            or type(member.get("device")) is not int
+            or member["device"] < 0
+            or type(member.get("inode")) is not int
+            or member["inode"] <= 0
+            or type(member.get("size")) is not int
+            or member["size"] < 0
+            or member["size"] > 64 * 1024
+            or not _is_sha256(member.get("content_sha256"))
+        ):
+            raise ValueError("retirement transaction member binding is invalid")
+        decoded_members.append(dict(member))
+    if len(
+        {
+            (member["source_parent"], member["source_name"])
+            for member in decoded_members
+        }
+    ) != len(decoded_members) or len(
+        {member["archive_name"] for member in decoded_members}
+    ) != len(decoded_members):
+        raise ValueError("retirement transaction members are duplicated")
+    source_bindings = tuple(
+        (member["source_parent"], member["source_name"])
+        for member in decoded_members
+    )
+    if source_bindings not in (
+        (
+            ("coordinator", "teardown.json"),
+            ("cleanup", "bootstrap-ownership.json"),
+            ("cleanup", "bootstrap-tombstone.json"),
+        ),
+        (
+            ("coordinator", "teardown.json"),
+            ("coordinator", "stop-launches.json"),
+            ("cleanup", "bootstrap-ownership.json"),
+            ("cleanup", "bootstrap-tombstone.json"),
+        ),
+    ):
+        raise ValueError(
+            "retirement transaction source set is invalid"
+        )
+    if (
+        _retirement_transaction_id(
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            members=decoded_members,
+        )
+        != transaction_id
+    ):
+        raise ValueError("retirement transaction digest is invalid")
+    return {
+        "schema_version": 1,
+        "epoch_id": plan.epoch_id,
+        "run_kind": plan.run_kind,
+        "transaction_id": transaction_id,
+        "phase": phase,
+        "members": decoded_members,
+    }
+
+
+def _publish_retirement_phase_record(
+    *,
+    archive_slot: _DescriptorSlot,
+    payload: Mapping[str, object],
+    fault_injector: _RetirementFaultInjector | None,
+) -> bytes:
+    phase = payload.get("phase")
+    transaction_id = payload.get("transaction_id")
+    if (
+        type(phase) is not str
+        or phase not in ("prepared", "complete")
+        or not _is_sha256(transaction_id)
+    ):
+        raise ValueError("retirement phase publication is invalid")
+    content = canonical_config_bytes(payload)
+    if len(content) > MAX_RETIRED_PROOF_TRANSACTION_BYTES:
+        raise ValueError("retirement transaction exceeds its byte cap")
+    _validate_retired_proof_archive(
+        archive_slot,
+        additional_records=1,
+    )
+    final_name = _retirement_phase_record_name(transaction_id, phase)
+    temporary_name = (
+        f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    temporary_slot: _DescriptorSlot | None = None
+    primary: BaseException | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=archive_slot.descriptor,
+        )
+        temporary_slot = _DescriptorSlot(descriptor)
+        os.fchmod(temporary_slot.descriptor, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(temporary_slot.descriptor, view)
+            view = view[written:]
+        os.fsync(temporary_slot.descriptor)
+        _invoke_retirement_fault(
+            fault_injector,
+            f"{phase}-file-fsync",
+        )
+    except BaseException as error:
+        primary = error
+    if temporary_slot is not None:
+        close_error = _retire_descriptor_capability(temporary_slot)
+        _raise_ordered_failures(
+            "retirement transaction write or close failed",
+            primary,
+            [close_error] if close_error is not None else [],
+        )
+    elif primary is not None:
+        raise primary
+    _rename_exclusive_at(
+        source_slot=archive_slot,
+        source_name=temporary_name,
+        destination_slot=archive_slot,
+        destination_name=final_name,
+    )
+    _invoke_retirement_fault(fault_injector, f"{phase}-rename")
+    os.fsync(archive_slot.descriptor)
+    _invoke_retirement_fault(
+        fault_injector,
+        f"{phase}-directory-fsync",
+    )
+    return content
+
+
+def _validate_retirement_binding_proof(
+    proof: _RetainedUnlinkProof,
+    member: Mapping[str, object],
+) -> None:
+    if (
+        proof.identity
+        != (member.get("device"), member.get("inode"))
+        or proof.size != member.get("size")
+        or hashlib.sha256(proof.content).hexdigest()
+        != member.get("content_sha256")
+    ):
+        raise ValueError("retirement transaction member changed")
+
+
+def _retain_transaction_member(
+    *,
+    parent_slot: _DescriptorSlot,
+    name: str,
+    member: Mapping[str, object],
+    label: str,
+) -> _RetainedUnlinkProof:
+    proof = _retain_verified_unlink_proof(
+        parent_slot=parent_slot,
+        name=name,
+        expected_content=None,
+        label=label,
+        byte_cap=64 * 1024,
+    )
+    primary: BaseException | None = None
+    try:
+        _validate_retirement_binding_proof(proof, member)
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        _retire_task_descriptors(
+            [proof.slot],
+            primary=primary,
+            label=f"{label} validation or close failed",
+        )
+    return proof
+
+
+def _reconcile_retirement_member(
+    *,
+    member: Mapping[str, object],
+    index: int,
+    coordinator_slot: _DescriptorSlot,
+    cleanup_slot: _DescriptorSlot,
+    archive_slot: _DescriptorSlot,
+    fault_injector: _RetirementFaultInjector | None,
+) -> None:
+    parent_slot = (
+        coordinator_slot
+        if member["source_parent"] == "coordinator"
+        else cleanup_slot
+    )
+    archive_name = str(member["archive_name"])
+    source_name = str(member["source_name"])
+    try:
+        archived = _retain_transaction_member(
+            parent_slot=archive_slot,
+            name=archive_name,
+            member=member,
+            label="retired proof transaction member",
+        )
+    except FileNotFoundError:
+        archived = None
+    if archived is not None:
+        primary: BaseException | None = None
+        try:
+            try:
+                active = os.stat(
+                    source_name,
+                    dir_fd=parent_slot.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                active = None
+            if (
+                active is not None
+                and _stat_identity(active) == archived.identity
+            ):
+                raise ValueError(
+                    "retirement transaction member has duplicate names"
+                )
+            _read_retained_unlink_content(
+                archived,
+                byte_cap=max(archived.size, 1),
+                require_original_ctime=True,
+            )
+            named = os.stat(
+                archive_name,
+                dir_fd=archive_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(named) != archived.identity:
+                raise ValueError(
+                    "retirement transaction member changed after verification"
+                )
+        except BaseException as error:
+            primary = error
+        _retire_task_descriptors(
+            [archived.slot],
+            primary=primary,
+            label="archived transaction member or close failed",
+        )
+        return
+
+    active = _retain_transaction_member(
+        parent_slot=parent_slot,
+        name=source_name,
+        member=member,
+        label="active proof transaction member",
+    )
+    primary = None
+    try:
+        _rename_exclusive_at(
+            source_slot=parent_slot,
+            source_name=source_name,
+            destination_slot=archive_slot,
+            destination_name=archive_name,
+        )
+        archived_metadata = os.stat(
+            archive_name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if _stat_identity(archived_metadata) != active.identity:
+            try:
+                os.stat(
+                    source_name,
+                    dir_fd=parent_slot.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                _rename_exclusive_at(
+                    source_slot=archive_slot,
+                    source_name=archive_name,
+                    destination_slot=parent_slot,
+                    destination_name=source_name,
+                )
+            raise ValueError(
+                "retirement transaction member changed during move"
+            )
+        _read_retained_unlink_content(
+            active,
+            byte_cap=max(active.size, 1),
+            require_original_ctime=False,
+        )
+        _invoke_retirement_fault(
+            fault_injector,
+            f"member-{index}-rename",
+        )
+        os.fsync(parent_slot.descriptor)
+        _invoke_retirement_fault(
+            fault_injector,
+            f"member-{index}-source-fsync",
+        )
+        os.fsync(archive_slot.descriptor)
+        _invoke_retirement_fault(
+            fault_injector,
+            f"member-{index}-archive-fsync",
+        )
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [active.slot],
+        primary=primary,
+        label="active transaction member move or close failed",
+    )
+
+
+def _retain_retirement_phase_record(
+    *,
+    archive_slot: _DescriptorSlot,
+    name: str,
+    plan: "EpochPlan",
+) -> tuple[dict[str, object], _RetainedUnlinkProof]:
+    proof = _retain_verified_unlink_proof(
+        parent_slot=archive_slot,
+        name=name,
+        expected_content=None,
+        label="retirement transaction record",
+        byte_cap=MAX_RETIRED_PROOF_TRANSACTION_BYTES,
+    )
+    primary: BaseException | None = None
+    decoded: dict[str, object] | None = None
+    try:
+        try:
+            payload = json.loads(proof.content.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError(
+                "retirement transaction is not canonical ASCII JSON"
+            ) from None
+        if (
+            type(payload) is not dict
+            or canonical_config_bytes(payload) != proof.content
+        ):
+            raise ValueError(
+                "retirement transaction is not canonical ASCII JSON"
+            )
+        decoded = _decode_retirement_transaction(
+            payload,
+            expected_name=name,
+            plan=plan,
+        )
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        _retire_task_descriptors(
+            [proof.slot],
+            primary=primary,
+            label="retirement transaction validation or close failed",
+        )
+    if decoded is None:
+        raise AssertionError("retirement transaction decode produced no record")
+    return decoded, proof
+
+
+def _reconcile_retired_proof_transactions_retained(
+    *,
+    plan: "EpochPlan",
+    coordinator_slot: _DescriptorSlot,
+    cleanup_slot: _DescriptorSlot,
+    archive_slot: _DescriptorSlot,
+    fault_injector: _RetirementFaultInjector | None = None,
+) -> bool:
+    inventory = _validate_retired_proof_archive(
+        archive_slot,
+        additional_records=0,
+    )
+    prepared_names = tuple(
+        name
+        for name in inventory
+        if re.fullmatch(
+            r"transaction-[0-9a-f]{64}-prepared\.json",
+            name,
+        )
+    )
+    complete_names = {
+        name
+        for name in inventory
+        if re.fullmatch(
+            r"transaction-[0-9a-f]{64}-complete\.json",
+            name,
+        )
+    }
+    expected_complete_names = {
+        name.replace("-prepared.json", "-complete.json")
+        for name in prepared_names
+    }
+    if complete_names - expected_complete_names:
+        raise ValueError("retirement transaction completion is orphaned")
+    retained_records: list[_RetainedUnlinkProof] = []
+    referenced_members: set[str] = set()
+    primary: BaseException | None = None
+    try:
+        for prepared_name in prepared_names:
+            prepared, prepared_proof = _retain_retirement_phase_record(
+                archive_slot=archive_slot,
+                name=prepared_name,
+                plan=plan,
+            )
+            retained_records.append(prepared_proof)
+            complete_name = prepared_name.replace(
+                "-prepared.json",
+                "-complete.json",
+            )
+            complete: dict[str, object] | None = None
+            if complete_name in complete_names:
+                complete, complete_proof = (
+                    _retain_retirement_phase_record(
+                        archive_slot=archive_slot,
+                        name=complete_name,
+                        plan=plan,
+                    )
+                )
+                retained_records.append(complete_proof)
+                expected_complete = {
+                    **prepared,
+                    "phase": "complete",
+                }
+                if complete != expected_complete:
+                    raise ValueError(
+                        "retirement transaction phases differ"
+                    )
+            for index, member in enumerate(prepared["members"]):
+                referenced_members.add(str(member["archive_name"]))
+                named = os.stat(
+                    prepared_name,
+                    dir_fd=archive_slot.descriptor,
+                    follow_symlinks=False,
+                )
+                if _stat_identity(named) != prepared_proof.identity:
+                    raise ValueError(
+                        "retirement transaction record changed"
+                    )
+                _reconcile_retirement_member(
+                    member=member,
+                    index=index,
+                    coordinator_slot=coordinator_slot,
+                    cleanup_slot=cleanup_slot,
+                    archive_slot=archive_slot,
+                    fault_injector=fault_injector,
+                )
+            for index, member in enumerate(prepared["members"]):
+                _reconcile_retirement_member(
+                    member=member,
+                    index=index,
+                    coordinator_slot=coordinator_slot,
+                    cleanup_slot=cleanup_slot,
+                    archive_slot=archive_slot,
+                    fault_injector=None,
+                )
+            if complete is None:
+                complete_payload = {
+                    **prepared,
+                    "phase": "complete",
+                }
+                content = _publish_retirement_phase_record(
+                    archive_slot=archive_slot,
+                    payload=complete_payload,
+                    fault_injector=fault_injector,
+                )
+                durable, durable_proof = (
+                    _retain_retirement_phase_record(
+                        archive_slot=archive_slot,
+                        name=complete_name,
+                        plan=plan,
+                    )
+                )
+                retained_records.append(durable_proof)
+                if (
+                    durable != complete_payload
+                    or durable_proof.content != content
+                ):
+                    raise ValueError(
+                        "retirement completion differs after publication"
+                    )
+        for record in retained_records:
+            named = os.stat(
+                record.name,
+                dir_fd=archive_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(named) != record.identity:
+                raise ValueError(
+                    "retirement transaction record changed"
+                )
+            _read_retained_unlink_content(
+                record,
+                byte_cap=max(record.size, 1),
+                require_original_ctime=True,
+            )
+        unreferenced_members = {
+            name
+            for name in inventory
+            if re.fullmatch(r"[0-9a-f]{64}-[0-9]{2}-.+", name)
+        } - referenced_members
+        if unreferenced_members:
+            raise ValueError(
+                "retired proof archive has an unbound transaction member"
+            )
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [record.slot for record in retained_records],
+        primary=primary,
+        label="retirement reconciliation or record close failed",
+    )
+    return bool(prepared_names)
+
+
 def _retire_retained_proofs(
     proofs: Sequence[_RetainedUnlinkProof],
     *,
+    plan: "EpochPlan",
+    coordinator_slot: _DescriptorSlot,
+    cleanup_slot: _DescriptorSlot,
     archive_slot: _DescriptorSlot,
+    lease: "RunCoordinatorLease",
+    authority: "QuiescentRunAuthority",
+    fault_injector: _RetirementFaultInjector | None = None,
 ) -> None:
     frozen = tuple(proofs)
     if (
         not frozen
         or any(type(proof) is not _RetainedUnlinkProof for proof in frozen)
+        or type(plan) is not EpochPlan
+        or type(coordinator_slot) is not _DescriptorSlot
+        or type(cleanup_slot) is not _DescriptorSlot
         or type(archive_slot) is not _DescriptorSlot
         or len({(id(proof.parent_slot), proof.name) for proof in frozen})
         != len(frozen)
+        or (fault_injector is not None and not callable(fault_injector))
     ):
         raise ValueError("retained retirement proofs are invalid")
-    initial_inventory = _validate_retired_proof_archive(
-        archive_slot,
-        additional_records=len(frozen),
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=lease._run_root,
     )
-    staged: list[tuple[_RetainedUnlinkProof, str]] = []
+    _validate_retirement_directory_slots(
+        coordinator_slot=coordinator_slot,
+        cleanup_slot=cleanup_slot,
+        archive_slot=archive_slot,
+    )
+    _validate_retired_proof_archive(
+        archive_slot,
+        additional_records=len(frozen) + 2,
+    )
+    prepared = _build_retirement_transaction(
+        plan=plan,
+        proofs=frozen,
+        coordinator_slot=coordinator_slot,
+        cleanup_slot=cleanup_slot,
+    )
+    retained_records: list[_RetainedUnlinkProof] = []
     primary: BaseException | None = None
     try:
-        for proof in frozen:
+        prepared_content = _publish_retirement_phase_record(
+            archive_slot=archive_slot,
+            payload=prepared,
+            fault_injector=fault_injector,
+        )
+        durable_prepared, prepared_proof = (
+            _retain_retirement_phase_record(
+                archive_slot=archive_slot,
+                name=_retirement_phase_record_name(
+                    str(prepared["transaction_id"]),
+                    "prepared",
+                ),
+                plan=plan,
+            )
+        )
+        retained_records.append(prepared_proof)
+        if (
+            durable_prepared != prepared
+            or prepared_proof.content != prepared_content
+        ):
+            raise ValueError(
+                "retirement prepared record differs after publication"
+            )
+        for index, member in enumerate(prepared["members"]):
+            named = os.stat(
+                prepared_proof.name,
+                dir_fd=archive_slot.descriptor,
+                follow_symlinks=False,
+            )
+            if _stat_identity(named) != prepared_proof.identity:
+                raise ValueError(
+                    "retirement transaction record changed"
+                )
             _read_retained_unlink_content(
-                proof,
-                byte_cap=max(proof.size, 1),
+                prepared_proof,
+                byte_cap=max(prepared_proof.size, 1),
                 require_original_ctime=True,
             )
-            named = os.stat(
-                proof.name,
-                dir_fd=proof.parent_slot.descriptor,
-                follow_symlinks=False,
+            _reconcile_retirement_member(
+                member=member,
+                index=index,
+                coordinator_slot=coordinator_slot,
+                cleanup_slot=cleanup_slot,
+                archive_slot=archive_slot,
+                fault_injector=fault_injector,
             )
-            if _stat_identity(named) != proof.identity:
-                raise ValueError(f"{proof.label} changed before retirement")
-            archived_name = f"{secrets.token_hex(16)}-{proof.name}"
-            _rename_exclusive_at(
-                source_slot=proof.parent_slot,
-                source_name=proof.name,
-                destination_slot=archive_slot,
-                destination_name=archived_name,
+        for index, member in enumerate(prepared["members"]):
+            _reconcile_retirement_member(
+                member=member,
+                index=index,
+                coordinator_slot=coordinator_slot,
+                cleanup_slot=cleanup_slot,
+                archive_slot=archive_slot,
+                fault_injector=None,
             )
-            staged.append((proof, archived_name))
-            archived = os.stat(
-                archived_name,
-                dir_fd=archive_slot.descriptor,
-                follow_symlinks=False,
+        named = os.stat(
+            prepared_proof.name,
+            dir_fd=archive_slot.descriptor,
+            follow_symlinks=False,
+        )
+        if _stat_identity(named) != prepared_proof.identity:
+            raise ValueError("retirement transaction record changed")
+        complete = {
+            **prepared,
+            "phase": "complete",
+        }
+        content = _publish_retirement_phase_record(
+            archive_slot=archive_slot,
+            payload=complete,
+            fault_injector=fault_injector,
+        )
+        durable, durable_proof = _retain_retirement_phase_record(
+            archive_slot=archive_slot,
+            name=_retirement_phase_record_name(
+                str(prepared["transaction_id"]),
+                "complete",
+            ),
+            plan=plan,
+        )
+        try:
+            if durable != complete or durable_proof.content != content:
+                raise ValueError(
+                    "retirement completion differs after publication"
+                )
+        except BaseException as error:
+            _retire_task_descriptors(
+                [durable_proof.slot],
+                primary=error,
+                label="retirement completion validation or close failed",
             )
-            if _stat_identity(archived) != proof.identity:
-                raise ValueError(f"{proof.label} changed before retirement")
-            _read_retained_unlink_content(
-                proof,
-                byte_cap=max(proof.size, 1),
-                require_original_ctime=False,
+        else:
+            _retire_task_descriptors(
+                [durable_proof.slot],
+                primary=None,
+                label="retirement completion close failed",
             )
-        for proof, archived_name in staged:
-            archived = os.stat(
-                archived_name,
-                dir_fd=archive_slot.descriptor,
-                follow_symlinks=False,
-            )
-            if _stat_identity(archived) != proof.identity:
-                raise ValueError(f"{proof.label} changed before retirement")
-            _read_retained_unlink_content(
-                proof,
-                byte_cap=max(proof.size, 1),
-                require_original_ctime=False,
-            )
-        if set(_validate_retired_proof_archive(
-            archive_slot,
-            additional_records=0,
-        )) != set(initial_inventory) | {
-            archived_name for _proof, archived_name in staged
-        }:
-            raise RuntimeError("retired proof archive changed during retirement")
-        for parent_slot in {
-            id(proof.parent_slot): proof.parent_slot for proof in frozen
-        }.values():
-            os.fsync(parent_slot.descriptor)
-        os.fsync(archive_slot.descriptor)
     except BaseException as error:
         primary = error
-        rollback_errors: list[BaseException] = []
-        for proof, archived_name in reversed(staged):
-            try:
-                try:
-                    os.stat(
-                        archived_name,
-                        dir_fd=archive_slot.descriptor,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    continue
-                try:
-                    os.stat(
-                        proof.name,
-                        dir_fd=proof.parent_slot.descriptor,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    _rename_exclusive_at(
-                        source_slot=archive_slot,
-                        source_name=archived_name,
-                        destination_slot=proof.parent_slot,
-                        destination_name=proof.name,
-                    )
-            except BaseException as rollback_error:
-                rollback_errors.append(rollback_error)
-        for parent_slot in {
-            id(proof.parent_slot): proof.parent_slot for proof in frozen
-        }.values():
-            try:
-                os.fsync(parent_slot.descriptor)
-            except BaseException as rollback_error:
-                rollback_errors.append(rollback_error)
-        try:
-            os.fsync(archive_slot.descriptor)
-        except BaseException as rollback_error:
-            rollback_errors.append(rollback_error)
-        if rollback_errors:
-            errors = [primary, *rollback_errors]
-            group_type = (
-                ExceptionGroup
-                if all(isinstance(item, Exception) for item in errors)
-                else BaseExceptionGroup
-            )
-            primary = group_type(
-                "retained proof retirement and rollback failed",
-                errors,
-            )
     _retire_task_descriptors(
-        [proof.slot for proof in frozen],
+        [record.slot for record in retained_records]
+        + [proof.slot for proof in frozen],
         primary=primary,
         label="retained proof retirement or descriptor close failed",
     )
@@ -13090,6 +13831,79 @@ def _resume_replay_requires_cleanup(
     )
 
 
+def _reconcile_retired_proof_archive_before_resume(
+    *,
+    plan: EpochPlan,
+    coordinator_root: Path,
+    lease: RunCoordinatorLease,
+    authority: QuiescentRunAuthority,
+) -> bool:
+    _validate_quiescent_cleanup_access(
+        lease=lease,
+        authority=authority,
+        plan=plan,
+        run_root=Path(coordinator_root).parent,
+    )
+    archive_path = Path(coordinator_root) / "retired-proofs"
+    try:
+        archive_metadata = archive_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise ValueError(
+            "resume retired proof archive is unavailable"
+        ) from None
+    if stat.S_ISLNK(archive_metadata.st_mode) or not stat.S_ISDIR(
+        archive_metadata.st_mode
+    ):
+        raise ValueError("resume retired proof archive is unsafe")
+    slots: list[_DescriptorSlot] = []
+    reconciled: bool | None = None
+    primary: BaseException | None = None
+    try:
+        coordinator_descriptor, _metadata = _open_private_directory(
+            Path(coordinator_root),
+            "resume transaction coordinator",
+        )
+        coordinator_slot = _DescriptorSlot(coordinator_descriptor)
+        slots.append(coordinator_slot)
+        cleanup_descriptor, _metadata = _open_private_directory(
+            Path(coordinator_root) / "cleanup",
+            "resume transaction cleanup",
+        )
+        cleanup_slot = _DescriptorSlot(cleanup_descriptor)
+        slots.append(cleanup_slot)
+        archive_descriptor, _metadata = _open_private_directory(
+            archive_path,
+            "resume transaction archive",
+        )
+        archive_slot = _DescriptorSlot(archive_descriptor)
+        slots.append(archive_slot)
+        _validate_retirement_directory_slots(
+            coordinator_slot=coordinator_slot,
+            cleanup_slot=cleanup_slot,
+            archive_slot=archive_slot,
+        )
+        reconciled = _reconcile_retired_proof_transactions_retained(
+            plan=plan,
+            coordinator_slot=coordinator_slot,
+            cleanup_slot=cleanup_slot,
+            archive_slot=archive_slot,
+        )
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        list(reversed(slots)),
+        primary=primary,
+        label="resume transaction reconciliation or close failed",
+    )
+    if reconciled is None:
+        raise AssertionError(
+            "resume transaction reconciliation produced no result"
+        )
+    return reconciled
+
+
 def _rearm_bootstrap_before_resume(
     *,
     plan: EpochPlan,
@@ -13097,6 +13911,7 @@ def _rearm_bootstrap_before_resume(
     source_codex_home: Path,
     lease: RunCoordinatorLease,
     authority: QuiescentRunAuthority,
+    retirement_fault_injector: _RetirementFaultInjector | None = None,
 ) -> InstalledAuthBootstrap:
     _validate_quiescent_cleanup_access(
         lease=lease,
@@ -13110,6 +13925,14 @@ def _rearm_bootstrap_before_resume(
         pass
     else:
         raise ValueError("resume bootstrap was not torn down")
+    reconciled_transaction = (
+        _reconcile_retired_proof_archive_before_resume(
+            plan=plan,
+            coordinator_root=Path(coordinator_root),
+            lease=lease,
+            authority=authority,
+        )
+    )
     coordinator_descriptor, _metadata = _open_private_directory(
         Path(coordinator_root), "resume coordinator root"
     )
@@ -13145,6 +13968,32 @@ def _rearm_bootstrap_before_resume(
             "resume retired proof archive open unexpectedly returned"
         )
     retired_slot = _DescriptorSlot(retired_descriptor)
+    if reconciled_transaction:
+        cleanup_inventory = tuple(sorted(os.listdir(
+            cleanup_slot.descriptor
+        )))
+        active_coordinator_proofs = []
+        for name in ("teardown.json", "stop-launches.json"):
+            try:
+                os.stat(
+                    name,
+                    dir_fd=coordinator_slot.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            active_coordinator_proofs.append(name)
+        if not cleanup_inventory and not active_coordinator_proofs:
+            _retire_task_descriptors(
+                [retired_slot, cleanup_slot, coordinator_slot],
+                primary=None,
+                label="completed retirement descriptor close failed",
+            )
+            return prepare_auth_bootstrap(
+                source_codex_home=source_codex_home,
+                coordinator_root=Path(coordinator_root),
+                plan=plan,
+            )
     proofs: list[_RetainedUnlinkProof] = []
     primary: BaseException | None = None
     try:
@@ -13313,7 +14162,13 @@ def _rearm_bootstrap_before_resume(
                 )
         _retire_retained_proofs(
             tuple(proofs),
+            plan=plan,
+            coordinator_slot=coordinator_slot,
+            cleanup_slot=cleanup_slot,
             archive_slot=retired_slot,
+            lease=lease,
+            authority=authority,
+            fault_injector=retirement_fault_injector,
         )
     except BaseException as error:
         primary = error
@@ -14620,6 +15475,29 @@ def run_parallel_evaluation(
             asdict(transport_config),
             "sealed transport config",
         )
+        resume_authority: QuiescentRunAuthority | None = None
+        retired_proofs_path = coordinator_root / "retired-proofs"
+        try:
+            retired_proofs_path.lstat()
+        except FileNotFoundError:
+            has_retired_proofs = False
+        except OSError:
+            raise ValueError(
+                "retired proof archive is unavailable"
+            ) from None
+        else:
+            has_retired_proofs = True
+        if (
+            has_retired_proofs
+            and bound_options.resume_run_root is not None
+        ):
+            resume_authority = machine.workers_stopped()
+            _reconcile_retired_proof_archive_before_resume(
+                plan=plan,
+                coordinator_root=coordinator_root,
+                lease=run_lease,
+                authority=resume_authority,
+            )
         cleanup_root = coordinator_root / "cleanup"
         ownership_path = cleanup_root / "bootstrap-ownership.json"
         tombstone_path = cleanup_root / "bootstrap-tombstone.json"
@@ -14669,12 +15547,15 @@ def run_parallel_evaluation(
             ),
             invalid=(),
         )
-        teardown_authority: QuiescentRunAuthority | None = None
+        teardown_authority: QuiescentRunAuthority | None = (
+            resume_authority if cleanup_only else None
+        )
         if (
             not cleanup_only
             and bound_options.resume_run_root is not None
         ):
-            resume_authority = machine.workers_stopped()
+            if resume_authority is None:
+                resume_authority = machine.workers_stopped()
             if has_teardown:
                 bootstrap = _rearm_bootstrap_before_resume(
                     plan=plan,
