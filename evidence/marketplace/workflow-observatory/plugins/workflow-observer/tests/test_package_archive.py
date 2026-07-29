@@ -142,6 +142,9 @@ class ArchiveTests(unittest.TestCase):
         required = {
             "scripts/workflow_eval_sharding.py",
             "scripts/run_observing_workflows_eval_worker.py",
+            "tests/run_parallel_eval_no_model_coordinator.py",
+            "tests/run_parallel_eval_no_model_worker.py",
+            "tests/test_parallel_eval_no_model_integration.py",
         }
         first_digest = build_archive(self.source, self.archive, evidence)
         second_digest = build_archive(self.source, second, evidence)
@@ -357,6 +360,9 @@ class ArchiveTests(unittest.TestCase):
             "scripts/__init__.py",
             "scripts/package_workflow_observatory.py",
             "scripts/workflow_eval_sharding.py",
+            "tests/run_parallel_eval_no_model_coordinator.py",
+            "tests/run_parallel_eval_no_model_worker.py",
+            "tests/test_parallel_eval_no_model_integration.py",
             "tests/observing_workflows_eval_harness.py",
             "tests/run_observing_workflows_eval.py",
             "marketplace/workflow-observatory/plugins/workflow-observer/"
