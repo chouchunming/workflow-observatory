@@ -231,6 +231,28 @@ class DiagnosticExecutionScopeTests(unittest.TestCase):
             fingerprints=input_fingerprints("diagnostic"),
         )
 
+    def test_coordinator_record_first_write_and_reverify_tuple_payload(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            coordinator = Path(temporary).resolve(strict=True)
+            path = coordinator / "epoch-plan.json"
+            payload = sharding._encode_epoch_plan_record(self.plan)
+
+            self.assertIs(type(payload["assignments"]), tuple)
+            sharding._write_or_verify_coordinator_record(
+                path,
+                payload,
+                "sealed epoch plan",
+            )
+            first = path.read_bytes()
+            self.assertEqual(sharding.canonical_config_bytes(payload), first)
+
+            sharding._write_or_verify_coordinator_record(
+                path,
+                payload,
+                "sealed epoch plan",
+            )
+            self.assertEqual(first, path.read_bytes())
+
     def test_scope_keeps_full_plan_and_binds_one_frozen_e3_case(self):
         scope = sharding._diagnostic_execution_scope(self.plan)
 

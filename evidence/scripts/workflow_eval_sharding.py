@@ -7028,12 +7028,12 @@ def _publish_immutable_json(
     _retire_task_descriptors(
         [parent_slot], primary=primary, label="record publish or close failed"
     )
-    durable, durable_content = _read_canonical_record(
+    _durable, durable_content = _read_canonical_record(
         path,
         path.name if existing_label is None else existing_label,
         byte_cap=byte_cap,
     )
-    if durable != payload or durable_content != content:
+    if durable_content != content:
         if existing_label is None:
             raise ValueError(f"{path.name} durable readback differs")
         raise ValueError(
@@ -15657,12 +15657,12 @@ def _write_or_verify_coordinator_record(
         return
     except OSError:
         raise ValueError(f"{label} is unavailable") from None
-    current_payload, current = _read_canonical_record(
+    _current_payload, current = _read_canonical_record(
         path,
         label,
         byte_cap=byte_cap,
     )
-    if current != expected or current_payload != dict(payload):
+    if current != expected:
         raise ValueError(f"{label} differs from the sealed coordinator record")
 
 
