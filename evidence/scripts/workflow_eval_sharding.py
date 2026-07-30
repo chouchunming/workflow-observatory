@@ -3244,6 +3244,20 @@ class CaseAssignment:
     manifest_sha256: str
 
 
+DIAGNOSTIC_CASE_KEY = CaseKey(
+    "forward", 3, "reviewed-refactor"
+)
+
+
+@dataclass(frozen=True)
+class DiagnosticExecutionScope:
+    schema_version: Literal[1]
+    epoch_id: str
+    run_kind: Literal["diagnostic"]
+    target: CaseKey
+    lane: Literal["E3"]
+
+
 @dataclass(frozen=True)
 class AttemptPaths:
     root: Path
@@ -15628,6 +15642,112 @@ def _write_or_verify_coordinator_record(
     current_payload, current = _read_canonical_record(path, label)
     if current != expected or current_payload != dict(payload):
         raise ValueError(f"{label} differs from the sealed coordinator record")
+
+
+def _diagnostic_execution_scope(
+    plan: EpochPlan,
+) -> DiagnosticExecutionScope:
+    if type(plan) is not EpochPlan or plan.run_kind != "diagnostic":
+        raise ValueError("diagnostic scope requires a diagnostic plan")
+    matches = tuple(
+        assignment
+        for assignment in plan.assignments
+        if assignment.key == DIAGNOSTIC_CASE_KEY
+    )
+    if (
+        len(plan.assignments) != 28
+        or len(matches) != 1
+        or matches[0].lane != "E3"
+        or matches[0].route != "exec"
+    ):
+        raise ValueError("diagnostic scope differs from the frozen target")
+    return DiagnosticExecutionScope(
+        schema_version=1,
+        epoch_id=plan.epoch_id,
+        run_kind="diagnostic",
+        target=DIAGNOSTIC_CASE_KEY,
+        lane="E3",
+    )
+
+
+def _encode_diagnostic_execution_scope(
+    scope: DiagnosticExecutionScope,
+) -> dict[str, object]:
+    return {
+        "schema_version": scope.schema_version,
+        "epoch_id": scope.epoch_id,
+        "run_kind": scope.run_kind,
+        "target": asdict(scope.target),
+        "lane": scope.lane,
+    }
+
+
+def _decode_diagnostic_execution_scope(
+    payload: dict[str, object],
+    *,
+    plan: EpochPlan,
+) -> DiagnosticExecutionScope:
+    _require_exact_fields(
+        payload,
+        DiagnosticExecutionScope,
+        "diagnostic scope",
+    )
+    scope = DiagnosticExecutionScope(
+        schema_version=payload.get("schema_version"),
+        epoch_id=payload.get("epoch_id"),
+        run_kind=payload.get("run_kind"),
+        target=_decode_case_key(
+            payload.get("target"),
+            "diagnostic scope",
+        ),
+        lane=payload.get("lane"),
+    )
+    expected = _diagnostic_execution_scope(plan)
+    if (
+        type(scope.schema_version) is not int
+        or scope != expected
+        or scope.target != DIAGNOSTIC_CASE_KEY
+        or scope.lane != "E3"
+    ):
+        raise ValueError("diagnostic scope differs from the frozen target")
+    return scope
+
+
+def _write_or_verify_diagnostic_execution_scope(
+    *,
+    coordinator_root: Path,
+    plan: EpochPlan,
+) -> DiagnosticExecutionScope:
+    scope = _diagnostic_execution_scope(plan)
+    _write_or_verify_coordinator_record(
+        Path(coordinator_root) / "diagnostic-scope.json",
+        _encode_diagnostic_execution_scope(scope),
+        "diagnostic scope",
+    )
+    return scope
+
+
+def _read_diagnostic_execution_scope(
+    *,
+    coordinator_root: Path,
+    plan: EpochPlan,
+) -> DiagnosticExecutionScope:
+    expected = _diagnostic_execution_scope(plan)
+    payload, canonical = _read_canonical_record(
+        Path(coordinator_root) / "diagnostic-scope.json",
+        "diagnostic scope",
+        byte_cap=4096,
+    )
+    scope = _decode_diagnostic_execution_scope(payload, plan=plan)
+    if (
+        scope != expected
+        or canonical
+        != canonical_config_bytes(
+            _encode_diagnostic_execution_scope(scope)
+        )
+    ):
+        raise ValueError("diagnostic scope differs from the frozen target")
+    return scope
 
 
 def _entry_exists_no_follow(path: Path, label: str) -> bool:

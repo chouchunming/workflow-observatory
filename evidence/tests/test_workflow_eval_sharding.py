@@ -217,6 +217,203 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.epoch_id, hashlib.sha256(payload).hexdigest())
 
 
+class DiagnosticExecutionScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+
+    def test_scope_keeps_full_plan_and_binds_one_frozen_e3_case(self):
+        scope = sharding._diagnostic_execution_scope(self.plan)
+
+        self.assertEqual(28, len(self.plan.assignments))
+        self.assertEqual(
+            sharding.CaseKey("forward", 3, "reviewed-refactor"),
+            sharding.DIAGNOSTIC_CASE_KEY,
+        )
+        self.assertEqual(
+            sharding.DIAGNOSTIC_CASE_KEY,
+            scope.target,
+        )
+        self.assertEqual(
+            [field.name for field in fields(sharding.DiagnosticExecutionScope)],
+            ["schema_version", "epoch_id", "run_kind", "target", "lane"],
+        )
+        self.assertEqual("E3", scope.lane)
+        self.assertEqual(self.plan.epoch_id, scope.epoch_id)
+        self.assertEqual("diagnostic", scope.run_kind)
+
+    def test_scope_record_is_closed_canonical_and_no_clobber(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            coordinator = Path(temporary).resolve(strict=True)
+            scope = sharding._write_or_verify_diagnostic_execution_scope(
+                coordinator_root=coordinator,
+                plan=self.plan,
+            )
+            path = coordinator / "diagnostic-scope.json"
+            payload = json.loads(path.read_text(encoding="ascii"))
+            self.assertEqual(
+                {
+                    "schema_version",
+                    "epoch_id",
+                    "run_kind",
+                    "target",
+                    "lane",
+                },
+                set(payload),
+            )
+            self.assertEqual(
+                sharding.canonical_config_bytes(payload),
+                path.read_bytes(),
+            )
+            self.assertEqual(
+                scope,
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=self.plan,
+                ),
+            )
+            mutations = {
+                "schema version": {**payload, "schema_version": True},
+                "epoch": {**payload, "epoch_id": "0" * 64},
+                "run kind": {**payload, "run_kind": "discovery"},
+                "target": {
+                    **payload,
+                    "target": {
+                        "mode": "forward",
+                        "ordinal": 2,
+                        "case_id": "tested-bugfix",
+                    },
+                },
+                "lane": {**payload, "lane": "E2"},
+            }
+            for label, mutated in mutations.items():
+                with self.subTest(label=label):
+                    tampered = sharding.canonical_config_bytes(mutated)
+                    path.write_bytes(tampered)
+                    with self.assertRaisesRegex(
+                        ValueError, "diagnostic scope"
+                    ):
+                        sharding._write_or_verify_diagnostic_execution_scope(
+                            coordinator_root=coordinator,
+                            plan=self.plan,
+                        )
+                    self.assertEqual(tampered, path.read_bytes())
+                    with self.assertRaisesRegex(
+                        ValueError, "diagnostic scope"
+                    ):
+                        sharding._read_diagnostic_execution_scope(
+                            coordinator_root=coordinator,
+                            plan=self.plan,
+                        )
+
+    def test_scope_rejects_discovery_and_formal_plans(self):
+        for run_kind in ("discovery", "formal"):
+            with self.subTest(run_kind=run_kind):
+                plan = sharding.build_epoch_plan(
+                    run_kind=run_kind,
+                    manifests=self.manifests,
+                    fingerprints=input_fingerprints(run_kind),
+                )
+                with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                    sharding._diagnostic_execution_scope(plan)
+
+    def test_scope_rejects_absent_duplicate_and_non_e3_target(self):
+        target = next(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.key
+            == sharding.CaseKey("forward", 3, "reviewed-refactor")
+        )
+        other = next(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment != target
+        )
+        invalid_plans = {
+            "absent": replace(
+                self.plan,
+                assignments=tuple(
+                    other
+                    if assignment == target
+                    else assignment
+                    for assignment in self.plan.assignments
+                ),
+            ),
+            "duplicate": replace(
+                self.plan,
+                assignments=tuple(
+                    target
+                    if assignment == other
+                    else assignment
+                    for assignment in self.plan.assignments
+                ),
+            ),
+            "non-E3": replace(
+                self.plan,
+                assignments=tuple(
+                    replace(assignment, lane="E2")
+                    if assignment == target
+                    else assignment
+                    for assignment in self.plan.assignments
+                ),
+            ),
+            "non-exec": replace(
+                self.plan,
+                assignments=tuple(
+                    replace(assignment, route="app-server")
+                    if assignment == target
+                    else assignment
+                    for assignment in self.plan.assignments
+                ),
+            ),
+        }
+        for label, plan in invalid_plans.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                    sharding._diagnostic_execution_scope(plan)
+
+    def test_scope_record_rejects_extra_field_and_non_canonical_bytes(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            coordinator = Path(temporary).resolve(strict=True)
+            sharding._write_or_verify_diagnostic_execution_scope(
+                coordinator_root=coordinator,
+                plan=self.plan,
+            )
+            path = coordinator / "diagnostic-scope.json"
+            payload = json.loads(path.read_text(encoding="ascii"))
+
+            payload["extra"] = True
+            path.write_bytes(sharding.canonical_config_bytes(payload))
+            with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=self.plan,
+                )
+
+            payload.pop("extra")
+            path.write_bytes(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                ).encode("ascii")
+            )
+            with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=self.plan,
+                )
+
+
 class FingerprintTests(unittest.TestCase):
     def test_canonical_config_bytes_are_sorted_compact_ascii_json(self):
         self.assertEqual(
