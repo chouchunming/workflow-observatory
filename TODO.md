@@ -14,12 +14,16 @@ tasks, production observations, credentials, and local configuration.
   acceptance report, and SHA-256 completeness inventory.
 - [x] Complete clean-room validation of the plugin, four skills, 76
   plugin-local tests, and 268 packaged repository tests.
+- [x] Implement the isolated parallel coordinator, production worker boundary,
+  ordered leases, sealed evidence, cleanup recovery, and opt-in Marketplace
+  CLI; prove deterministic 8/8/8/4 coverage without invoking a model.
 - [ ] Publish the public MIT repository and 0.1.0 release archive.
 
 ## Next
 
-- [ ] Implement the isolated parallel evaluator described in
-  [docs/parallel-evaluation-plan.md](docs/parallel-evaluation-plan.md).
+- [ ] Obtain explicit approval before one protected real-model formal epoch
+  after independent review; do not treat the deterministic no-model gate as a
+  real-model 28/28 result.
 - [ ] Add per-resource advisory locks, content-hash compare-and-swap, bounded
   lock timeouts, stale-owner handling, and a maintenance lease.
 - [ ] Add schema-version migrations plus retention, export, and delete policy.

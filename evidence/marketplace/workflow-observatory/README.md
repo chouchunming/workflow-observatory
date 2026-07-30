@@ -93,6 +93,29 @@ Author-specific paths are normalized only in archive copies. Production raw
 inputs, observations, credentials, local configuration, caches, and temporary
 payloads are excluded.
 
+## Parallel evaluator boundary
+
+The Marketplace evaluator keeps its existing preflight, single-case diagnostic,
+serial discovery sweep, and default serial formal behavior when `--parallel` is
+absent. Parallel execution is opt-in:
+
+```text
+run_marketplace_eval.py --parallel {diagnostic,discovery,formal}
+run_marketplace_eval.py --parallel discovery \
+  --resume-run-root /absolute/private/path/to/retained-run
+```
+
+Parallel diagnostic and discovery runs are non-authoritative: they pass no
+result destinations and cannot claim the formal commit capability. Only a
+validated `formal` epoch may use the coordinator-held ordered leases and consume
+that one-shot capability to publish the paired result.
+
+The deterministic 28-case no-model gate passed with one coordinator, four real
+worker processes, 8/8/8/4 sealed lane coverage, no Codex invocation, and no
+discovery writer call. This is protocol and isolation evidence, not a real-model
+28/28 result. A real-model diagnostic, discovery sweep, and protected formal
+epoch still require their separate review and approval gates.
+
 See [TODO.md](TODO.md), [ROADMAP.md](ROADMAP.md), and
 [docs/release-acceptance.md](docs/release-acceptance.md) for the public work and
 verification boundary, and

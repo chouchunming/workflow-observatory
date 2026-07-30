@@ -66,6 +66,91 @@ class MarketplaceEvalRunnerHygieneTests(unittest.TestCase):
             )
             self.assertEqual([], repository_runner_caches)
 
+    def test_parallel_cli_exposes_no_test_driver_override(self):
+        runner = Path(__file__).with_name("run_marketplace_eval.py")
+        result = subprocess.run(
+            [sys.executable, str(runner), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        text = runner.read_text(encoding="utf-8")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("--parallel {diagnostic,discovery,formal}", result.stdout)
+        self.assertIn("--resume-run-root", result.stdout)
+        for forbidden in (
+            "--test-driver",
+            "--worker-command",
+            "--coordinator-dependencies",
+            "CoordinatorDependencies",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, result.stdout)
+                self.assertNotIn(forbidden, text)
+
+    def test_parallel_public_document_mirrors_preserve_evidence_boundary(self):
+        marketplace_tests = Path(__file__).resolve().parent
+        marketplace = marketplace_tests.parents[2]
+        source_repository = marketplace.parents[1]
+        evidence = (
+            source_repository
+            if (
+                source_repository
+                / "scripts/run_observing_workflows_task9_eval.py"
+            ).is_file()
+            else marketplace / "evidence"
+        )
+        repository = evidence.parent
+        packaged = evidence / "marketplace/workflow-observatory"
+        pairs = (
+            ("README.md", "README.md"),
+            ("ROADMAP.md", "ROADMAP.md"),
+            ("TODO.md", "TODO.md"),
+            (
+                "docs/parallel-evaluation-plan.md",
+                "docs/parallel-evaluation-plan.md",
+            ),
+            (
+                "plugins/workflow-observer/README.md",
+                "plugins/workflow-observer/README.md",
+            ),
+        )
+        contents = {}
+        for source_name, packaged_name in pairs:
+            with self.subTest(source_name=source_name):
+                source = repository / source_name
+                mirror = packaged / packaged_name
+                self.assertEqual(source.read_bytes(), mirror.read_bytes())
+                contents[source_name] = source.read_text(encoding="utf-8")
+
+        readme = " ".join(contents["README.md"].split())
+        roadmap = " ".join(contents["ROADMAP.md"].split())
+        todo = " ".join(contents["TODO.md"].split())
+        plan = " ".join(
+            contents["docs/parallel-evaluation-plan.md"].split()
+        )
+        self.assertIn(
+            "deterministic 28-case no-model gate",
+            readme,
+        )
+        self.assertIn(
+            "not a real-model 28/28 result",
+            readme,
+        )
+        self.assertIn(
+            "protected real-model formal epoch remains pending",
+            roadmap,
+        )
+        self.assertIn(
+            "explicit approval before one protected real-model formal epoch",
+            todo,
+        )
+        self.assertIn(
+            "Discovery remains non-authoritative",
+            plan,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

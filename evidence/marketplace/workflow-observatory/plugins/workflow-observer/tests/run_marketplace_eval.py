@@ -40,6 +40,10 @@ from scripts.run_observing_workflows_task9_eval import (
     run_suite,
     run_with_production_guard,
 )
+from scripts.workflow_eval_sharding import (
+    ParallelOptions,
+    run_parallel_evaluation,
+)
 from tests.observing_workflows_eval_harness import inspect_store
 from tests.observing_workflows_eval_harness import snapshot_production, assert_production_unchanged
 
@@ -299,13 +303,74 @@ def run_diagnostic_case(case_id: str) -> dict:
     )
 
 
+def run_parallel_mode(arguments: argparse.Namespace) -> int:
+    if arguments.resume_run_root is None:
+        run_root = Path(
+            tempfile.mkdtemp(
+                prefix=f"workflow-observatory-parallel-{arguments.parallel}-"
+            )
+        ).resolve(strict=True)
+        resume_run_root = None
+    else:
+        run_root = arguments.resume_run_root.expanduser().resolve(strict=True)
+        resume_run_root = run_root
+    source_codex_home = Path(
+        os.environ.get("CODEX_HOME", Path.home() / ".codex")
+    ).expanduser().resolve(strict=True)
+    selected_codex = shutil.which("codex")
+    if selected_codex is None:
+        raise RuntimeError("Codex executable is unavailable")
+    codex_executable = Path(selected_codex).resolve(strict=True)
+    manifests = {
+        name: json.loads(path.read_text(encoding="utf-8"))
+        for name, path in MANIFEST_PATHS.items()
+    }
+    result = run_parallel_evaluation(
+        repository_root=exact_git_repository_root(REPOSITORY_ROOT),
+        manifests=manifests,
+        result_destinations=(
+            RESULT_PATHS if arguments.parallel == "formal" else None
+        ),
+        options=ParallelOptions(
+            run_kind=arguments.parallel,
+            run_root=run_root,
+            source_codex_home=source_codex_home,
+            codex_executable=codex_executable,
+            resume_run_root=resume_run_root,
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "authoritative": (
+                    result.run_kind == "formal"
+                    and result.status == "committed"
+                ),
+                "run_kind": result.run_kind,
+                "run_root": str(result.run_root),
+                "status": result.status,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    return 1 if result.status == "failed" else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight", action="store_true")
     mode.add_argument("--diagnostic-case")
     mode.add_argument("--sweep", action="store_true")
+    mode.add_argument(
+        "--parallel",
+        choices=("diagnostic", "discovery", "formal"),
+    )
+    parser.add_argument("--resume-run-root", type=Path)
     arguments = parser.parse_args()
+    if arguments.resume_run_root is not None and arguments.parallel is None:
+        parser.error("--resume-run-root requires --parallel")
     diagnostic_requested = arguments.diagnostic_case is not None
     if (
         diagnostic_requested
@@ -342,6 +407,8 @@ def main() -> int:
         )
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
+    if arguments.parallel is not None:
+        return run_parallel_mode(arguments)
     run_suite(
         REPOSITORY_ROOT,
         repository_root=exact_git_repository_root(REPOSITORY_ROOT),

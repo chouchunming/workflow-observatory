@@ -9,13 +9,20 @@ tasks and production observations are intentionally excluded.
   Python 3.11+ and current Codex for every 0.1.x release.
 - Publish the public MIT-licensed marketplace with its specifications, plans,
   complete test evidence, and SHA-256 inventory.
-- Add a sharded evaluator coordinator so independent frozen cases can run in
-  parallel without making partial worker output authoritative.
+- Keep the implemented sharded evaluator coordinator, ordered leases, sealed
+  worker evidence, cleanup recovery, and opt-in Marketplace CLI passing their
+  deterministic gates.
+- Preserve the deterministic no-model proof of one coordinator, four real
+  workers, and 28 sealed cases in 8/8/8/4 lanes without a Codex invocation or
+  discovery writer call.
 - Preserve one final aggregate gate that validates all 20 forward and 8
   lifecycle case results, exact frozen manifest hashes, store integrity,
   payload cleanup, and production isolation.
+- The protected real-model formal epoch remains pending; independent review and
+  explicit approval are required, and deterministic protocol coverage is not a
+  real-model 28/28 result.
 
-The proposed worker layout, isolation model, retry policy, and RED/GREEN steps
+The implemented worker layout, isolation model, retry policy, and RED/GREEN record
 are documented in
 [`docs/parallel-evaluation-plan.md`](docs/parallel-evaluation-plan.md).
 

@@ -1,6 +1,7 @@
 # Parallel Evaluation Acceleration Plan
 
-Status: Proposed; not implemented in the 0.1.0 release.
+Status: Implemented and deterministically verified; model-bearing rollout is
+pending independent review and explicit approval.
 
 ## Goal
 
@@ -32,7 +33,7 @@ must not be relabeled as a single-run 28/28 result.
 - The earlier 15-minute exec-timeout drift is resolved: approved spec, plan,
   implementation, and tests now use the same 20-minute fail-closed bound.
 
-## Proposed four-lane layout
+## Four-lane layout
 
 Each lane preserves relative frozen order. The coordinator restores the full
 forward-then-lifecycle aggregate order.
@@ -151,6 +152,27 @@ After all workers stop, one non-model coordinator gate must:
 No serial model rerun is needed. The serial aggregation gate is the only
 authoritative boundary; shards are never authoritative independently.
 
+## Marketplace CLI and authority
+
+The Marketplace runner exposes an opt-in
+`--parallel {diagnostic,discovery,formal}` mode and an optional
+`--resume-run-root` for the exact retained run root. With `--parallel` absent,
+the existing preflight, fixed single-case diagnostic, serial discovery sweep,
+and default serial formal paths keep their prior behavior and serial writer
+authority.
+
+The CLI passes the two frozen manifests and a sealed `RunKind` to the reviewed
+production coordinator. Diagnostic and discovery pass no result destinations
+and never acquire or claim result-writer authority. Discovery remains
+non-authoritative even after complete validation. Formal uses the coordinator's
+ordered per-run then repository writer leases; only the validated formal
+capability can be claimed and consumed for one paired-result publication.
+
+The deterministic no-model integration gate starts one coordinator and four
+real worker processes, seals all 28 cases in 8/8/8/4 lanes, and proves zero
+sentinel Codex invocations and zero discovery writer calls. It does not establish
+a real-model discovery or formal 28/28 result.
+
 ## Expected acceleration and cost
 
 - Sequential timeout bound at the implemented 20-minute exec and 10-minute
@@ -162,7 +184,7 @@ authoritative boundary; shards are never authoritative independently.
 - The 28 model tasks remain unchanged. Coordinator/worker bootstrap is expected
   to add roughly 3–10% tokens while substantially reducing wall-clock time.
 
-## RED/GREEN implementation order
+## RED/GREEN implementation record
 
 Create focused modules rather than expanding the current evaluator file:
 
@@ -178,8 +200,9 @@ process-group cleanup, post-failure all-store integrity, coordinator lock
 exclusivity, crash consistency, non-authoritative discovery shards, and exact
 post-commit production delta.
 
-Implement in this order: schema/planner, worker isolation, case sealing,
-coordinator cancellation/guards, aggregation, resume policy, marketplace CLI,
-deterministic suites, and official validators. Then run one worker-path
-diagnostic, one parallel discovery sweep, independent review, and one protected
-parallel formal epoch.
+Implementation followed this order: schema/planner, worker isolation, case
+sealing, coordinator cancellation/guards, aggregation, resume policy,
+Marketplace CLI, deterministic suites, and official validators. The
+model-bearing worker-path diagnostic, parallel discovery sweep, independent
+review, and protected parallel formal epoch remain separate approval-gated
+rollout steps.

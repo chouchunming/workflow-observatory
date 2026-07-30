@@ -94,6 +94,7 @@ class ArchiveTests(unittest.TestCase):
             "2026-07-15-workflow-observatory-marketplace.md",
             "run_observing_workflows_task9_eval.py",
             "observing_workflows_eval_harness.py",
+            "test_parallel_eval_runner.py",
             "SHA256SUMS.json",
         ):
             self.assertTrue(any(name.endswith(suffix) for name in names), suffix)
@@ -142,6 +143,10 @@ class ArchiveTests(unittest.TestCase):
         required = {
             "scripts/workflow_eval_sharding.py",
             "scripts/run_observing_workflows_eval_worker.py",
+            "marketplace/workflow-observatory/plugins/workflow-observer/"
+            "tests/run_marketplace_eval.py",
+            "marketplace/workflow-observatory/plugins/workflow-observer/"
+            "tests/test_parallel_eval_runner.py",
             "tests/run_parallel_eval_no_model_coordinator.py",
             "tests/run_parallel_eval_no_model_worker.py",
             "tests/test_parallel_eval_no_model_integration.py",
@@ -367,6 +372,8 @@ class ArchiveTests(unittest.TestCase):
             "tests/run_observing_workflows_eval.py",
             "marketplace/workflow-observatory/plugins/workflow-observer/"
             "tests/run_marketplace_eval.py",
+            "marketplace/workflow-observatory/plugins/workflow-observer/"
+            "tests/test_parallel_eval_runner.py",
         }
         self.assertLessEqual(required, relative)
         self.assertTrue(any(name.startswith("tests/test_observation") for name in relative))
