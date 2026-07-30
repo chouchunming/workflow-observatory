@@ -314,6 +314,10 @@ def run_parallel_mode(arguments: argparse.Namespace) -> int:
     else:
         run_root = arguments.resume_run_root.expanduser().resolve(strict=True)
         resume_run_root = run_root
+    print(
+        f"Parallel {arguments.parallel} run root retained at {run_root}",
+        flush=True,
+    )
     source_codex_home = Path(
         os.environ.get("CODEX_HOME", Path.home() / ".codex")
     ).expanduser().resolve(strict=True)

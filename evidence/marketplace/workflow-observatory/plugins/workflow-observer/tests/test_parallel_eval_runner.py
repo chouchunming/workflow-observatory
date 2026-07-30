@@ -214,6 +214,53 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         self.assertEqual(run_root, options.resume_run_root)
         self.assertIsNone(calls[0]["result_destinations"])
 
+    def test_fresh_run_root_is_disclosed_before_coordinator_failure(self):
+        runner, namespace, runtime_globals = _load_runner()
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(temporary).resolve(strict=True)
+        source_codex_home = root / "source-codex-home"
+        source_codex_home.mkdir(mode=0o700)
+        codex_executable = root / "codex"
+        codex_executable.write_text("#!/bin/sh\n", encoding="ascii")
+        codex_executable.chmod(0o700)
+        run_root = root / "failed-run"
+        run_root.mkdir(mode=0o700)
+        exact_repository = root / "repository"
+        exact_repository.mkdir()
+
+        with mock.patch.object(
+            sys, "argv", [str(runner), "--parallel", "discovery"]
+        ), mock.patch.object(
+            sys, "stdout", new_callable=io.StringIO
+        ) as stdout, mock.patch.dict(
+            runtime_globals["os"].environ,
+            {"CODEX_HOME": str(source_codex_home)},
+        ), mock.patch.object(
+            runtime_globals["shutil"],
+            "which",
+            return_value=str(codex_executable),
+        ), mock.patch.object(
+            runtime_globals["tempfile"],
+            "mkdtemp",
+            return_value=str(run_root),
+        ), mock.patch.dict(
+            runtime_globals,
+            {
+                "exact_git_repository_root": (
+                    lambda _start: exact_repository
+                ),
+                "run_parallel_evaluation": mock.Mock(
+                    side_effect=RuntimeError("coordinator failed")
+                ),
+            },
+        ), self.assertRaisesRegex(RuntimeError, "coordinator failed"):
+            namespace["main"]()
+
+        self.assertIn(
+            f"Parallel discovery run root retained at {run_root}",
+            stdout.getvalue(),
+        )
+
     def test_parallel_is_opt_in_and_legacy_default_keeps_serial_authority(self):
         runner, namespace, runtime_globals = _load_runner()
         exact_repository = Path("/private/tmp/exact-repository")
@@ -275,7 +322,12 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
             "plugins/workflow-observer/tests"
         )
 
-        for name in ("run_marketplace_eval.py", "test_parallel_eval_runner.py"):
+        for name in (
+            "run_marketplace_eval.py",
+            "test_parallel_eval_runner.py",
+            "test_eval_runner_hygiene.py",
+            "test_package_archive.py",
+        ):
             with self.subTest(name=name):
                 self.assertEqual(
                     (canonical / name).read_bytes(),
