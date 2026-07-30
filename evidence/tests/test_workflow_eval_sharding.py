@@ -16749,11 +16749,15 @@ class DiagnosticWorkerTests(unittest.TestCase):
             pending = tuple(
                 assignment.key for assignment in self.plan.assignments
             )
-        return sharding.ResumePlan(
+        resume = sharding.ResumePlan(
             run_kind="diagnostic",
             reusable=tuple(reusable),
             pending=tuple(pending),
             invalid=(),
+        )
+        return sharding._decode_resume_plan_record(
+            sharding._encode_resume_plan_record(resume),
+            plan=self.plan,
         )
 
     @staticmethod
@@ -16794,12 +16798,22 @@ class DiagnosticWorkerTests(unittest.TestCase):
         )
         paths.codex_home.rmdir()
 
-    def _run(self, *, lane="E3", resume=None, fail_target=False):
+    def _run(
+        self,
+        *,
+        lane="E3",
+        resume=None,
+        fail_target=False,
+        driven=None,
+        messages=None,
+        runtime_calls=None,
+    ):
         from scripts import run_observing_workflows_eval_worker as worker
         from scripts import run_observing_workflows_task9_eval as task9_eval
 
-        driven = []
-        messages = []
+        driven = [] if driven is None else driven
+        messages = [] if messages is None else messages
+        runtime_calls = [] if runtime_calls is None else runtime_calls
 
         class Factory:
             poisoned = False
@@ -16808,6 +16822,7 @@ class DiagnosticWorkerTests(unittest.TestCase):
                 self.closed = False
 
             def __call__(self, **_kwargs):
+                runtime_calls.append("runtime")
                 raise AssertionError("test case driver owns the fake runtime")
 
             def close(self):
@@ -16923,12 +16938,8 @@ class DiagnosticWorkerTests(unittest.TestCase):
             runtime_factory=factory,
             case_driver=case_driver,
         )
-        with mock.patch.object(
-            worker,
-            "publish_progress_and_wait_for_ack",
-            side_effect=acknowledge,
-        ):
-            result = worker._run_worker_impl(
+        def run_impl():
+            return worker._run_worker_impl(
                 lane=lane,
                 plan=self.plan,
                 run_root=self.run_root,
@@ -16936,6 +16947,31 @@ class DiagnosticWorkerTests(unittest.TestCase):
                 resume=self._resume() if resume is None else resume,
                 dependencies=dependencies,
             )
+
+        with mock.patch.object(
+            worker,
+            "publish_progress_and_wait_for_ack",
+            side_effect=acknowledge,
+        ):
+            if fail_target:
+                with mock.patch.object(
+                    worker,
+                    "seal_case",
+                    side_effect=AssertionError(
+                        "semantic failure must not seal a case"
+                    ),
+                ) as case_seal, mock.patch.object(
+                    worker,
+                    "seal_shard",
+                    side_effect=AssertionError(
+                        "diagnostic failure must not seal a shard"
+                    ),
+                ) as shard_seal:
+                    result = run_impl()
+                    case_seal.assert_not_called()
+                    shard_seal.assert_not_called()
+            else:
+                result = run_impl()
         self.assertTrue(factory.closed)
         return result, driven, messages
 
@@ -17009,19 +17045,40 @@ class DiagnosticWorkerTests(unittest.TestCase):
                     scope_path.unlink()
                 if content is not None:
                     scope_path.write_bytes(content)
+                driven = []
+                messages = []
+                runtime_calls = []
                 with self.assertRaisesRegex(ValueError, "diagnostic scope"):
-                    self._run(resume=self._resume(pending=()))
+                    self._run(
+                        driven=driven,
+                        messages=messages,
+                        runtime_calls=runtime_calls,
+                    )
+                self.assertEqual([], driven)
+                self.assertEqual([], messages)
+                self.assertEqual([], runtime_calls)
                 self.assertFalse((self.run_root / "workers/E3").exists())
                 scope_path.write_bytes(original)
 
     def test_diagnostic_worker_rejects_non_scope_lane_before_progress(self):
+        driven = []
+        messages = []
+        runtime_calls = []
         with self.assertRaisesRegex(
             ValueError, "diagnostic worker lane differs"
         ):
-            self._run(lane="E1", resume=self._resume(pending=()))
+            self._run(
+                lane="E1",
+                driven=driven,
+                messages=messages,
+                runtime_calls=runtime_calls,
+            )
+        self.assertEqual([], driven)
+        self.assertEqual([], messages)
+        self.assertEqual([], runtime_calls)
         self.assertFalse((self.run_root / "workers/E1").exists())
 
-    def test_diagnostic_semantic_failure_has_no_shard_or_commit_authority(self):
+    def test_diagnostic_semantic_failure_has_no_case_or_shard_seal(self):
         _result, driven, messages = self._run(fail_target=True)
 
         self.assertEqual([sharding.DIAGNOSTIC_CASE_KEY], driven)
@@ -17037,13 +17094,21 @@ class DiagnosticWorkerTests(unittest.TestCase):
                 / "workers/E3/sealed/shard-commit.json"
             ).exists()
         )
-        self.assertFalse(
-            (
-                sharding.paths_for_case(
-                    self.run_root, self.target
-                ).sealed
-                / "case-commit.json"
-            ).exists()
+        sealed = sharding.paths_for_case(
+            self.run_root, self.target
+        ).sealed
+        for name in (
+            "case-result.json",
+            "case-evidence.json",
+            "case-commit.json",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse((sealed / name).exists())
+        self.assertEqual(
+            (),
+            tuple(path.name for path in sealed.iterdir())
+            if sealed.exists()
+            else (),
         )
         self.assertEqual(
             {
