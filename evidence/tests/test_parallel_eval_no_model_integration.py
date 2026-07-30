@@ -216,11 +216,16 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
             summary.get("sealed_codex_executable_path"),
         )
         self.assertEqual(
-            4, summary.get("transport_binding_launch_count")
+            1 if run_kind == "diagnostic" else 4,
+            summary.get("transport_binding_launch_count"),
         )
         self.assertEqual([], summary.get("worker_writer_violations"))
         self.assertEqual(
-            0 if extra else 28,
+            (
+                28
+                if run_kind in ("discovery", "formal") and not extra
+                else 0
+            ),
             summary.get("production_integrity_delegations"),
             summary,
         )
@@ -231,6 +236,44 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
             str(path.relative_to(self.results))
             for path in self.results.rglob("*")
         )
+
+    def test_diagnostic_real_process_runs_only_reviewed_refactor(self):
+        run_root, summary = self._run_coordinator("diagnostic")
+        plan = json.loads(
+            (run_root / "coordinator/epoch-plan.json").read_text(
+                encoding="ascii"
+            )
+        )
+
+        self.assertEqual("diagnostic", summary["status"])
+        self.assertEqual(["E3"], summary["launched_lanes"])
+        self.assertEqual(
+            ["forward:3:reviewed-refactor"],
+            summary["sealed_keys"],
+        )
+        self.assertEqual(
+            {
+                "schema_version": 1,
+                "epoch_id": plan["epoch_id"],
+                "run_kind": "diagnostic",
+                "target": {
+                    "mode": "forward",
+                    "ordinal": 3,
+                    "case_id": "reviewed-refactor",
+                },
+                "lane": "E3",
+            },
+            summary["diagnostic_scope"],
+        )
+        self.assertEqual(["E3"], summary["process_group_lanes"])
+        self.assertEqual(1, summary["transport_binding_launch_count"])
+        self.assertEqual(0, summary["writer_lease_acquisitions"])
+        self.assertEqual(0, summary["writer_authority_issuances"])
+        self.assertFalse(self.sentinel_marker.exists())
+        self.assertFalse(
+            (run_root / "workers/E3/sealed/shard-commit.json").exists()
+        )
+        self.assertEqual([".keep"], self._result_inventory())
 
     def test_real_processes_cover_all_28_cases(self):
         run_root, summary = self._run_coordinator("formal")

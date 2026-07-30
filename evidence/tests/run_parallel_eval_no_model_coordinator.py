@@ -141,6 +141,7 @@ def _process_summary(
     writer_lease_acquisitions: int,
     writer_authority_issuances: int,
     transport_binding_paths: list[str],
+    launched_lanes: list[str],
 ) -> dict[str, object]:
     lane_pids = {}
     all_workers_joined = True
@@ -212,12 +213,25 @@ def _process_summary(
         if worker_violation_root.exists()
         else []
     )
+    diagnostic_scope = None
+    if plan.run_kind == "diagnostic":
+        diagnostic_scope = (
+            sharding._encode_diagnostic_execution_scope(
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=run_root / "coordinator",
+                    plan=plan,
+                )
+            )
+        )
     return {
         "status": result.status,
         "sealed_keys": sealed_keys,
+        "launched_lanes": launched_lanes,
         "lane_pids": lane_pids,
+        "process_group_lanes": sorted(lane_pids),
         "all_workers_joined": all_workers_joined,
         "lane_case_keys": lane_case_keys,
+        "diagnostic_scope": diagnostic_scope,
         "aggregate": aggregate,
         "writer_lease_acquisitions": writer_lease_acquisitions,
         "writer_authority_issuances": writer_authority_issuances,
@@ -256,7 +270,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source-codex-home", required=True, type=Path)
     parser.add_argument("--codex-executable", required=True, type=Path)
     parser.add_argument(
-        "--run-kind", required=True, choices=("discovery", "formal")
+        "--run-kind",
+        required=True,
+        choices=("diagnostic", "discovery", "formal"),
     )
     parser.add_argument("--forward-result", required=True, type=Path)
     parser.add_argument("--lifecycle-result", required=True, type=Path)
@@ -291,6 +307,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe = _IntegrityProbe(run_root)
     captured_plan: list[sharding.EpochPlan] = []
     transport_binding_paths: list[str] = []
+    launched_lanes: list[str] = []
+    expected_lanes = (
+        ("E3",)
+        if arguments.run_kind == "diagnostic"
+        else LANES
+    )
 
     def worker_command_factory(
         lane, plan, bound_options, snapshot_root
@@ -329,6 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "test coordinator did not seal the configured sentinel"
             )
+        launched_lanes.append(lane)
         transport_binding_paths.append(str(sealed_executable))
         worker_root = (
             bound_options.run_root / "app-server"
@@ -413,6 +436,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("recovery plan changed between injection and run")
     if captured_plan and captured_plan[0] != plan:
         raise ValueError("launched worker plan differs from sealed plan")
+    if tuple(launched_lanes) != expected_lanes:
+        raise ValueError("test coordinator observed unexpected launch lanes")
     summary = _process_summary(
         run_root=run_root,
         plan=plan,
@@ -421,6 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         writer_lease_acquisitions=writer_lease_acquisitions,
         writer_authority_issuances=writer_authority_issuances,
         transport_binding_paths=transport_binding_paths,
+        launched_lanes=launched_lanes,
     )
     sys.stdout.write(
         json.dumps(
