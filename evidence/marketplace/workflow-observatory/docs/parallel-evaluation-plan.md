@@ -173,6 +173,90 @@ real worker processes, seals all 28 cases in 8/8/8/4 lanes, and proves zero
 sentinel Codex invocations and zero discovery writer calls. It does not establish
 a real-model discovery or formal 28/28 result.
 
+## Fixed single-case parallel diagnostic contract
+
+`--parallel diagnostic` is a non-authoritative rollout gate, not a shortened
+epoch or a user-selectable case runner. It must execute exactly
+`forward/3 reviewed-refactor`, whose frozen lane is E3. The ordinal `3` names
+one frozen case; it does not mean three cases.
+
+The coordinator must still load both complete frozen manifests and build the
+same full 28-assignment diagnostic `EpochPlan`. Manifest bytes, frozen lane
+mapping, input fingerprints, and epoch identity therefore remain unchanged.
+Filtering a manifest before plan construction is forbidden because it would
+create a different inventory and weaken the frozen-plan checks.
+
+The target is a closed production constant, not a `ParallelOptions` field and
+not a CLI selector. Before launching a diagnostic worker, the coordinator
+derives the unique matching `CaseAssignment` from the full plan and atomically
+writes or verifies:
+
+```json
+{
+  "schema_version": 1,
+  "epoch_id": "<full diagnostic epoch ID>",
+  "run_kind": "diagnostic",
+  "target": {
+    "mode": "forward",
+    "ordinal": 3,
+    "case_id": "reviewed-refactor"
+  },
+  "lane": "E3"
+}
+```
+
+This exact closed record lives at
+`coordinator/diagnostic-scope.json`. A missing target, duplicate target,
+different lane, extra field, non-canonical encoding, unsafe path, or changed
+record fails closed before model launch. Discovery and formal runs reject a
+diagnostic scope record. Because there is only one legal diagnostic target,
+the existing full-plan epoch identity remains sufficient; a resume cannot
+select a different case under the same epoch.
+
+For diagnostic runs, the coordinator launches only the E3 worker and supervises
+exactly its registered process. Discovery and formal retain the exact four-lane
+launch requirement. Worker recovery and process-group cleanup continue to
+iterate over the closed four-lane namespace so an unexpected retained process
+in any lane is still detected and terminated.
+
+The diagnostic worker reads and validates the sealed scope against its full
+plan before case execution. The E3 worker filters the full pending/reusable resume
+classification to the one target without relabeling the other 27 assignments
+as successful, reusable, invalid, or skipped. The existing `ResumePlan` schema
+does not change. A resumed diagnostic may reuse only the target's valid sealed
+case evidence; absent non-target cases remain absent and cannot affect the
+diagnostic outcome.
+
+A successful diagnostic retains the target's attempt and case seals plus its
+cleanup evidence, then reports `status: diagnostic`. It does not write a
+partial shard seal, enter 28-case aggregation, construct `ValidatedEpoch`,
+acquire result-writer authority, claim a commit capability, or update frozen
+result files. A target failure returns `status: failed` after the existing
+fail-closed cancellation and cleanup path. The retained run root remains the
+operator-visible recovery and review artifact.
+
+The Marketplace CLI keeps all existing modes. Legacy
+`--diagnostic-case reviewed-refactor` remains the existing serial one-case
+path. New `--parallel diagnostic` always uses the sealed production constant;
+no arbitrary parallel case selector is exposed.
+
+Implementation acceptance requires test-first proof that:
+
+1. the full 28-case diagnostic plan and epoch fingerprints are preserved;
+2. a fresh diagnostic writes the exact scope and launches only E3;
+3. only `forward/3 reviewed-refactor` reaches the worker case driver;
+4. success and failure cannot create or persist a partial authoritative result;
+5. resume reuses only the same target and rejects missing or tampered scope;
+6. discovery and formal still launch E1, E2, E3, and APP and reject diagnostic
+   scope state;
+7. process cleanup, production guards, frozen hashes, boundary checks, clean
+   archive suites, reproducible packaging, and official validators remain
+   green.
+
+The deterministic tests must use sentinel/no-model runtimes. Real-model
+diagnostic execution remains a separate explicit rollout step after code review
+and deterministic acceptance.
+
 ## Expected acceleration and cost
 
 - Sequential timeout bound at the implemented 20-minute exec and 10-minute
