@@ -105,6 +105,11 @@ run_marketplace_eval.py --parallel discovery \
   --resume-run-root /absolute/private/path/to/retained-run
 ```
 
+`--parallel diagnostic` runs only the fixed non-authoritative
+`forward/3 reviewed-refactor` case through the reviewed coordinator/worker
+path. It cannot select another case or persist results. Discovery and formal
+continue to use the complete frozen 20+8 inventory.
+
 Parallel diagnostic and discovery runs are non-authoritative: they pass no
 result destinations and cannot claim the formal commit capability. Only a
 validated `formal` epoch may use the coordinator-held ordered leases and consume

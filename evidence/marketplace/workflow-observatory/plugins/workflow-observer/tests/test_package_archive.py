@@ -137,6 +137,28 @@ class ArchiveTests(unittest.TestCase):
         self.assertNotIn(b"/private/var/" + b"folders/", all_bytes)
         self.assertIn(b"/" + b"Users/" + b"alice/private/repo", all_bytes)
 
+    def test_archive_packages_portable_mvp_implementation_plan(self):
+        build_archive(self.source, self.archive, self.evidence)
+        member = (
+            "workflow-observatory/docs/"
+            "parallel-evaluation-mvp-implementation-plan.md"
+        )
+        with zipfile.ZipFile(self.archive) as bundle:
+            self.assertIn(member, bundle.namelist())
+            plan = bundle.read(member)
+
+        self.assertIn(b"${HOME}", plan)
+        self.assertIn(b"${CODEX_HOME}", plan)
+        self.assertNotIn(b"/" + b"Users/vincent", plan)
+        row = self._inventory()["marketplace_files"][
+            "docs/parallel-evaluation-mvp-implementation-plan.md"
+        ]
+        self.assertEqual(member, row["member"])
+        self.assertEqual(
+            ["codex-home", "user-home"],
+            row["normalizations"],
+        )
+
     def test_parallel_worker_sources_are_captured_reproducibly(self):
         second = self.root / "parallel-worker-second.zip"
         evidence = default_evidence(REPOSITORY_ROOT)

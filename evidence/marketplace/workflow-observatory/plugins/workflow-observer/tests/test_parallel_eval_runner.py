@@ -127,6 +127,13 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                     {"forward", "lifecycle"},
                     set(arguments["manifests"]),
                 )
+                self.assertEqual(
+                    {"forward": 20, "lifecycle": 8},
+                    {
+                        name: len(cases)
+                        for name, cases in arguments["manifests"].items()
+                    },
+                )
                 self.assertIs(
                     runtime_globals["RESULT_PATHS"]
                     if mode == "formal"
@@ -136,6 +143,19 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                 self.assertNotIn("dependencies", arguments)
                 options = arguments["options"]
                 self.assertIs(runtime_globals["ParallelOptions"], type(options))
+                self.assertEqual(
+                    {
+                        "run_kind",
+                        "run_root",
+                        "source_codex_home",
+                        "codex_executable",
+                        "requested_model",
+                        "requested_reasoning_effort",
+                        "resume_run_root",
+                        "max_total_tokens",
+                    },
+                    set(vars(options)),
+                )
                 self.assertEqual(mode, options.run_kind)
                 self.assertEqual(run_root, options.run_root)
                 self.assertEqual(source_codex_home, options.source_codex_home)
@@ -310,6 +330,35 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         self.assertNotIn("ResultWriterLease", text)
         self.assertNotIn("CoordinatorDependencies", text)
         self.assertIsNotNone(runtime_globals.get("run_parallel_evaluation"))
+
+    def test_parallel_diagnostic_docs_fix_target_without_model_success_claim(self):
+        _runner, _namespace, runtime_globals = _load_runner()
+        repository = runtime_globals["REPOSITORY_ROOT"].parent
+        readmes = (
+            repository / "README.md",
+            repository
+            / "evidence/marketplace/workflow-observatory/README.md",
+        )
+        fixed_target_contract = (
+            "`--parallel diagnostic` runs only the fixed non-authoritative\n"
+            "`forward/3 reviewed-refactor` case through the reviewed "
+            "coordinator/worker\n"
+            "path. It cannot select another case or persist results. "
+            "Discovery and formal\n"
+            "continue to use the complete frozen 20+8 inventory."
+        )
+
+        for readme in readmes:
+            with self.subTest(readme=readme):
+                text = readme.read_text(encoding="utf-8")
+                self.assertIn(fixed_target_contract, text)
+                self.assertIn(
+                    "A real-model diagnostic, discovery sweep, and protected "
+                    "formal\n"
+                    "epoch still require their separate review and approval "
+                    "gates.",
+                    text,
+                )
 
     def test_canonical_and_packaged_runner_and_test_mirrors_are_identical(self):
         _runner, _namespace, runtime_globals = _load_runner()

@@ -51,11 +51,17 @@ PATH_NORMALIZATION_DECLARATIONS = {
         "skills/observing-workflows/SKILL.md",
     }),
     "codex-home": frozenset({
+        "docs/parallel-evaluation-mvp-implementation-plan.md",
         "docs/superpowers/plans/2026-07-13-observation-records-v2.md",
         "docs/superpowers/plans/2026-07-15-workflow-observatory-marketplace.md",
+        "marketplace/workflow-observatory/docs/"
+        "parallel-evaluation-mvp-implementation-plan.md",
         "skills/observing-workflows/README.md",
     }),
     "user-home": frozenset({
+        "docs/parallel-evaluation-mvp-implementation-plan.md",
+        "marketplace/workflow-observatory/docs/"
+        "parallel-evaluation-mvp-implementation-plan.md",
         "plugins/workflow-observer/tests/skill_evals/"
         "observing_workflows_lifecycle_cases.json",
         "marketplace/workflow-observatory/plugins/workflow-observer/tests/"
@@ -104,6 +110,7 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
         "TODO.md",
         "LICENSE",
         "NOTICE.md",
+        "docs/parallel-evaluation-mvp-implementation-plan.md",
         "docs/parallel-evaluation-plan.md",
         "docs/release-acceptance.md",
         "plugins/workflow-observer/.codex-plugin/plugin.json",
@@ -175,6 +182,7 @@ def _marketplace_files(source_root: Path) -> list[tuple[str, bytes, str]]:
         f"{ARCHIVE_ROOT}/README.md",
         f"{ARCHIVE_ROOT}/ROADMAP.md",
         f"{ARCHIVE_ROOT}/TODO.md",
+        f"{ARCHIVE_ROOT}/docs/parallel-evaluation-mvp-implementation-plan.md",
         f"{ARCHIVE_ROOT}/docs/parallel-evaluation-plan.md",
         f"{ARCHIVE_ROOT}/docs/release-acceptance.md",
         f"{ARCHIVE_ROOT}/LICENSE",
