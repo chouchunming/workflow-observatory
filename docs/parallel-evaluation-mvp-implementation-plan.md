@@ -2346,7 +2346,8 @@ Commit: `feat(eval): expose reviewed parallel coordinator`.
 
 - Start from reviewed spec commit `8a3ed53`.
 - Observation managed by parent run `obs-20260730-215053-640536`; do not
-  start a child observation.
+  start a child observation. For Tasks 14A–14E this replaces the historical
+  Task 1–14 observation marker in the plan-wide constraints above.
 - Run every test, validator, build, package, and CodeGraph computation as a
   direct child of `caffeinate -i -m`.
 - Preserve both complete frozen manifests, the 28-assignment `EpochPlan`,
@@ -2912,6 +2913,10 @@ In both `test_package_archive.py` copies, require this member:
 "workflow-observatory/docs/parallel-evaluation-mvp-implementation-plan.md"
 ```
 
+Assert that the archived member contains `${HOME}` and `${CODEX_HOME}` where
+the canonical plan names machine-local tools or checkpoint storage, and that
+it contains no `/Users/vincent` bytes.
+
 Confirm the existing frozen-boundary allowlist still contains both the
 canonical and packaged implementation-plan paths; do not widen it.
 
@@ -2942,9 +2947,12 @@ continue to use the complete frozen 20+8 inventory.
 
 Add `docs/parallel-evaluation-mvp-implementation-plan.md` to the exact
 marketplace-file allowlist and required archive members in
-`package_workflow_observatory.py`. Refresh the packaged implementation-plan
-mirror byte-for-byte after the canonical plan is final. Preserve the existing
-design-plan mirror and all runner/test mirrors.
+`package_workflow_observatory.py`. Add that exact relative path to both the
+`codex-home` and `user-home` path-normalization declaration sets so packaging
+replaces machine-local tool and checkpoint prefixes with `${CODEX_HOME}` and
+`${HOME}` and still rejects undeclared personal paths. Refresh the packaged
+implementation-plan mirror byte-for-byte after the canonical plan is final.
+Preserve the existing design-plan mirror and all runner/test mirrors.
 
 - [ ] **Step 4: Run focused GREEN and mirror checks**
 
