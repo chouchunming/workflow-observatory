@@ -13918,6 +13918,222 @@ class CoordinatorStateTests(unittest.TestCase):
         evidence.chmod(0o600)
         return lease, bootstrap, assignment, paths, installed, evidence
 
+    def test_execution_lanes_are_one_for_diagnostic_and_four_otherwise(self):
+        plans = {
+            kind: sharding.build_epoch_plan(
+                run_kind=kind,
+                manifests=self.manifests,
+                fingerprints=input_fingerprints(kind),
+            )
+            for kind in ("diagnostic", "discovery", "formal")
+        }
+        self.assertEqual(
+            ("E3",), sharding._execution_lanes(plans["diagnostic"])
+        )
+        self.assertEqual(
+            ("E1", "E2", "E3", "APP"),
+            sharding._execution_lanes(plans["discovery"]),
+        )
+        self.assertEqual(
+            ("E1", "E2", "E3", "APP"),
+            sharding._execution_lanes(plans["formal"]),
+        )
+
+    def test_diagnostic_supervisor_requires_only_registered_e3(self):
+        plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+        options = self._options(run_kind="diagnostic")
+        machine, _guard = self._new_machine(plan=plan, options=options)
+        events = []
+        worker_root = self.run_root / "workers/E3"
+        worker_root.mkdir(parents=True, mode=0o700)
+        self.run_root.chmod(0o700)
+        worker_root.parent.chmod(0o700)
+        process = self.FakeProcess(
+            "E3", worker_root, events, pid=4203
+        )
+
+        def successful_wait(timeout=None):
+            process.returncode = 0
+            return process.returncode
+
+        process.wait = mock.Mock(side_effect=successful_wait)
+        machine.register_worker("E3", process)
+        sharding._register_progress_epoch_context(
+            plan=plan,
+            manifests=self.manifests,
+        )
+
+        def diagnostic_message(seq, progress_type):
+            return replace(
+                self._lane_message(
+                    "E3",
+                    seq=seq,
+                    progress_type=progress_type,
+                ),
+                epoch_id=plan.epoch_id,
+                run_kind=plan.run_kind,
+            )
+
+        ready = diagnostic_message(1, "lane-ready")
+        stopped = diagnostic_message(2, "worker-stopped")
+        sharding.write_progress(worker_root, ready)
+        publisher_errors = []
+
+        def publish_stopped_after_ack():
+            try:
+                sharding.wait_for_ack(worker_root, ready, timeout=5.0)
+                sharding.write_progress(worker_root, stopped)
+            except BaseException as error:
+                publisher_errors.append(error)
+
+        publisher = threading.Thread(target=publish_stopped_after_ack)
+        publisher.start()
+        try:
+            sharding._supervise_parallel_workers(
+                machine=machine,
+                options=options,
+            )
+        finally:
+            publisher.join(5.0)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual([], publisher_errors)
+        process.wait.assert_called_once_with(timeout=5.0)
+        self.assertTrue(
+            all(reader.joined for reader in process._coordinator_readers)
+        )
+
+        wrong_machine, _guard = self._new_machine(
+            plan=plan,
+            options=options,
+        )
+        wrong_process = self.FakeProcess(
+            "E1",
+            self.run_root / "workers/E1",
+            events,
+            pid=4211,
+        )
+        wrong_machine.register_worker("E1", wrong_process)
+        with self.assertRaisesRegex(ValueError, "worker lane set"):
+            sharding._supervise_parallel_workers(
+                machine=wrong_machine,
+                options=options,
+            )
+
+    def test_discovery_and_formal_reject_diagnostic_scope_before_launch(self):
+        diagnostic_plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+        transport_config = RuntimeIsolationTests._transport_config(
+            self.codex_executable
+        )
+        for run_kind in ("discovery", "formal"):
+            with self.subTest(run_kind=run_kind):
+                run_root = self.root / f"{run_kind}-scope-run"
+                run_root.mkdir(mode=0o700)
+                coordinator_root = run_root / "coordinator"
+                coordinator_root.mkdir(mode=0o700)
+                sharding._write_or_verify_diagnostic_execution_scope(
+                    coordinator_root=coordinator_root,
+                    plan=diagnostic_plan,
+                )
+                scope_bytes = (
+                    coordinator_root / "diagnostic-scope.json"
+                ).read_bytes()
+                plan = sharding.build_epoch_plan(
+                    run_kind=run_kind,
+                    manifests=self.manifests,
+                    fingerprints=input_fingerprints(run_kind),
+                )
+                options = replace(
+                    self._options(run_kind=run_kind),
+                    run_root=run_root,
+                )
+                worker_command_factory = mock.Mock(
+                    side_effect=AssertionError(
+                        "worker command factory was called"
+                    )
+                )
+                dependencies = sharding.CoordinatorDependencies(
+                    worker_command_factory=worker_command_factory,
+                    integrity_runner=mock.Mock(),
+                )
+                bootstrap_preparer = mock.Mock(
+                    side_effect=AssertionError(
+                        "auth bootstrap preparation was attempted"
+                    )
+                )
+                scope_probe = mock.Mock(
+                    wraps=sharding._entry_exists_no_follow
+                )
+                snapshot_root = (
+                    coordinator_root / "captured-snapshot"
+                )
+                result_destinations = (
+                    {} if run_kind == "formal" else None
+                )
+                with mock.patch.object(
+                    sharding,
+                    "_parallel_plan_inputs",
+                    return_value=(
+                        plan,
+                        transport_config,
+                        snapshot_root,
+                        self.manifests,
+                        ("a" * 64, "b" * 64, "c" * 64),
+                    ),
+                ), mock.patch.object(
+                    sharding,
+                    "_materialize_parallel_snapshot",
+                ), mock.patch.object(
+                    sharding,
+                    "prepare_auth_bootstrap",
+                    bootstrap_preparer,
+                ), mock.patch.object(
+                    sharding,
+                    "_entry_exists_no_follow",
+                    scope_probe,
+                ):
+                    result = sharding.run_parallel_evaluation(
+                        repository_root=self.repository,
+                        manifests=self.manifests,
+                        result_destinations=result_destinations,
+                        options=options,
+                        dependencies=dependencies,
+                    )
+                self.assertEqual("failed", result.status)
+                self.assertEqual(
+                    sharding.canonical_config_bytes(
+                        sharding._encode_epoch_plan_record(plan)
+                    ),
+                    (coordinator_root / "epoch-plan.json").read_bytes(),
+                )
+                self.assertEqual(
+                    sharding.canonical_config_bytes(
+                        asdict(transport_config)
+                    ),
+                    (
+                        coordinator_root / "transport-config.json"
+                    ).read_bytes(),
+                )
+                scope_probe.assert_any_call(
+                    coordinator_root / "diagnostic-scope.json",
+                    "diagnostic scope",
+                )
+                bootstrap_preparer.assert_not_called()
+                worker_command_factory.assert_not_called()
+                self.assertEqual(
+                    scope_bytes,
+                    (
+                        coordinator_root / "diagnostic-scope.json"
+                    ).read_bytes(),
+                )
+
     def test_quiescent_authority_requires_live_bound_run_lease(self):
         machine, _guard = self._new_machine()
         with self.assertRaisesRegex(RuntimeError, "live run lease"):

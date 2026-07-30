@@ -15238,6 +15238,17 @@ def _drain_worker_stream(stream: object) -> None:
         pass
 
 
+def _execution_lanes(plan: EpochPlan) -> tuple[LaneName, ...]:
+    if type(plan) is not EpochPlan:
+        raise TypeError("execution lanes require an exact epoch plan")
+    if plan.run_kind == "diagnostic":
+        scope = _diagnostic_execution_scope(plan)
+        return (scope.lane,)
+    if plan.run_kind in ("discovery", "formal"):
+        return ("E1", "E2", "E3", "APP")
+    raise ValueError("execution lanes received an invalid run kind")
+
+
 def _launch_parallel_workers(
     *,
     machine: CoordinatorStateMachine,
@@ -15249,7 +15260,7 @@ def _launch_parallel_workers(
 ) -> None:
     if not callable(dependencies.worker_command_factory):
         raise TypeError("worker command factory must be callable")
-    for lane in ("E1", "E2", "E3", "APP"):
+    for lane in _execution_lanes(plan):
         lifetime_slot, group_record_path = (
             _acquire_worker_lifetime_lock(options.run_root, lane)
         )
@@ -15379,14 +15390,20 @@ def _supervise_parallel_workers(
     machine: CoordinatorStateMachine,
     options: ParallelOptions,
 ) -> None:
+    expected = _execution_lanes(machine._plan)
+    if tuple(machine._workers) != expected:
+        raise ValueError(
+            "registered worker lane set differs from execution lanes"
+        )
     sequences = {
         lane: machine._ledger._state.last_sequence[lane] + 1
-        for lane in ("E1", "E2", "E3", "APP")
+        for lane in expected
     }
     stopped: set[LaneName] = set()
-    while len(stopped) != 4:
+    expected_stopped = frozenset(expected)
+    while stopped != expected_stopped:
         progressed = False
-        for lane in ("E1", "E2", "E3", "APP"):
+        for lane in expected:
             if lane in stopped:
                 continue
             process = machine._workers[lane]
@@ -15872,6 +15889,18 @@ def run_parallel_evaluation(
             asdict(transport_config),
             "sealed transport config",
         )
+        diagnostic_scope_path = coordinator_root / "diagnostic-scope.json"
+        if plan.run_kind == "diagnostic":
+            _write_or_verify_diagnostic_execution_scope(
+                coordinator_root=coordinator_root,
+                plan=plan,
+            )
+        elif _entry_exists_no_follow(
+            diagnostic_scope_path, "diagnostic scope"
+        ):
+            raise ValueError(
+                "diagnostic scope is invalid for discovery or formal"
+            )
         resume_authority: QuiescentRunAuthority | None = None
         retired_proofs_path = coordinator_root / "retired-proofs"
         try:
