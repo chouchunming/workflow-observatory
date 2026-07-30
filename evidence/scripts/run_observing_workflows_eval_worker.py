@@ -54,6 +54,7 @@ from scripts.workflow_eval_sharding import (
     _decode_case_key,
     _decode_resume_plan_record,
     _read_canonical_record,
+    _read_diagnostic_execution_scope,
     _register_progress_epoch_context,
     _require_exact_fields,
     _retire_descriptor_capability,
@@ -1884,6 +1885,16 @@ def _run_worker_impl(
         raise ValueError("worker resume plan is unavailable")
     if resume.invalid:
         raise ValueError("worker cannot launch an invalid resume plan")
+    diagnostic_scope = None
+    if plan.run_kind == "diagnostic":
+        diagnostic_scope = _read_diagnostic_execution_scope(
+            coordinator_root=root / "coordinator",
+            plan=plan,
+        )
+        if lane != diagnostic_scope.lane:
+            raise ValueError(
+                "diagnostic worker lane differs from sealed scope"
+            )
     transport_config = _load_worker_transport_config(
         run_root=root, plan=plan
     )
@@ -1929,8 +1940,13 @@ def _run_worker_impl(
     lane_assignments = tuple(
         assignment for assignment in plan.assignments if assignment.lane == lane
     )
-    reusable_keys = set(resume.reusable)
-    pending_keys = set(resume.pending)
+    execution_keys = {
+        assignment.key for assignment in lane_assignments
+    }
+    if diagnostic_scope is not None:
+        execution_keys = {diagnostic_scope.target}
+    reusable_keys = set(resume.reusable).intersection(execution_keys)
+    pending_keys = set(resume.pending).intersection(execution_keys)
     assignments = tuple(
         assignment
         for assignment in lane_assignments
@@ -2116,10 +2132,14 @@ def _run_worker_impl(
             if terminals and terminals[-1].status == "failed"
             else "success"
         )
-        if (
-            len(terminals) == len(lane_assignments)
-            or shard_status == "failed"
-        ):
+        should_seal_shard = (
+            plan.run_kind != "diagnostic"
+            and (
+                len(terminals) == len(lane_assignments)
+                or shard_status == "failed"
+            )
+        )
+        if should_seal_shard:
             shard_path = seal_shard(
                 worker_root=worker_root,
                 plan=plan,

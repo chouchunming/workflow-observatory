@@ -16672,5 +16672,389 @@ def _contains_process_survival_failure(error):
         self.assertEqual(15, machine.total_tokens)
 
 
+class DiagnosticWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.run_root = self.root / "run"
+        self.run_root.mkdir(mode=0o700)
+        self.coordinator_root = self.run_root / "coordinator"
+        self.coordinator_root.mkdir(mode=0o700)
+        self.snapshot_root = self.coordinator_root / "captured-snapshot"
+        fixture_root = self.snapshot_root / "evidence/tests/skill_evals"
+        fixture_root.mkdir(parents=True, mode=0o700)
+        for name in (
+            "observing_workflows_cases.json",
+            "observing_workflows_lifecycle_cases.json",
+        ):
+            shutil.copy2(FIXTURES / name, fixture_root / name)
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        source_codex_home = self.root / "source-codex-home"
+        source_codex_home.mkdir(mode=0o700)
+        (source_codex_home / "auth.json").write_bytes(b'{"token":"secret"}')
+        (source_codex_home / "auth.json").chmod(0o600)
+        codex_executable = self.root / "codex"
+        codex_executable.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 9.9.9'\n",
+            encoding="utf-8",
+        )
+        codex_executable.chmod(0o700)
+        self.transport_config = sharding.resolve_transport_config(
+            codex_executable=codex_executable,
+            source_codex_home=source_codex_home,
+            requested_model="test-model",
+            requested_reasoning_effort="medium",
+        )
+        fingerprints = replace(
+            input_fingerprints("diagnostic"),
+            transport_config_sha256=hashlib.sha256(
+                sharding.transport_config_bytes(self.transport_config)
+            ).hexdigest(),
+        )
+        self.plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=fingerprints,
+        )
+        self.target = next(
+            assignment
+            for assignment in self.plan.assignments
+            if assignment.key == sharding.DIAGNOSTIC_CASE_KEY
+        )
+        sharding._write_or_verify_coordinator_record(
+            self.coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(self.plan),
+            "sealed epoch plan",
+        )
+        sharding._write_or_verify_coordinator_record(
+            self.coordinator_root / "transport-config.json",
+            asdict(self.transport_config),
+            "sealed transport config",
+        )
+        sharding._write_or_verify_diagnostic_execution_scope(
+            coordinator_root=self.coordinator_root,
+            plan=self.plan,
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _resume(self, *, reusable=(), pending=None):
+        if pending is None:
+            pending = tuple(
+                assignment.key for assignment in self.plan.assignments
+            )
+        return sharding.ResumePlan(
+            run_kind="diagnostic",
+            reusable=tuple(reusable),
+            pending=tuple(pending),
+            invalid=(),
+        )
+
+    @staticmethod
+    def _write_tombstone(*, plan, assignment, paths):
+        paths.codex_home.mkdir(parents=True, mode=0o700)
+        root_stat = paths.root.stat()
+        home_stat = paths.codex_home.stat()
+        ownership = sharding.CaseAuthOwnership(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+        )
+        ownership_bytes = sharding._atomic_write_record(
+            paths.cleanup / "ownership.json", asdict(ownership)
+        )
+        receipt = sharding.TombstoneReceipt(
+            schema_version=1,
+            epoch_id=plan.epoch_id,
+            run_kind=plan.run_kind,
+            case=assignment.key,
+            ownership_sha256=hashlib.sha256(ownership_bytes).hexdigest(),
+            case_root_device=root_stat.st_dev,
+            case_root_inode=root_stat.st_ino,
+            codex_home_device=home_stat.st_dev,
+            codex_home_inode=home_stat.st_ino,
+            scrubbed=True,
+            empty=True,
+            canonical_binding="expected",
+            producer="worker",
+        )
+        sharding._atomic_write_record(
+            paths.cleanup / "tombstone.json", asdict(receipt)
+        )
+        paths.codex_home.rmdir()
+
+    def _run(self, *, lane="E3", resume=None, fail_target=False):
+        from scripts import run_observing_workflows_eval_worker as worker
+        from scripts import run_observing_workflows_task9_eval as task9_eval
+
+        driven = []
+        messages = []
+
+        class Factory:
+            poisoned = False
+
+            def __init__(self):
+                self.closed = False
+
+            def __call__(self, **_kwargs):
+                raise AssertionError("test case driver owns the fake runtime")
+
+            def close(self):
+                self.closed = True
+
+        factory = Factory()
+
+        def case_driver(
+            *,
+            assignment,
+            manifest_case,
+            paths,
+            runtime_factory,
+            event_sink,
+        ):
+            driven.append(assignment.key)
+            for directory in (
+                paths.store,
+                paths.audit,
+                paths.payload,
+                paths.output,
+            ):
+                directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            self._write_tombstone(
+                plan=self.plan,
+                assignment=assignment,
+                paths=paths,
+            )
+            if fail_target and assignment.key == self.target.key:
+                raise AssertionError("injected diagnostic semantic failure")
+            event_sink("model-started", 4100, 4100)
+            if assignment.key.mode == "forward":
+                decisions = [
+                    {
+                        **decision,
+                        "task_type": (
+                            manifest_case["task_type"]
+                            if decision["triggered"]
+                            else None
+                        ),
+                        "workflow_variant": (
+                            manifest_case["workflow_variant"]
+                            if decision["triggered"]
+                            else None
+                        ),
+                    }
+                    for decision in manifest_case["expected_decisions"]
+                ]
+                result = {
+                    "id": assignment.key.case_id,
+                    "decisions": decisions,
+                    "record_checkpoints": manifest_case[
+                        "expected_record_checkpoints"
+                    ],
+                    "run_count": manifest_case["expected_run_count"],
+                    "draft_count": 0,
+                    "final_statuses": manifest_case[
+                        "expected_final_statuses"
+                    ],
+                }
+            elif manifest_case["expected_selected_command"] is not None:
+                result = {
+                    "id": assignment.key.case_id,
+                    "record_checkpoints": None,
+                    "run_count": None,
+                    "draft_count": None,
+                    "final_statuses": None,
+                    "failure_disclosed": None,
+                    "selected_command": manifest_case[
+                        "expected_selected_command"
+                    ],
+                }
+            else:
+                result = {
+                    "id": assignment.key.case_id,
+                    "record_checkpoints": manifest_case[
+                        "expected_record_checkpoints"
+                    ],
+                    "run_count": manifest_case["expected_run_count"],
+                    "draft_count": manifest_case["expected_draft_count"],
+                    "final_statuses": manifest_case[
+                        "expected_final_statuses"
+                    ],
+                    "failure_disclosed": manifest_case[
+                        "expect_failure_disclosure"
+                    ],
+                    "selected_command": None,
+                }
+            return worker.DrivenCase(
+                result=result,
+                execution=task9_eval.CaseExecution(
+                    terminal_status="completed",
+                    final_text="done",
+                    command_executions=(),
+                    observation_command_diagnostics=(),
+                    usage=sharding.TokenUsage(10, 2, 5, 1, 15),
+                ),
+            )
+
+        def acknowledge(*, message, **_kwargs):
+            messages.append(message)
+            return sharding.Ack(
+                schema_version=1,
+                epoch_id=message.epoch_id,
+                run_kind=message.run_kind,
+                lane=message.lane,
+                seq=message.seq,
+                message_sha256="a" * 64,
+                decision="continue",
+            )
+
+        dependencies = sharding.WorkerDependencies(
+            runtime_factory=factory,
+            case_driver=case_driver,
+        )
+        with mock.patch.object(
+            worker,
+            "publish_progress_and_wait_for_ack",
+            side_effect=acknowledge,
+        ):
+            result = worker._run_worker_impl(
+                lane=lane,
+                plan=self.plan,
+                run_root=self.run_root,
+                snapshot_root=self.snapshot_root,
+                resume=self._resume() if resume is None else resume,
+                dependencies=dependencies,
+            )
+        self.assertTrue(factory.closed)
+        return result, driven, messages
+
+    def test_diagnostic_executes_only_target_and_never_seals_shard(self):
+        _result, driven, messages = self._run()
+
+        self.assertEqual([sharding.DIAGNOSTIC_CASE_KEY], driven)
+        self.assertEqual(
+            ["lane-ready", "case-started", "case-terminal", "worker-stopped"],
+            [message.type for message in messages],
+        )
+        self.assertEqual([1, 2, 3, 4], [message.seq for message in messages])
+        self.assertFalse(
+            (
+                self.run_root
+                / "workers/E3/sealed/shard-commit.json"
+            ).exists()
+        )
+        self.assertTrue(
+            (
+                sharding.paths_for_case(
+                    self.run_root, self.target
+                ).sealed
+                / "case-commit.json"
+            ).is_file()
+        )
+
+    def test_diagnostic_resume_reuses_target_without_driving_pending_others(self):
+        self._run()
+        case_commit = (
+            sharding.paths_for_case(self.run_root, self.target).sealed
+            / "case-commit.json"
+        )
+        first_commit = case_commit.read_bytes()
+        other_keys = tuple(
+            assignment.key
+            for assignment in self.plan.assignments
+            if assignment.key != self.target.key
+        )
+
+        _result, driven, messages = self._run(
+            resume=self._resume(
+                reusable=(self.target.key,),
+                pending=other_keys,
+            )
+        )
+
+        self.assertEqual([], driven)
+        self.assertEqual(
+            ["lane-ready", "worker-stopped"],
+            [message.type for message in messages],
+        )
+        self.assertEqual(first_commit, case_commit.read_bytes())
+        self.assertFalse(
+            (
+                self.run_root
+                / "workers/E3/sealed/shard-commit.json"
+            ).exists()
+        )
+
+    def test_missing_or_tampered_scope_fails_before_progress_or_model(self):
+        scope_path = self.coordinator_root / "diagnostic-scope.json"
+        original = scope_path.read_bytes()
+        mutations = {
+            "missing": None,
+            "tampered": original.replace(b'"lane":"E3"', b'"lane":"E2"'),
+        }
+        for label, content in mutations.items():
+            with self.subTest(label=label):
+                if scope_path.exists():
+                    scope_path.unlink()
+                if content is not None:
+                    scope_path.write_bytes(content)
+                with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                    self._run(resume=self._resume(pending=()))
+                self.assertFalse((self.run_root / "workers/E3").exists())
+                scope_path.write_bytes(original)
+
+    def test_diagnostic_worker_rejects_non_scope_lane_before_progress(self):
+        with self.assertRaisesRegex(
+            ValueError, "diagnostic worker lane differs"
+        ):
+            self._run(lane="E1", resume=self._resume(pending=()))
+        self.assertFalse((self.run_root / "workers/E1").exists())
+
+    def test_diagnostic_semantic_failure_has_no_shard_or_commit_authority(self):
+        _result, driven, messages = self._run(fail_target=True)
+
+        self.assertEqual([sharding.DIAGNOSTIC_CASE_KEY], driven)
+        self.assertEqual(
+            ["lane-ready", "case-started", "case-terminal", "worker-stopped"],
+            [message.type for message in messages],
+        )
+        self.assertEqual("failed", messages[2].status)
+        self.assertEqual("semantic", messages[2].classification)
+        self.assertFalse(
+            (
+                self.run_root
+                / "workers/E3/sealed/shard-commit.json"
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                sharding.paths_for_case(
+                    self.run_root, self.target
+                ).sealed
+                / "case-commit.json"
+            ).exists()
+        )
+        self.assertEqual(
+            {
+                "epoch-plan.json",
+                "transport-config.json",
+                "diagnostic-scope.json",
+                "captured-snapshot",
+            },
+            {path.name for path in self.coordinator_root.iterdir()},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
