@@ -2340,6 +2340,747 @@ non-authoritative. Do not claim 28/28 before a protected formal epoch.
 
 Commit: `feat(eval): expose reviewed parallel coordinator`.
 
+### Task 14A: Seal the fixed diagnostic execution scope
+
+**Execution bindings for Tasks 14A–14D**
+
+- Start from reviewed spec commit `8a3ed53`.
+- Observation managed by parent run `obs-20260730-215053-640536`; do not
+  start a child observation.
+- Run every test, validator, build, package, and CodeGraph computation as a
+  direct child of `caffeinate -i -m`.
+- Preserve both complete frozen manifests, the 28-assignment `EpochPlan`,
+  frozen lane mapping, result schemas, historical results, and
+  `SHA256SUMS.json`.
+- Do not run a real model, formal production persistence, release, merge, push,
+  or publication in these tasks.
+- Keep `.codegraph/`, `.superpowers/`, and `docs/superpowers/` untracked and
+  preserve unrelated worktree changes.
+
+**Files**
+
+- Modify: `evidence/scripts/workflow_eval_sharding.py`
+- Modify: `evidence/tests/test_workflow_eval_sharding.py`
+
+**Interfaces**
+
+- Consumes: `CaseKey`, `CaseAssignment`, `EpochPlan`,
+  `_write_or_verify_coordinator_record()`, `_read_canonical_record()`, and
+  `canonical_config_bytes()`.
+- Produces:
+  `DIAGNOSTIC_CASE_KEY: CaseKey`,
+  `DiagnosticExecutionScope`,
+  `_diagnostic_execution_scope(plan: EpochPlan) -> DiagnosticExecutionScope`,
+  `_write_or_verify_diagnostic_execution_scope(*, coordinator_root: Path,
+  plan: EpochPlan) -> DiagnosticExecutionScope`, and
+  `_read_diagnostic_execution_scope(*, coordinator_root: Path,
+  plan: EpochPlan) -> DiagnosticExecutionScope`.
+
+- [ ] **Step 1: Add the failing closed-schema and full-plan tests**
+
+Add a `DiagnosticExecutionScopeTests` class beside `PlannerTests`. Build the
+diagnostic plan from both complete fixture manifests and assert the exact
+contract:
+
+```python
+class DiagnosticExecutionScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.manifests = {
+            "forward": load_cases("observing_workflows_cases.json"),
+            "lifecycle": load_cases(
+                "observing_workflows_lifecycle_cases.json"
+            ),
+        }
+        self.plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+
+    def test_scope_keeps_full_plan_and_binds_one_frozen_e3_case(self):
+        scope = sharding._diagnostic_execution_scope(self.plan)
+
+        self.assertEqual(28, len(self.plan.assignments))
+        self.assertEqual(
+            sharding.CaseKey("forward", 3, "reviewed-refactor"),
+            scope.target,
+        )
+        self.assertEqual("E3", scope.lane)
+        self.assertEqual(self.plan.epoch_id, scope.epoch_id)
+        self.assertEqual("diagnostic", scope.run_kind)
+
+    def test_scope_record_is_closed_canonical_and_no_clobber(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            coordinator = Path(temporary).resolve(strict=True)
+            scope = sharding._write_or_verify_diagnostic_execution_scope(
+                coordinator_root=coordinator,
+                plan=self.plan,
+            )
+            path = coordinator / "diagnostic-scope.json"
+            payload = json.loads(path.read_text(encoding="ascii"))
+            self.assertEqual(
+                {
+                    "schema_version",
+                    "epoch_id",
+                    "run_kind",
+                    "target",
+                    "lane",
+                },
+                set(payload),
+            )
+            self.assertEqual(
+                sharding.canonical_config_bytes(payload),
+                path.read_bytes(),
+            )
+            self.assertEqual(
+                scope,
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=self.plan,
+                ),
+            )
+            payload["lane"] = "E2"
+            path.write_bytes(sharding.canonical_config_bytes(payload))
+            with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=self.plan,
+                )
+```
+
+Also assert that discovery/formal plans, an absent target, duplicate matching
+assignment, an extra field, a non-canonical record, and a target mapped outside
+E3 are rejected before launch.
+
+- [ ] **Step 2: Run the focused test and confirm RED**
+
+Run:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.DiagnosticExecutionScopeTests -v
+```
+
+from `evidence/`.
+
+Expected: FAIL because `DiagnosticExecutionScope` and the three scope helpers
+do not exist.
+
+- [ ] **Step 3: Add the minimal nominal scope and exact codec**
+
+Define the constant and nominal type after `CaseAssignment`:
+
+```python
+DIAGNOSTIC_CASE_KEY = CaseKey(
+    "forward", 3, "reviewed-refactor"
+)
+
+
+@dataclass(frozen=True)
+class DiagnosticExecutionScope:
+    schema_version: Literal[1]
+    epoch_id: str
+    run_kind: Literal["diagnostic"]
+    target: CaseKey
+    lane: Literal["E3"]
+```
+
+Implement exact plan binding:
+
+```python
+def _diagnostic_execution_scope(
+    plan: EpochPlan,
+) -> DiagnosticExecutionScope:
+    if type(plan) is not EpochPlan or plan.run_kind != "diagnostic":
+        raise ValueError("diagnostic scope requires a diagnostic plan")
+    matches = tuple(
+        assignment
+        for assignment in plan.assignments
+        if assignment.key == DIAGNOSTIC_CASE_KEY
+    )
+    if (
+        len(plan.assignments) != 28
+        or len(matches) != 1
+        or matches[0].lane != "E3"
+        or matches[0].route != "exec"
+    ):
+        raise ValueError("diagnostic scope differs from the frozen target")
+    return DiagnosticExecutionScope(
+        schema_version=1,
+        epoch_id=plan.epoch_id,
+        run_kind="diagnostic",
+        target=DIAGNOSTIC_CASE_KEY,
+        lane="E3",
+    )
+```
+
+Encode `target` with `asdict(scope.target)`. Decode with
+`_require_exact_fields()` for the five outer fields and
+`_decode_case_key()` for the exact nested three-field key. Require canonical
+bytes, the exact epoch/run kind, the module constant, and E3. The writer must
+call `_write_or_verify_coordinator_record()` at
+`coordinator_root / "diagnostic-scope.json"`; the reader must use
+`_read_canonical_record(..., byte_cap=4096)`.
+
+- [ ] **Step 4: Run GREEN and the planner regression**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.DiagnosticExecutionScopeTests \
+  tests.test_workflow_eval_sharding.PlannerTests -v
+```
+
+Expected: PASS; the planner test still proves exact 8/8/8/4 and 28 unique
+assignments.
+
+- [ ] **Step 5: Commit the sealed-scope unit**
+
+```bash
+git add evidence/scripts/workflow_eval_sharding.py \
+  evidence/tests/test_workflow_eval_sharding.py
+git commit -m "feat(eval): seal fixed diagnostic scope"
+```
+
+### Task 14B: Launch and supervise only the target lane
+
+**Files**
+
+- Modify: `evidence/scripts/workflow_eval_sharding.py`
+- Modify: `evidence/tests/test_workflow_eval_sharding.py`
+
+**Interfaces**
+
+- Consumes: Task 14A's `DiagnosticExecutionScope` and scope helpers.
+- Produces:
+  `_execution_lanes(plan: EpochPlan) -> tuple[LaneName, ...]`;
+  a diagnostic coordinator launches only E3, while
+  `_launch_parallel_workers()` and `_supervise_parallel_workers()` preserve
+  four lanes for discovery/formal.
+
+- [ ] **Step 1: Add RED tests for exact launch topology**
+
+Add tests that assert the pure selection contract and the supervisor's
+registered-lane contract:
+
+```python
+def test_execution_lanes_are_one_for_diagnostic_and_four_otherwise(self):
+    plans = {
+        kind: sharding.build_epoch_plan(
+            run_kind=kind,
+            manifests=self.manifests,
+            fingerprints=input_fingerprints(kind),
+        )
+        for kind in ("diagnostic", "discovery", "formal")
+    }
+    self.assertEqual(("E3",), sharding._execution_lanes(plans["diagnostic"]))
+    self.assertEqual(
+        ("E1", "E2", "E3", "APP"),
+        sharding._execution_lanes(plans["discovery"]),
+    )
+    self.assertEqual(
+        ("E1", "E2", "E3", "APP"),
+        sharding._execution_lanes(plans["formal"]),
+    )
+```
+
+Use the existing `CoordinatorStateTests.FakeProcess` and `_new_machine()`
+fixtures to register only E3 for a diagnostic plan. Publish `lane-ready` and
+`worker-stopped`, then prove `_supervise_parallel_workers()` returns after that
+one process. Register E1 instead and assert a fail-closed lane-set error. Seed
+`coordinator/diagnostic-scope.json` for discovery and formal plans and assert
+both reject it before any worker command factory call.
+
+- [ ] **Step 2: Run the new tests and confirm RED**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.CoordinatorStateTests.test_execution_lanes_are_one_for_diagnostic_and_four_otherwise \
+  tests.test_workflow_eval_sharding.CoordinatorStateTests.test_diagnostic_supervisor_requires_only_registered_e3 -v
+```
+
+Expected: FAIL because `_execution_lanes()` is absent and supervision still
+hard-codes four workers.
+
+- [ ] **Step 3: Implement the closed lane selection**
+
+```python
+def _execution_lanes(plan: EpochPlan) -> tuple[LaneName, ...]:
+    if type(plan) is not EpochPlan:
+        raise TypeError("execution lanes require an exact epoch plan")
+    if plan.run_kind == "diagnostic":
+        scope = _diagnostic_execution_scope(plan)
+        return (scope.lane,)
+    if plan.run_kind in ("discovery", "formal"):
+        return ("E1", "E2", "E3", "APP")
+    raise ValueError("execution lanes received an invalid run kind")
+```
+
+In `run_parallel_evaluation()`, immediately after sealing `epoch-plan.json` and
+`transport-config.json`, create or verify the diagnostic scope for diagnostic
+runs. For discovery/formal, fail if `diagnostic-scope.json` exists.
+
+Change `_launch_parallel_workers()` to iterate
+`_execution_lanes(plan)`. Change `_supervise_parallel_workers()` to calculate
+the exact expected tuple once, require `tuple(machine._workers) == expected`,
+initialize sequences only for those lanes, and stop when that exact set has
+durably stopped. Keep `_recover_durable_worker_groups()` over the full closed
+four-lane namespace.
+
+- [ ] **Step 4: Run GREEN plus cancellation/cleanup regressions**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.CoordinatorStateTests \
+  tests.test_workflow_eval_sharding.DiagnosticExecutionScopeTests -v
+```
+
+Expected: PASS; discovery/formal topology tests still require all four workers.
+
+- [ ] **Step 5: Commit the coordinator topology unit**
+
+```bash
+git add evidence/scripts/workflow_eval_sharding.py \
+  evidence/tests/test_workflow_eval_sharding.py
+git commit -m "feat(eval): launch fixed diagnostic lane"
+```
+
+### Task 14C: Filter worker execution and preserve resume semantics
+
+**Files**
+
+- Modify: `evidence/scripts/run_observing_workflows_eval_worker.py`
+- Modify: `evidence/tests/test_workflow_eval_sharding.py`
+
+**Interfaces**
+
+- Consumes: the full sealed `EpochPlan`, unchanged `ResumePlan`, and Task 14A's
+  read-only diagnostic scope.
+- Produces: diagnostic E3 execution restricted to
+  `DIAGNOSTIC_CASE_KEY`; no diagnostic shard commit; exact target case evidence
+  remains reusable on resume.
+
+- [ ] **Step 1: Add RED worker tests for execution, resume, and tampering**
+
+Adapt the existing threaded `_run_worker_impl()` test fixture with a diagnostic
+plan and a case driver that records assignment keys. Assert:
+
+```python
+self.assertEqual(
+    [sharding.DIAGNOSTIC_CASE_KEY],
+    driven_assignments,
+)
+self.assertFalse(
+    (self.run_root / "workers/E3/sealed/shard-commit.json").exists()
+)
+self.assertTrue(
+    (
+        sharding.paths_for_case(
+            self.run_root,
+            next(
+                assignment
+                for assignment in plan.assignments
+                if assignment.key == sharding.DIAGNOSTIC_CASE_KEY
+            ),
+        ).sealed
+        / "case-commit.json"
+    ).is_file()
+)
+```
+
+Run the same root a second time with the target in `resume.reusable` and the
+other 27 keys in `resume.pending`; assert the case driver is not called again.
+Delete or alter `coordinator/diagnostic-scope.json` and assert the worker fails
+before `lane-ready` or model-start evidence. Invoke the diagnostic worker as E1
+and assert a lane mismatch. Add a semantic-failure case and assert no shard,
+validated epoch, writer authority, or result file is created.
+
+- [ ] **Step 2: Run the worker tests and confirm RED**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.DiagnosticWorkerTests -v
+```
+
+Expected: FAIL because the current E3 worker executes every pending E3
+assignment and does not require the diagnostic scope.
+
+- [ ] **Step 3: Apply the scope only at the execution boundary**
+
+Import `_read_diagnostic_execution_scope` and `DIAGNOSTIC_CASE_KEY` in the
+worker module. After loading the sealed plan and resume record:
+
+```python
+execution_keys = {
+    assignment.key
+    for assignment in plan.assignments
+    if assignment.lane == lane
+}
+if plan.run_kind == "diagnostic":
+    scope = _read_diagnostic_execution_scope(
+        coordinator_root=root / "coordinator",
+        plan=plan,
+    )
+    if lane != scope.lane:
+        raise ValueError("diagnostic worker lane differs from sealed scope")
+    execution_keys = {scope.target}
+
+reusable_keys = set(resume.reusable).intersection(execution_keys)
+pending_keys = set(resume.pending).intersection(execution_keys)
+```
+
+Keep `lane_assignments` derived from the full plan for all frozen-plan
+validation. Filter both the reusable-evidence loop and new-execution loop with
+`execution_keys`. Do not add `skipped` or change `ResumePlan`.
+
+Guard shard publication:
+
+```python
+should_seal_shard = (
+    plan.run_kind != "diagnostic"
+    and (
+        len(terminals) == len(lane_assignments)
+        or shard_status == "failed"
+    )
+)
+if should_seal_shard:
+    shard_path = seal_shard(...)
+```
+
+Diagnostic still publishes sequenced `lane-ready`, case progress, and
+`worker-stopped`; coordinator cancellation and cleanup retain their existing
+fail-closed behavior.
+
+- [ ] **Step 4: Run GREEN and full worker protocol regressions**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_workflow_eval_sharding.DiagnosticWorkerTests \
+  tests.test_workflow_eval_sharding.ProgressProtocolTests \
+  tests.test_workflow_eval_sharding.RetryResumeTests \
+  tests.test_workflow_eval_sharding.SealTests \
+  tests.test_workflow_eval_sharding.CoordinatorStateTests -v
+```
+
+Expected: PASS; a diagnostic produces one case seal and no shard seal, while
+discovery/formal shard behavior is unchanged.
+
+- [ ] **Step 5: Commit the worker/resume unit**
+
+```bash
+git add evidence/scripts/run_observing_workflows_eval_worker.py \
+  evidence/tests/test_workflow_eval_sharding.py
+git commit -m "feat(eval): execute one resumable diagnostic case"
+```
+
+### Task 14D: Cross the fixed diagnostic real-process boundary
+
+**Files**
+
+- Modify: `evidence/tests/run_parallel_eval_no_model_coordinator.py`
+- Modify: `evidence/tests/test_parallel_eval_no_model_integration.py`
+
+**Interfaces**
+
+- Consumes: the production coordinator/worker path from Tasks 14A–14C.
+- Produces: one real coordinator plus one real E3 worker no-model proof with
+  exact launch, case, cleanup, non-persistence, and sentinel evidence.
+
+- [ ] **Step 1: Add the failing real-process diagnostic test**
+
+Extend the test coordinator's `--run-kind` choices to include `diagnostic`.
+Make `_run_coordinator()` assert expected launches by run kind rather than
+hard-coding four and 28. Add:
+
+```python
+def test_diagnostic_real_process_runs_only_reviewed_refactor(self):
+    run_root, summary = self._run_coordinator("diagnostic")
+
+    self.assertEqual("diagnostic", summary["status"])
+    self.assertEqual(["E3"], summary["launched_lanes"])
+    self.assertEqual(
+        ["forward:3:reviewed-refactor"],
+        summary["sealed_keys"],
+    )
+    self.assertEqual(1, summary["transport_binding_launch_count"])
+    self.assertEqual(0, summary["writer_lease_acquisitions"])
+    self.assertEqual(0, summary["writer_authority_issuances"])
+    self.assertFalse(self.sentinel_marker.exists())
+    self.assertFalse(
+        (run_root / "workers/E3/sealed/shard-commit.json").exists()
+    )
+    self.assertEqual([".keep"], self._result_inventory())
+```
+
+Include the decoded exact `diagnostic_scope` and the sorted lanes with durable
+process-group records in the coordinator JSON summary.
+
+- [ ] **Step 2: Run the process test and confirm RED**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_parallel_eval_no_model_integration.ParallelNoModelIntegrationTests.test_diagnostic_real_process_runs_only_reviewed_refactor -v
+```
+
+Expected: FAIL because the harness rejects `diagnostic` or observes four
+workers and 28 case executions.
+
+- [ ] **Step 3: Make the no-model harness report variable topology**
+
+Allow `diagnostic` in the test coordinator, pass no result destinations, and
+derive:
+
+```python
+expected_lanes = (
+    ("E3",)
+    if arguments.run_kind == "diagnostic"
+    else ("E1", "E2", "E3", "APP")
+)
+```
+
+The production coordinator remains the only authority under test. Do not add a
+test-only selector, dependency injection point, or worker flag to production.
+The no-model worker continues to call the production `_run_worker_impl()`.
+
+- [ ] **Step 4: Run focused GREEN and all existing process scenarios**
+
+Run from `evidence/`:
+
+```bash
+caffeinate -i -m python3 -m unittest \
+  tests.test_parallel_eval_no_model_integration -v
+```
+
+Expected: every existing formal/discovery/recovery scenario plus the fixed
+diagnostic scenario PASS; no sentinel Codex invocation occurs.
+
+- [ ] **Step 5: Commit the process-boundary unit**
+
+```bash
+git add evidence/tests/run_parallel_eval_no_model_coordinator.py \
+  evidence/tests/test_parallel_eval_no_model_integration.py
+git commit -m "test(eval): prove fixed diagnostic process boundary"
+```
+
+### Task 14E: Publish portable docs, package evidence, and deterministic gates
+
+**Files**
+
+- Modify: `evidence/scripts/package_workflow_observatory.py`
+- Modify:
+  `plugins/workflow-observer/tests/test_parallel_eval_runner.py`
+- Modify:
+  `evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_parallel_eval_runner.py`
+- Modify: `plugins/workflow-observer/tests/test_package_archive.py`
+- Modify:
+  `evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py`
+- Modify: `README.md`
+- Modify: `evidence/marketplace/workflow-observatory/README.md`
+- Modify: `docs/parallel-evaluation-mvp-implementation-plan.md`
+- Create:
+  `evidence/marketplace/workflow-observatory/docs/parallel-evaluation-mvp-implementation-plan.md`
+
+**Interfaces**
+
+- Consumes: the production path and no-model proof from Tasks 14A–14D plus the
+  opt-in Marketplace CLI from commits `7035d07` and `c9d4848`.
+- Produces: explicit fixed-target CLI documentation, canonical/packaged byte
+  mirrors, implementation-plan archive inclusion, reproducible package
+  evidence, and no real-model success claim.
+
+- [ ] **Step 1: Add RED Marketplace and package-contract tests**
+
+Extend `test_parallel_eval_runner.py` to assert that docs describe
+`--parallel diagnostic` as fixed to `forward/3 reviewed-refactor`, and that the
+CLI still passes both complete manifests with no diagnostic selector in
+`ParallelOptions`.
+
+In both `test_package_archive.py` copies, require this member:
+
+```python
+"workflow-observatory/docs/parallel-evaluation-mvp-implementation-plan.md"
+```
+
+Confirm the existing frozen-boundary allowlist still contains both the
+canonical and packaged implementation-plan paths; do not widen it.
+
+- [ ] **Step 2: Run the package/runner tests and confirm RED**
+
+```bash
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests \
+  -p 'test_parallel_eval_runner.py' -v
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests \
+  -p 'test_package_archive.py' -v
+```
+
+Expected: FAIL because the fixed-target wording and packaged implementation
+plan are absent.
+
+- [ ] **Step 3: Add exact docs and package inclusion**
+
+Update both README copies with:
+
+```markdown
+`--parallel diagnostic` runs only the fixed non-authoritative
+`forward/3 reviewed-refactor` case through the reviewed coordinator/worker
+path. It cannot select another case or persist results. Discovery and formal
+continue to use the complete frozen 20+8 inventory.
+```
+
+Add `docs/parallel-evaluation-mvp-implementation-plan.md` to the exact
+marketplace-file allowlist and required archive members in
+`package_workflow_observatory.py`. Refresh the packaged implementation-plan
+mirror byte-for-byte after the canonical plan is final. Preserve the existing
+design-plan mirror and all runner/test mirrors.
+
+- [ ] **Step 4: Run focused GREEN and mirror checks**
+
+```bash
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests \
+  -p 'test_parallel_eval_runner.py' -v
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests \
+  -p 'test_package_archive.py' -v
+caffeinate -i -m cmp README.md \
+  evidence/marketplace/workflow-observatory/README.md
+caffeinate -i -m cmp docs/parallel-evaluation-mvp-implementation-plan.md \
+  evidence/marketplace/workflow-observatory/docs/parallel-evaluation-mvp-implementation-plan.md
+```
+
+Expected: PASS and both canonical/packaged pairs are byte-identical.
+
+- [ ] **Step 5: Commit the portable documentation/package unit**
+
+```bash
+git add evidence/scripts/package_workflow_observatory.py \
+  plugins/workflow-observer/tests/test_parallel_eval_runner.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_parallel_eval_runner.py \
+  plugins/workflow-observer/tests/test_package_archive.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/tests/test_package_archive.py \
+  README.md evidence/marketplace/workflow-observatory/README.md \
+  docs/parallel-evaluation-mvp-implementation-plan.md \
+  evidence/marketplace/workflow-observatory/docs/parallel-evaluation-mvp-implementation-plan.md
+git commit -m "docs(eval): package fixed diagnostic evidence"
+```
+
+- [ ] **Step 6: Run the complete deterministic acceptance**
+
+Run CodeGraph sync and affected-test inventory first:
+
+```bash
+caffeinate -i -m /Users/vincent/.local/share/codegraph-lab/bin/codegraph sync .
+caffeinate -i -m /Users/vincent/.local/share/codegraph-lab/bin/codegraph affected \
+  -p . evidence/scripts/workflow_eval_sharding.py \
+  evidence/scripts/run_observing_workflows_eval_worker.py
+```
+
+Then run:
+
+```bash
+cd evidence
+caffeinate -i -m python3 -m unittest tests.test_workflow_eval_sharding -v
+caffeinate -i -m python3 -m unittest \
+  tests.test_parallel_eval_no_model_integration -v
+caffeinate -i -m python3 -m unittest \
+  tests.test_parallel_eval_frozen_boundary -v
+caffeinate -i -m python3 scripts/check_parallel_eval_frozen_boundary.py \
+  --base 2f617fea833e583af9cae87308cfde2e620fcd82 --head HEAD
+cd ..
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests -p 'test_*.py'
+caffeinate -i -m git diff --check \
+  2f617fea833e583af9cae87308cfde2e620fcd82..HEAD
+```
+
+Expected: every suite PASS, one documented expected skip only, boundary OK,
+and no frozen-byte delta.
+
+- [ ] **Step 7: Run clean archives and reproducible packages**
+
+Create two clean HEAD extractions and build before running their suites:
+
+```bash
+gate_root=$(mktemp -d /private/tmp/workflow-observatory-task14-gate.XXXXXX)
+chmod 700 "$gate_root"
+mkdir -m 700 "$gate_root/a" "$gate_root/b"
+caffeinate -i -m git archive HEAD | tar -x -C "$gate_root/a"
+caffeinate -i -m git archive HEAD | tar -x -C "$gate_root/b"
+
+(cd "$gate_root/a" && caffeinate -i -m python3 \
+  evidence/scripts/package_workflow_observatory.py \
+  --version 0.2.0-recovery)
+(cd "$gate_root/b" && caffeinate -i -m python3 \
+  evidence/scripts/package_workflow_observatory.py \
+  --version 0.2.0-recovery)
+
+(cd "$gate_root/a" && caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests -p 'test_*.py')
+(cd "$gate_root/a/evidence" && caffeinate -i -m python3 \
+  -m unittest discover -s tests -p 'test_*.py')
+
+caffeinate -i -m cmp \
+  "$gate_root/a/dist/workflow-observatory-0.2.0-recovery.zip" \
+  "$gate_root/b/dist/workflow-observatory-0.2.0-recovery.zip"
+caffeinate -i -m shasum -a 256 \
+  "$gate_root/a/dist/workflow-observatory-0.2.0-recovery.zip" \
+  "$gate_root/b/dist/workflow-observatory-0.2.0-recovery.zip"
+```
+
+Expected: clean plugin/evidence suites PASS, the ZIP bytes are identical, and
+both SHA-256 values match.
+
+- [ ] **Step 8: Run official plugin and four skill validators**
+
+Run from the repository root:
+
+```bash
+caffeinate -i -m /tmp/skill-validator-venv/bin/python \
+  /Users/vincent/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer
+caffeinate -i -m /tmp/skill-validator-venv/bin/python \
+  /Users/vincent/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-observer
+caffeinate -i -m /tmp/skill-validator-venv/bin/python \
+  /Users/vincent/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-telemetry
+caffeinate -i -m /tmp/skill-validator-venv/bin/python \
+  /Users/vincent/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-learning
+caffeinate -i -m /tmp/skill-validator-venv/bin/python \
+  /Users/vincent/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+  evidence/marketplace/workflow-observatory/plugins/workflow-observer/skills/workflow-improving
+```
+
+Expected: plugin valid and all four skills valid. Also require all six frozen
+manifest copies to retain the two approved hashes and no result, schema,
+`SHA256SUMS.json`, manifest, or production-observation mutation.
+
+- [ ] **Step 9: Independent review and durable checkpoint**
+
+Request spec-compliance review, then code-quality/security review. Fix every
+accepted issue test-first and repeat affected gates. Commit each independently
+reviewable fix. Create and verify a complete-history bundle under:
+
+```text
+/Users/vincent/Developer/workflow-observatory/.git/codex-checkpoints/
+```
+
+Do not run the real-model diagnostic until a later explicit rollout approval.
+
 ## Deterministic gates
 
 ### Focused worktree gate after every task
