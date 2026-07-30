@@ -6967,7 +6967,11 @@ def _directory_inventory(path: Path, label: str) -> tuple[str, ...]:
 
 
 def _publish_immutable_json(
-    path: Path, payload: Mapping[str, Any], *, byte_cap: int
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    byte_cap: int,
+    existing_label: str | None = None,
 ) -> bytes:
     _require_lease_process_healthy()
     content = canonical_config_bytes(payload)
@@ -7005,7 +7009,8 @@ def _publish_immutable_json(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            raise ValueError(f"{path.name} already exists") from None
+            if existing_label is None:
+                raise ValueError(f"{path.name} already exists") from None
         os.fsync(parent_slot.descriptor)
         os.unlink(temporary_name, dir_fd=parent_slot.descriptor)
         os.fsync(parent_slot.descriptor)
@@ -7024,10 +7029,16 @@ def _publish_immutable_json(
         [parent_slot], primary=primary, label="record publish or close failed"
     )
     durable, durable_content = _read_canonical_record(
-        path, path.name, byte_cap=byte_cap
+        path,
+        path.name if existing_label is None else existing_label,
+        byte_cap=byte_cap,
     )
     if durable != payload or durable_content != content:
-        raise ValueError(f"{path.name} durable readback differs")
+        if existing_label is None:
+            raise ValueError(f"{path.name} durable readback differs")
+        raise ValueError(
+            f"{existing_label} differs from the sealed coordinator record"
+        )
     return durable_content
 
 
@@ -15630,16 +15641,27 @@ def _write_or_verify_coordinator_record(
     path: Path,
     payload: Mapping[str, object],
     label: str,
+    *,
+    byte_cap: int = 1024 * 1024,
 ) -> None:
     expected = canonical_config_bytes(payload)
     try:
         path.lstat()
     except FileNotFoundError:
-        _atomic_write_record(path, payload)
+        _publish_immutable_json(
+            path,
+            payload,
+            byte_cap=byte_cap,
+            existing_label=label,
+        )
         return
     except OSError:
         raise ValueError(f"{label} is unavailable") from None
-    current_payload, current = _read_canonical_record(path, label)
+    current_payload, current = _read_canonical_record(
+        path,
+        label,
+        byte_cap=byte_cap,
+    )
     if current != expected or current_payload != dict(payload):
         raise ValueError(f"{label} differs from the sealed coordinator record")
 
@@ -15723,6 +15745,7 @@ def _write_or_verify_diagnostic_execution_scope(
         Path(coordinator_root) / "diagnostic-scope.json",
         _encode_diagnostic_execution_scope(scope),
         "diagnostic scope",
+        byte_cap=4096,
     )
     return scope
 

@@ -315,6 +315,115 @@ class DiagnosticExecutionScopeTests(unittest.TestCase):
                             plan=self.plan,
                         )
 
+    def test_concurrent_distinct_first_writers_never_report_clobbered_scope(self):
+        alternate = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=replace(
+                input_fingerprints("diagnostic"),
+                archive_sha256="e" * 64,
+            ),
+        )
+        plans = {"original": self.plan, "alternate": alternate}
+        self.assertNotEqual(self.plan.epoch_id, alternate.epoch_id)
+        for plan in plans.values():
+            self.assertEqual(28, len(plan.assignments))
+            sharding._diagnostic_execution_scope(plan)
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            coordinator = Path(temporary).resolve(strict=True)
+            path = coordinator / "diagnostic-scope.json"
+            real_link = sharding.os.link
+            real_replace = sharding.os.replace
+            publication_boundary = threading.Barrier(2)
+            outcomes_lock = threading.Lock()
+            successes = {}
+            failures = {}
+
+            def synchronize_link(source, destination, *args, **kwargs):
+                if destination == path.name:
+                    publication_boundary.wait(2.0)
+                return real_link(source, destination, *args, **kwargs)
+
+            def synchronize_replace(source, destination, *args, **kwargs):
+                if destination == path.name:
+                    publication_boundary.wait(2.0)
+                return real_replace(source, destination, *args, **kwargs)
+
+            def publish(name):
+                try:
+                    scope = (
+                        sharding._write_or_verify_diagnostic_execution_scope(
+                            coordinator_root=coordinator,
+                            plan=plans[name],
+                        )
+                    )
+                except BaseException as error:
+                    with outcomes_lock:
+                        failures[name] = error
+                else:
+                    with outcomes_lock:
+                        successes[name] = scope
+
+            with mock.patch.object(
+                sharding.os,
+                "link",
+                side_effect=synchronize_link,
+            ), mock.patch.object(
+                sharding.os,
+                "replace",
+                side_effect=synchronize_replace,
+            ):
+                writers = tuple(
+                    threading.Thread(
+                        target=publish,
+                        args=(name,),
+                        name=f"diagnostic-scope-{name}",
+                    )
+                    for name in plans
+                )
+                for writer in writers:
+                    writer.start()
+                for writer in writers:
+                    writer.join(3.0)
+                    self.assertFalse(writer.is_alive())
+
+            self.assertEqual(1, len(successes))
+            self.assertEqual(1, len(failures))
+            losing_name, losing_error = next(iter(failures.items()))
+            self.assertIsInstance(losing_error, ValueError)
+            self.assertRegex(str(losing_error), "diagnostic scope")
+
+            final_bytes = path.read_bytes()
+            final_payload = json.loads(final_bytes.decode("ascii"))
+            self.assertEqual(
+                sharding.canonical_config_bytes(final_payload),
+                final_bytes,
+            )
+            winning_name, winning_scope = next(iter(successes.items()))
+            self.assertEqual(winning_scope.epoch_id, final_payload["epoch_id"])
+            self.assertEqual(
+                winning_scope,
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=plans[winning_name],
+                ),
+            )
+            self.assertNotEqual(winning_name, losing_name)
+            with self.assertRaisesRegex(ValueError, "diagnostic scope"):
+                sharding._read_diagnostic_execution_scope(
+                    coordinator_root=coordinator,
+                    plan=plans[losing_name],
+                )
+            self.assertEqual(
+                [],
+                [
+                    entry.name
+                    for entry in coordinator.iterdir()
+                    if ".tmp-" in entry.name
+                ],
+            )
+
     def test_scope_rejects_discovery_and_formal_plans(self):
         for run_kind in ("discovery", "formal"):
             with self.subTest(run_kind=run_kind):
