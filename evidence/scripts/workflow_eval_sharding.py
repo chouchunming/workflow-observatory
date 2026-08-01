@@ -3,6 +3,7 @@ from contextlib import ExitStack, contextmanager
 import ctypes
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -3289,6 +3290,7 @@ class InputFingerprints:
     schema_version: int
     epoch_id: str
     run_kind: RunKind
+    expected_archive_sha256: str
     archive_sha256: str
     marketplace_sha256: str
     evaluator_sha256: str
@@ -3540,6 +3542,8 @@ class ParallelOptions:
     run_root: Path
     source_codex_home: Path
     codex_executable: Path
+    archive_path: Path
+    expected_archive_sha256: str
     requested_model: str | None = None
     requested_reasoning_effort: str | None = None
     resume_run_root: Path | None = None
@@ -7542,9 +7546,12 @@ def _fingerprints_are_complete(fingerprints: InputFingerprints) -> bool:
         and type(fingerprints.run_kind) is str
         and fingerprints.run_kind in ("diagnostic", "discovery", "formal")
         and _is_sha256(fingerprints.epoch_id)
+        and fingerprints.expected_archive_sha256
+        == fingerprints.archive_sha256
         and all(
             _is_sha256(value)
             for value in (
+                fingerprints.expected_archive_sha256,
                 fingerprints.archive_sha256,
                 fingerprints.marketplace_sha256,
                 fingerprints.evaluator_sha256,
@@ -14545,6 +14552,7 @@ def production_coordinator_dependencies(
     *, snapshot_root: Path
 ) -> CoordinatorDependencies:
     snapshot = Path(snapshot_root)
+    snapshot_evidence = snapshot / "evidence"
 
     def worker_command_factory(
         lane: LaneName,
@@ -14562,8 +14570,10 @@ def production_coordinator_dependencies(
             raise ValueError("worker command inputs are invalid")
         return (
             sys.executable,
-            "-m",
-            "scripts.run_observing_workflows_eval_worker",
+            "-I",
+            "-c",
+            _ISOLATED_WORKER_BOOTSTRAP,
+            str(snapshot_evidence),
             "--lane",
             lane,
             "--run-root",
@@ -14572,6 +14582,8 @@ def production_coordinator_dependencies(
             str(snapshot),
             "--epoch-id",
             plan.epoch_id,
+            "--expected-evaluator-sha256",
+            plan.fingerprints.evaluator_sha256,
         )
 
     return CoordinatorDependencies(
@@ -14622,25 +14634,199 @@ def _snapshot_rows_for_parallel_plan(
 _PARALLEL_EVALUATOR_ORIGINS = (
     "wiki_cli.py",
     "wiki_observations.py",
+    "scripts/__init__.py",
+    "scripts/package_workflow_observatory.py",
     "scripts/run_observing_workflows_task9_eval.py",
     "scripts/run_observing_workflows_eval_worker.py",
     "scripts/workflow_eval_sharding.py",
     "tests/observing_workflows_eval_harness.py",
     "tests/run_observing_workflows_eval.py",
 )
-_PARALLEL_ARCHIVE_RELATIVE = PurePosixPath(
-    "evidence/dist/workflow-observatory-0.2.0-recovery.zip"
+_PARALLEL_LIVE_MARKETPLACE_ORIGINS = (
+    "plugins/workflow-observer/tests/run_marketplace_eval.py",
+)
+_PARALLEL_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
+_PARALLEL_ARCHIVE_ROOT = "workflow-observatory"
+_ISOLATED_WORKER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "snapshot_evidence=sys.argv.pop(1);"
+    "sys.path.insert(0,snapshot_evidence);"
+    "runpy.run_module('scripts.run_observing_workflows_eval_worker',"
+    "run_name='__main__')"
 )
 
 
-def _verified_parallel_archive_inputs(
+def _require_trusted_archive_sha256(value: object) -> str:
+    if type(value) is not str or not _is_sha256(value):
+        raise ValueError(
+            "trusted archive SHA-256 must be a full lowercase digest"
+        )
+    return value
+
+
+def _live_source_sha256(path: Path, label: str) -> str:
+    descriptor, before = _open_regular_file(path, label)
+    slot = _DescriptorSlot(descriptor)
+    primary: BaseException | None = None
+    digest: str | None = None
+    try:
+        if before.st_size > 16 * 1024 * 1024:
+            raise ValueError(f"{label} exceeds its byte cap")
+        digest = _descriptor_sha256(slot.descriptor)
+        after = os.fstat(slot.descriptor)
+        named = path.lstat()
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or _stat_identity(after) != _stat_identity(named)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+        ):
+            raise ValueError(f"{label} changed while reading")
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [slot],
+        primary=primary,
+        label=f"{label} read or descriptor close failed",
+    )
+    if digest is None:
+        raise AssertionError(f"{label} read produced no digest")
+    return digest
+
+
+def _verify_live_parallel_evaluator_sources(
     repository_root: Path,
+    inventory: dict[str, object],
+) -> None:
+    if type(inventory) is not dict:
+        raise TypeError("archive inventory must be an exact dict")
+    repository_evidence = inventory.get("repository_evidence")
+    marketplace_files = inventory.get("marketplace_files")
+    if (
+        type(repository_evidence) is not dict
+        or type(marketplace_files) is not dict
+    ):
+        raise ValueError("archive inventory lacks live source identities")
+    groups = (
+        (
+            _PARALLEL_EVALUATOR_ORIGINS,
+            Path(repository_root) / "evidence",
+            repository_evidence,
+        ),
+        (
+            _PARALLEL_LIVE_MARKETPLACE_ORIGINS,
+            Path(repository_root),
+            marketplace_files,
+        ),
+    )
+    for origins, source_root, records in groups:
+        for origin in origins:
+            record = records.get(origin)
+            if type(record) is not dict:
+                raise ValueError("archive lacks a live evaluator identity")
+            source_sha256 = record.get("source_sha256")
+            packaged_sha256 = record.get("packaged_sha256")
+            observed = _live_source_sha256(
+                source_root / origin,
+                f"live evaluator source {origin}",
+            )
+            if (
+                not _is_sha256(source_sha256)
+                or not _is_sha256(packaged_sha256)
+                or source_sha256 != packaged_sha256
+                or observed != source_sha256
+            ):
+                raise ValueError(
+                    f"live evaluator source differs from archive: {origin}"
+                )
+
+
+def _read_parallel_archive_bytes(archive_path: Path) -> bytes:
+    descriptor, before = _open_regular_file(
+        archive_path, "parallel evaluation archive"
+    )
+    slot = _DescriptorSlot(descriptor)
+    content = bytearray()
+    primary: BaseException | None = None
+    after: os.stat_result | None = None
+    try:
+        if before.st_size > _PARALLEL_ARCHIVE_MAX_BYTES:
+            raise ValueError("parallel evaluation archive exceeds its byte cap")
+        os.lseek(slot.descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(
+                slot.descriptor,
+                min(
+                    1024 * 1024,
+                    _PARALLEL_ARCHIVE_MAX_BYTES + 1 - len(content),
+                ),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > _PARALLEL_ARCHIVE_MAX_BYTES:
+                raise ValueError(
+                    "parallel evaluation archive exceeds its byte cap"
+                )
+        after = os.fstat(slot.descriptor)
+        named = archive_path.lstat()
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or _stat_identity(after) != _stat_identity(named)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or len(content) != after.st_size
+            or not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+        ):
+            raise ValueError(
+                "parallel evaluation archive changed while reading"
+            )
+    except BaseException as error:
+        primary = error
+    _retire_task_descriptors(
+        [slot],
+        primary=primary,
+        label="parallel archive read or descriptor close failed",
+    )
+    if after is None:
+        raise AssertionError("parallel archive read produced no metadata")
+    return bytes(content)
+
+
+def _capture_verified_parallel_archive(
+    repository_root: Path,
+    *,
+    archive_path: Path,
+    expected_archive_sha256: str,
 ) -> tuple[
     Path,
+    bytes,
     tuple[str, str, str],
     dict[str, object],
     bytes,
 ]:
+    expected = _require_trusted_archive_sha256(
+        expected_archive_sha256
+    )
+    if not isinstance(archive_path, Path) or not archive_path.is_absolute():
+        raise ValueError(
+            "parallel evaluation archive path must be an absolute Path"
+        )
+    try:
+        archive_bytes = _read_parallel_archive_bytes(archive_path)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "verified evaluation archive is unavailable"
+        ) from error
+    observed = hashlib.sha256(archive_bytes).hexdigest()
+    if observed != expected:
+        raise ValueError(
+            "observed archive differs from trusted archive SHA-256"
+        )
+
     from scripts.package_workflow_observatory import (
         ARCHIVE_ROOT,
         INVENTORY_MEMBER,
@@ -14648,10 +14834,43 @@ def _verified_parallel_archive_inputs(
         verify_archive,
     )
 
-    archive_path = Path(repository_root) / _PARALLEL_ARCHIVE_RELATIVE
     try:
-        archive_sha256 = verify_archive(archive_path)
-        with zipfile.ZipFile(archive_path) as bundle:
+        with tempfile.TemporaryDirectory(
+            prefix="workflow-observatory-archive-verify-",
+            dir="/private/tmp",
+        ) as temporary:
+            candidate = Path(temporary) / "candidate.zip"
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            slot = _DescriptorSlot(descriptor)
+            primary: BaseException | None = None
+            try:
+                offset = 0
+                while offset < len(archive_bytes):
+                    written = os.write(slot.descriptor, archive_bytes[offset:])
+                    if written <= 0:
+                        raise OSError("archive verifier copy write stalled")
+                    offset += written
+                os.fsync(slot.descriptor)
+            except BaseException as error:
+                primary = error
+            _retire_task_descriptors(
+                [slot],
+                primary=primary,
+                label="archive verifier copy or descriptor close failed",
+            )
+            if verify_archive(candidate) != observed:
+                raise ValueError(
+                    "archive self-verifier returned a different digest"
+                )
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as bundle:
             inventory_bytes = bundle.read(INVENTORY_MEMBER)
         inventory = json.loads(inventory_bytes)
     except (OSError, ValueError, PackageError, zipfile.BadZipFile) as error:
@@ -14659,13 +14878,18 @@ def _verified_parallel_archive_inputs(
             "verified evaluation archive is unavailable"
         ) from error
     if (
-        type(inventory) is not dict
+        ARCHIVE_ROOT != _PARALLEL_ARCHIVE_ROOT
+        or type(inventory) is not dict
         or inventory.get("archive_root") != ARCHIVE_ROOT
         or type(inventory.get("marketplace_files")) is not dict
         or type(inventory.get("repository_evidence")) is not dict
         or type(inventory.get("members")) is not dict
     ):
         raise ValueError("verified evaluation archive inventory is invalid")
+    live_repository_root = Path(__file__).resolve().parents[2]
+    _verify_live_parallel_evaluator_sources(
+        live_repository_root, inventory
+    )
     marketplace = inventory["marketplace_files"]
     repository_evidence = inventory["repository_evidence"]
     marketplace_rows = tuple(
@@ -14686,11 +14910,38 @@ def _verified_parallel_archive_inputs(
         ) from None
     return (
         archive_path,
+        archive_bytes,
         (
-            archive_sha256,
+            observed,
             component_digest(marketplace_rows),
             component_digest(evaluator_rows),
         ),
+        inventory,
+        inventory_bytes,
+    )
+
+
+def _verified_parallel_archive_inputs(
+    repository_root: Path,
+    *,
+    archive_path: Path,
+    expected_archive_sha256: str,
+) -> tuple[
+    Path,
+    tuple[str, str, str],
+    dict[str, object],
+    bytes,
+]:
+    archive_path, _archive_bytes, digests, inventory, inventory_bytes = (
+        _capture_verified_parallel_archive(
+            repository_root,
+            archive_path=archive_path,
+            expected_archive_sha256=expected_archive_sha256,
+        )
+    )
+    return (
+        archive_path,
+        digests,
         inventory,
         inventory_bytes,
     )
@@ -14701,13 +14952,20 @@ def _materialize_parallel_snapshot(
     repository_root: Path,
     snapshot_root: Path,
     expected_digests: tuple[str, str, str],
+    archive_path: Path,
+    expected_archive_sha256: str,
 ) -> None:
     (
-        archive_path,
+        _archive_path,
+        archive_bytes,
         archive_digests,
         inventory,
         inventory_bytes,
-    ) = _verified_parallel_archive_inputs(repository_root)
+    ) = _capture_verified_parallel_archive(
+        repository_root,
+        archive_path=archive_path,
+        expected_archive_sha256=expected_archive_sha256,
+    )
     if archive_digests != expected_digests:
         raise RuntimeError(
             "verified archive changed before materialization"
@@ -14718,7 +14976,7 @@ def _materialize_parallel_snapshot(
         snapshot_root.mkdir(mode=0o700)
         snapshot_root.chmod(0o700)
         try:
-            with zipfile.ZipFile(archive_path) as bundle:
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as bundle:
                 for info in bundle.infolist():
                     relative = PurePosixPath(info.filename)
                     destination_relative = PurePosixPath(*relative.parts[1:])
@@ -14786,6 +15044,46 @@ def _materialize_parallel_snapshot(
         )
 
 
+def attest_captured_evaluator_identity(
+    snapshot_root: Path,
+    expected_evaluator_sha256: str,
+) -> str:
+    if type(expected_evaluator_sha256) is not str or not _is_sha256(
+        expected_evaluator_sha256
+    ):
+        raise ValueError(
+            "expected evaluator SHA-256 must be a full lowercase digest"
+        )
+    rows = _validate_snapshot_root(Path(snapshot_root))
+    captured = {
+        relative: (kind, mode, digest)
+        for relative, kind, mode, _size, digest in rows
+    }
+    evaluator_rows = []
+    for origin in _PARALLEL_EVALUATOR_ORIGINS:
+        relative = f"evidence/{origin}"
+        entry = captured.get(relative)
+        if (
+            entry is None
+            or entry[0] != "file"
+            or entry[1] != 0o444
+            or not _is_sha256(entry[2])
+        ):
+            raise ValueError(
+                "captured evaluator source is absent or non-canonical"
+            )
+        evaluator_rows.append(
+            (
+                f"{_PARALLEL_ARCHIVE_ROOT}/{relative}",
+                entry[2],
+            )
+        )
+    observed = component_digest(tuple(evaluator_rows))
+    if observed != expected_evaluator_sha256:
+        raise ValueError("captured evaluator identity differs")
+    return observed
+
+
 def _parallel_recovery_is_cleanup_only(
     *,
     has_ownership: bool,
@@ -14815,6 +15113,9 @@ def _parallel_plan_inputs(
 ]:
     if type(options) is not ParallelOptions:
         raise TypeError("options must be exact ParallelOptions")
+    expected_archive_sha256 = _require_trusted_archive_sha256(
+        options.expected_archive_sha256
+    )
     if type(manifests) is not dict or set(manifests) != {
         "forward",
         "lifecycle",
@@ -14835,13 +15136,18 @@ def _parallel_plan_inputs(
         run_root / "coordinator/captured-snapshot"
     )
     _archive_path, capture_digests, _inventory, _inventory_bytes = (
-        _verified_parallel_archive_inputs(repository_root)
+        _verified_parallel_archive_inputs(
+            repository_root,
+            archive_path=options.archive_path,
+            expected_archive_sha256=expected_archive_sha256,
+        )
     )
     archive_digest, marketplace_digest, evaluator_digest = capture_digests
     fingerprints = InputFingerprints(
         schema_version=1,
         epoch_id="",
         run_kind=options.run_kind,
+        expected_archive_sha256=expected_archive_sha256,
         archive_sha256=archive_digest,
         marketplace_sha256=marketplace_digest,
         evaluator_sha256=evaluator_digest,
@@ -15811,6 +16117,7 @@ def run_parallel_evaluation(
     repository, _identity = _canonical_git_repository_root(repository_root)
     if type(options) is not ParallelOptions:
         raise TypeError("options must be exact ParallelOptions")
+    _require_trusted_archive_sha256(options.expected_archive_sha256)
     if options.run_kind in ("diagnostic", "discovery"):
         if result_destinations is not None:
             raise ValueError(
@@ -15878,6 +16185,10 @@ def run_parallel_evaluation(
             repository_root=repository,
             snapshot_root=snapshot_root,
             expected_digests=capture_digests,
+            archive_path=bound_options.archive_path,
+            expected_archive_sha256=(
+                plan.fingerprints.expected_archive_sha256
+            ),
         )
         _write_or_verify_coordinator_record(
             coordinator_root / "epoch-plan.json",

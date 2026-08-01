@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -304,6 +305,18 @@ def run_diagnostic_case(case_id: str) -> dict:
 
 
 def run_parallel_mode(arguments: argparse.Namespace) -> int:
+    archive_path = arguments.archive.expanduser()
+    if not archive_path.is_absolute():
+        raise ValueError("--archive must be an absolute path")
+    try:
+        archive_metadata = archive_path.lstat()
+    except OSError as error:
+        raise ValueError("--archive must name an available file") from error
+    if (
+        stat.S_ISLNK(archive_metadata.st_mode)
+        or not stat.S_ISREG(archive_metadata.st_mode)
+    ):
+        raise ValueError("--archive must name a regular non-symlink file")
     if arguments.resume_run_root is None:
         run_root = Path(
             tempfile.mkdtemp(
@@ -340,6 +353,8 @@ def run_parallel_mode(arguments: argparse.Namespace) -> int:
             run_root=run_root,
             source_codex_home=source_codex_home,
             codex_executable=codex_executable,
+            archive_path=archive_path,
+            expected_archive_sha256=arguments.expected_archive_sha256,
             resume_run_root=resume_run_root,
         ),
     )
@@ -371,10 +386,28 @@ def main() -> int:
         "--parallel",
         choices=("diagnostic", "discovery", "formal"),
     )
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--expected-archive-sha256")
     parser.add_argument("--resume-run-root", type=Path)
     arguments = parser.parse_args()
     if arguments.resume_run_root is not None and arguments.parallel is None:
         parser.error("--resume-run-root requires --parallel")
+    if (
+        arguments.parallel is not None
+        and arguments.expected_archive_sha256 is None
+    ):
+        parser.error(
+            "--expected-archive-sha256 is required with --parallel"
+        )
+    if arguments.parallel is not None and arguments.archive is None:
+        parser.error("--archive is required with --parallel")
+    if (
+        arguments.parallel is None
+        and arguments.expected_archive_sha256 is not None
+    ):
+        parser.error("--expected-archive-sha256 requires --parallel")
+    if arguments.parallel is None and arguments.archive is not None:
+        parser.error("--archive requires --parallel")
     diagnostic_requested = arguments.diagnostic_case is not None
     if (
         diagnostic_requested

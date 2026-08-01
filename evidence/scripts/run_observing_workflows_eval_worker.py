@@ -61,6 +61,7 @@ from scripts.workflow_eval_sharding import (
     _tombstone_receipt_from_payload as _receipt_from_payload,
     _validate_wait_timeout,
     _write_progress_with_deadline,
+    attest_captured_evaluator_identity,
     canonical_run_root,
     canonical_config_bytes,
     decide_retry,
@@ -2219,6 +2220,7 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--snapshot-root", required=True, type=Path)
     parser.add_argument("--epoch-id", required=True)
+    parser.add_argument("--expected-evaluator-sha256", required=True)
     parser.add_argument("--resume-plan-hex", required=True)
     arguments = parser.parse_args(argv)
     run_root = canonical_run_root(arguments.run_root)
@@ -2230,6 +2232,17 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
     plan = _decode_epoch_plan_record(payload)
     if plan.epoch_id != arguments.epoch_id:
         raise ValueError("worker epoch argument differs from sealed plan")
+    if (
+        arguments.expected_evaluator_sha256
+        != plan.fingerprints.evaluator_sha256
+    ):
+        raise ValueError(
+            "worker evaluator argument differs from sealed plan"
+        )
+    attest_captured_evaluator_identity(
+        arguments.snapshot_root,
+        arguments.expected_evaluator_sha256,
+    )
     try:
         resume_content = bytes.fromhex(arguments.resume_plan_hex)
         resume_payload = json.loads(resume_content)

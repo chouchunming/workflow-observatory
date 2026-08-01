@@ -1,12 +1,17 @@
+import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 from tests import run_parallel_eval_no_model_coordinator as coordinator_runner
 from tests import run_parallel_eval_no_model_worker as worker_runner
@@ -17,6 +22,11 @@ ARCHIVE = (
     EVIDENCE_ROOT
     / "dist/workflow-observatory-0.2.0-recovery.zip"
 )
+ARCHIVE_PATH_ENV = "WORKFLOW_OBSERVATORY_EVAL_ARCHIVE"
+ARCHIVE_SHA256_ENV = "WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256"
+FRESH_EXTRACTION_CHILD_ENV = (
+    "WORKFLOW_OBSERVATORY_FRESH_EXTRACTION_CHILD"
+)
 FIXTURES = EVIDENCE_ROOT / "tests/skill_evals"
 LANES = ("E1", "E2", "E3", "APP")
 
@@ -26,6 +36,48 @@ def _key(payload):
         f"{payload['mode']}:{payload['ordinal']}:"
         f"{payload['case_id']}"
     )
+
+
+def _trusted_archive_input(*, require_environment=False):
+    configured_path = os.environ.get(ARCHIVE_PATH_ENV)
+    configured_digest = os.environ.get(ARCHIVE_SHA256_ENV)
+    if require_environment and (
+        configured_path is None or configured_digest is None
+    ):
+        raise unittest.SkipTest(
+            "fresh extraction requires external archive path and digest"
+        )
+    if configured_path is None:
+        path = ARCHIVE.resolve(strict=True)
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    else:
+        path = Path(configured_path).expanduser()
+        if not path.is_absolute():
+            raise AssertionError(
+                f"{ARCHIVE_PATH_ENV} must be an absolute path"
+            )
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise AssertionError(
+                f"{ARCHIVE_PATH_ENV} is unavailable"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+            metadata.st_mode
+        ):
+            raise AssertionError(
+                f"{ARCHIVE_PATH_ENV} must be a regular non-symlink file"
+            )
+        path = path.resolve(strict=True)
+        expected = configured_digest
+    if expected is None or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise AssertionError(
+            f"{ARCHIVE_SHA256_ENV} must be a full lowercase SHA-256"
+        )
+    observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    if observed != expected:
+        raise AssertionError("external archive differs from trusted SHA-256")
+    return path, expected
 
 
 class NoModelHarnessUnitTests(unittest.TestCase):
@@ -113,6 +165,7 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.repository = self.root / "fixture-repository"
+        self.archive_path, self.archive_sha256 = _trusted_archive_input()
         subprocess.run(
             ["git", "init", "-q", str(self.repository)],
             check=True,
@@ -123,12 +176,6 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         (self.repository / "baseline.txt").write_text(
             "fixture baseline\n", encoding="utf-8"
         )
-        archive_destination = (
-            self.repository
-            / "evidence/dist/workflow-observatory-0.2.0-recovery.zip"
-        )
-        archive_destination.parent.mkdir(parents=True)
-        shutil.copy2(ARCHIVE, archive_destination)
         fixture_destination = (
             self.repository / "evidence/tests/skill_evals"
         )
@@ -185,6 +232,10 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
             str(self.source_codex_home),
             "--codex-executable",
             str(self.sentinel_codex),
+            "--archive",
+            str(self.archive_path),
+            "--expected-archive-sha256",
+            self.archive_sha256,
             "--run-kind",
             run_kind,
             "--forward-result",
@@ -499,6 +550,82 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertNotIn("test-driver", completed.stdout)
         self.assertNotIn("no-model", completed.stdout)
         self.assertFalse(self.sentinel_marker.exists())
+
+    def test_fresh_release_extraction_runs_all_parallel_safety_suites(self):
+        if os.environ.get(FRESH_EXTRACTION_CHILD_ENV) == "1":
+            self.skipTest("fresh-extraction parent only")
+        archive_path, archive_sha256 = _trusted_archive_input(
+            require_environment=True
+        )
+        verified = subprocess.run(
+            [
+                sys.executable,
+                str(EVIDENCE_ROOT / "scripts/package_workflow_observatory.py"),
+                "--verify",
+                str(archive_path),
+            ],
+            cwd=EVIDENCE_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, verified.returncode, verified.stderr)
+        self.assertEqual(archive_sha256, verified.stdout.strip())
+
+        extraction = self.root / "fresh-extraction"
+        extraction.mkdir(mode=0o700)
+        with zipfile.ZipFile(archive_path) as bundle:
+            for info in bundle.infolist():
+                member = PurePosixPath(info.filename)
+                self.assertFalse(member.is_absolute())
+                self.assertNotIn("..", member.parts)
+            bundle.extractall(extraction)
+        release_root = extraction / "workflow-observatory"
+        evidence_root = release_root / "evidence"
+        self.assertTrue(evidence_root.is_dir())
+        self.assertEqual([], list(release_root.rglob("*.zip")))
+
+        environment = dict(self.environment)
+        environment.update(
+            {
+                ARCHIVE_PATH_ENV: str(archive_path),
+                ARCHIVE_SHA256_ENV: archive_sha256,
+                FRESH_EXTRACTION_CHILD_ENV: "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-v",
+                "-s",
+                "tests",
+                "-p",
+                "test_*.py",
+            ],
+            cwd=evidence_root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=300,
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(0, completed.returncode, output)
+        match = re.search(r"Ran (\d+) tests?", output)
+        self.assertIsNotNone(match, output)
+        self.assertGreaterEqual(int(match.group(1)), 556)
+        for test_name in (
+            "test_public_planner_types_match_the_frozen_contract",
+            "test_allowlist_and_frozen_contract_are_disjoint",
+            "test_real_processes_cover_all_28_cases",
+            "test_fresh_release_extraction_runs_all_parallel_safety_suites",
+        ):
+            self.assertIn(test_name, output)
+        self.assertIn("OK (skipped=1)", output)
 
 
 if __name__ == "__main__":

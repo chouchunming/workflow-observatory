@@ -25,6 +25,42 @@ from scripts import workflow_eval_sharding as sharding
 
 
 FIXTURES = Path(__file__).parent / "skill_evals"
+_EXTERNAL_ARCHIVE_ENV = "WORKFLOW_OBSERVATORY_EVAL_ARCHIVE"
+_EXTERNAL_ARCHIVE_SHA256_ENV = (
+    "WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256"
+)
+
+
+def trusted_test_archive(repository):
+    configured = os.environ.get(_EXTERNAL_ARCHIVE_ENV)
+    expected = os.environ.get(_EXTERNAL_ARCHIVE_SHA256_ENV)
+    if configured is None:
+        path = (
+            Path(repository)
+            / "evidence/dist/workflow-observatory-0.2.0-recovery.zip"
+        )
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        return path, expected
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise AssertionError(
+            f"{_EXTERNAL_ARCHIVE_ENV} must be an absolute path"
+        )
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+        metadata.st_mode
+    ):
+        raise AssertionError(
+            f"{_EXTERNAL_ARCHIVE_ENV} must be a regular non-symlink file"
+        )
+    if expected is None or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise AssertionError(
+            f"{_EXTERNAL_ARCHIVE_SHA256_ENV} must be a full lowercase digest"
+        )
+    path = path.resolve(strict=True)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise AssertionError("external archive differs from trusted SHA-256")
+    return path, expected
 
 
 def load_cases(filename):
@@ -36,6 +72,7 @@ def input_fingerprints(run_kind):
         schema_version=1,
         epoch_id="",
         run_kind=run_kind,
+        expected_archive_sha256="a" * 64,
         archive_sha256="a" * 64,
         marketplace_sha256="b" * 64,
         evaluator_sha256="c" * 64,
@@ -65,6 +102,38 @@ class PlannerTests(unittest.TestCase):
             sharding.CaseKey("forward", 1, "first"),
             sharding.CaseKey("forward", 2, "second"),
         )
+
+    def test_expected_and_observed_archive_identities_are_sealed_into_epoch(self):
+        fingerprints = input_fingerprints("formal")
+        plan = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests={
+                "forward": load_cases("observing_workflows_cases.json"),
+                "lifecycle": load_cases(
+                    "observing_workflows_lifecycle_cases.json"
+                ),
+            },
+            fingerprints=fingerprints,
+        )
+
+        sealed = sharding._encode_epoch_plan_record(plan)["fingerprints"]
+        self.assertEqual("a" * 64, sealed["expected_archive_sha256"])
+        self.assertEqual("a" * 64, sealed["archive_sha256"])
+        changed = sharding.build_epoch_plan(
+            run_kind="formal",
+            manifests={
+                "forward": load_cases("observing_workflows_cases.json"),
+                "lifecycle": load_cases(
+                    "observing_workflows_lifecycle_cases.json"
+                ),
+            },
+            fingerprints=replace(
+                fingerprints,
+                expected_archive_sha256="e" * 64,
+                archive_sha256="e" * 64,
+            ),
+        )
+        self.assertNotEqual(plan.epoch_id, changed.epoch_id)
 
     def test_frozen_plan_has_exact_8_8_8_4_coverage(self):
         forward_cases = load_cases("observing_workflows_cases.json")
@@ -343,6 +412,7 @@ class DiagnosticExecutionScopeTests(unittest.TestCase):
             manifests=self.manifests,
             fingerprints=replace(
                 input_fingerprints("diagnostic"),
+                expected_archive_sha256="e" * 64,
                 archive_sha256="e" * 64,
             ),
         )
@@ -8650,7 +8720,9 @@ class AggregationGateTests(unittest.TestCase):
     def test_coherent_guard_and_validated_retargeting_is_rejected(self):
         other_repository = self._new_repository("other-repository")
         other_fingerprints = replace(
-            input_fingerprints("formal"), archive_sha256="e" * 64
+            input_fingerprints("formal"),
+            expected_archive_sha256="e" * 64,
+            archive_sha256="e" * 64,
         )
         first_arguments = self._build_valid_epoch(
             "formal",
@@ -8724,7 +8796,9 @@ class AggregationGateTests(unittest.TestCase):
     def test_coherent_already_issued_commit_retargeting_is_rejected(self):
         other_repository = self._new_repository("issued-other-repository")
         other_fingerprints = replace(
-            input_fingerprints("formal"), archive_sha256="e" * 64
+            input_fingerprints("formal"),
+            expected_archive_sha256="e" * 64,
+            archive_sha256="e" * 64,
         )
         first_arguments = self._build_valid_epoch(
             "formal",
@@ -8879,7 +8953,9 @@ class AggregationGateTests(unittest.TestCase):
             "issuance-other-repository"
         )
         other_fingerprints = replace(
-            input_fingerprints("formal"), archive_sha256="e" * 64
+            input_fingerprints("formal"),
+            expected_archive_sha256="e" * 64,
+            archive_sha256="e" * 64,
         )
         first_arguments = self._build_valid_epoch(
             "formal",
@@ -8953,7 +9029,9 @@ class AggregationGateTests(unittest.TestCase):
             "commit-issuance-other-repository"
         )
         other_fingerprints = replace(
-            input_fingerprints("formal"), archive_sha256="e" * 64
+            input_fingerprints("formal"),
+            expected_archive_sha256="e" * 64,
+            archive_sha256="e" * 64,
         )
         first_arguments = self._build_valid_epoch(
             "formal",
@@ -13824,6 +13902,8 @@ class CoordinatorStateTests(unittest.TestCase):
             run_root=self.run_root,
             source_codex_home=self.source_codex_home,
             codex_executable=self.codex_executable,
+            archive_path=self.root / "externally-trusted-archive.zip",
+            expected_archive_sha256="a" * 64,
             max_total_tokens=max_total_tokens,
         )
 
@@ -15578,6 +15658,8 @@ class CoordinatorStateTests(unittest.TestCase):
                 "run_root",
                 "source_codex_home",
                 "codex_executable",
+                "archive_path",
+                "expected_archive_sha256",
                 "requested_model",
                 "requested_reasoning_effort",
                 "resume_run_root",
@@ -15726,6 +15808,13 @@ class CoordinatorStateTests(unittest.TestCase):
                 "E1", self.plan, self._options(), self.root / "snapshot"
             )
         )
+        self.assertEqual((sys.executable, "-I", "-c"), command[:3])
+        self.assertIn(
+            str((self.root / "snapshot" / "evidence").resolve()),
+            command,
+        )
+        self.assertIn("--expected-evaluator-sha256", command)
+        self.assertIn(self.plan.fingerprints.evaluator_sha256, command)
         rendered = "\0".join(command).lower()
         for forbidden in (
             "result_destination",
@@ -15739,19 +15828,120 @@ class CoordinatorStateTests(unittest.TestCase):
         self.assertEqual(["argv"], list(signature.parameters))
         self.assertIsNone(signature.parameters["argv"].default)
 
+    def test_every_parallel_mode_rejects_missing_trusted_archive_identity(self):
+        for run_kind in ("diagnostic", "discovery", "formal"):
+            with self.subTest(run_kind=run_kind):
+                options = replace(
+                    self._options(run_kind=run_kind),
+                    expected_archive_sha256=None,
+                )
+                verifier = mock.Mock(
+                    side_effect=AssertionError(
+                        "archive inspection occurred before trust validation"
+                    )
+                )
+                with mock.patch.object(
+                    sharding,
+                    "_verified_parallel_archive_inputs",
+                    verifier,
+                ), self.assertRaisesRegex(
+                    ValueError, "trusted archive SHA-256"
+                ):
+                    sharding._parallel_plan_inputs(
+                        repository_root=self.repository,
+                        manifests=self.manifests,
+                        options=options,
+                    )
+                verifier.assert_not_called()
+
+    def test_archive_mismatch_fails_before_self_verifier_or_zip_inspection(self):
+        archive = self.root / "external/untrusted-candidate.zip"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"internally consistent but untrusted archive")
+        verifier = mock.Mock(
+            side_effect=AssertionError("self-verifier must not run")
+        )
+        zip_reader = mock.Mock(
+            side_effect=AssertionError("ZIP must not be inspected")
+        )
+
+        with mock.patch(
+            "scripts.package_workflow_observatory.verify_archive",
+            verifier,
+        ), mock.patch.object(
+            sharding.zipfile, "ZipFile", zip_reader
+        ), self.assertRaisesRegex(ValueError, "trusted archive SHA-256"):
+            sharding._verified_parallel_archive_inputs(
+                self.repository,
+                archive_path=archive,
+                expected_archive_sha256="0" * 64,
+            )
+
+        verifier.assert_not_called()
+        zip_reader.assert_not_called()
+
+    def test_live_coordinator_conflict_fails_before_plan_or_worker_launch(self):
+        inventory = {
+            "repository_evidence": {},
+            "marketplace_files": {},
+        }
+        for origin in sharding._PARALLEL_EVALUATOR_ORIGINS:
+            source = self.repository / "evidence" / origin
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(f"repository:{origin}\n".encode("ascii"))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            inventory["repository_evidence"][origin] = {
+                "source_sha256": digest,
+                "packaged_sha256": digest,
+            }
+        for origin in sharding._PARALLEL_LIVE_MARKETPLACE_ORIGINS:
+            source = self.repository / origin
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(f"marketplace:{origin}\n".encode("ascii"))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            inventory["marketplace_files"][origin] = {
+                "source_sha256": digest,
+                "packaged_sha256": digest,
+            }
+
+        sharding._verify_live_parallel_evaluator_sources(
+            self.repository, inventory
+        )
+        live_coordinator = (
+            self.repository
+            / "evidence/scripts/workflow_eval_sharding.py"
+        )
+        live_coordinator.write_bytes(b"conflicting live coordinator\n")
+
+        with self.assertRaisesRegex(
+            ValueError, "live evaluator source differs"
+        ):
+            sharding._verify_live_parallel_evaluator_sources(
+                self.repository, inventory
+            )
+
     def test_default_worker_launcher_reaches_durable_lane_ready(self):
         repository = Path(__file__).resolve().parents[2]
         coordinator_root = self.run_root / "coordinator"
         coordinator_root.mkdir(parents=True, mode=0o700)
         self.run_root.chmod(0o700)
         snapshot_root = coordinator_root / "captured-snapshot"
+        archive_path, trusted_archive_sha256 = trusted_test_archive(
+            repository
+        )
         _archive, capture_digests, _inventory, _inventory_bytes = (
-            sharding._verified_parallel_archive_inputs(repository)
+            sharding._verified_parallel_archive_inputs(
+                repository,
+                archive_path=archive_path,
+                expected_archive_sha256=trusted_archive_sha256,
+            )
         )
         sharding._materialize_parallel_snapshot(
             repository_root=repository,
             snapshot_root=snapshot_root,
             expected_digests=capture_digests,
+            archive_path=archive_path,
+            expected_archive_sha256=trusted_archive_sha256,
         )
         self.codex_executable.write_text(
             "#!/bin/sh\nprintf '%s\\n' 'codex-cli 9.9.9'\n",
@@ -15769,6 +15959,10 @@ class CoordinatorStateTests(unittest.TestCase):
             manifests=self.manifests,
             fingerprints=replace(
                 input_fingerprints("discovery"),
+                expected_archive_sha256=capture_digests[0],
+                archive_sha256=capture_digests[0],
+                marketplace_sha256=capture_digests[1],
+                evaluator_sha256=capture_digests[2],
                 transport_config_sha256=hashlib.sha256(
                     sharding.transport_config_bytes(transport_config)
                 ).hexdigest(),
@@ -15829,8 +16023,8 @@ class CoordinatorStateTests(unittest.TestCase):
             self.assertEqual(
                 (
                     sys.executable,
-                    "-m",
-                    "scripts.run_observing_workflows_eval_worker",
+                    "-I",
+                    "-c",
                 ),
                 command[:3],
             )
@@ -15841,6 +16035,67 @@ class CoordinatorStateTests(unittest.TestCase):
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
+
+    def test_worker_attests_snapshot_before_lane_ready_or_model_capable_work(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        self.run_root.mkdir(mode=0o700)
+        coordinator_root = self.run_root / "coordinator"
+        coordinator_root.mkdir(mode=0o700)
+        plan = sharding.build_epoch_plan(
+            run_kind="diagnostic",
+            manifests=self.manifests,
+            fingerprints=input_fingerprints("diagnostic"),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(plan),
+        )
+        resume = sharding.ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=tuple(assignment.key for assignment in plan.assignments),
+            invalid=(),
+        )
+        events = []
+
+        def reject_identity(*_args, **_kwargs):
+            events.append("attest")
+            raise ValueError("captured evaluator identity differs")
+
+        with mock.patch.object(
+            worker,
+            "attest_captured_evaluator_identity",
+            side_effect=reject_identity,
+            create=True,
+        ), mock.patch.object(
+            worker,
+            "_run_worker_impl",
+            side_effect=lambda **_kwargs: events.append("run"),
+        ) as run_impl, self.assertRaisesRegex(
+            ValueError, "captured evaluator identity differs"
+        ):
+            worker.worker_main(
+                [
+                    "--lane",
+                    "E3",
+                    "--run-root",
+                    str(self.run_root),
+                    "--snapshot-root",
+                    str(self.root / "captured-snapshot"),
+                    "--epoch-id",
+                    plan.epoch_id,
+                    "--expected-evaluator-sha256",
+                    plan.fingerprints.evaluator_sha256,
+                    "--resume-plan-hex",
+                    sharding.canonical_config_bytes(
+                        sharding._encode_resume_plan_record(resume)
+                    ).hex(),
+                ]
+            )
+
+        self.assertEqual(["attest"], events)
+        run_impl.assert_not_called()
 
     def test_production_integrity_runner_parses_exact_healthy_output(self):
         completed = subprocess.CompletedProcess(
@@ -16372,13 +16627,24 @@ def _contains_process_survival_failure(error):
         self.assertIn(
             "wiki_observations.py", sharding._PARALLEL_EVALUATOR_ORIGINS
         )
+        self.assertIn(
+            "scripts/package_workflow_observatory.py",
+            sharding._PARALLEL_EVALUATOR_ORIGINS,
+        )
         self.assertNotIn(
             "tests/skill_evals/observing_workflows_cases.json",
             sharding._PARALLEL_EVALUATOR_ORIGINS,
         )
         repository = Path(__file__).resolve().parents[2]
+        archive_path, trusted_archive_sha256 = trusted_test_archive(
+            repository
+        )
         _archive, digests, inventory, _inventory_bytes = (
-            sharding._verified_parallel_archive_inputs(repository)
+            sharding._verified_parallel_archive_inputs(
+                repository,
+                archive_path=archive_path,
+                expected_archive_sha256=trusted_archive_sha256,
+            )
         )
         evaluator_rows = tuple(
             (

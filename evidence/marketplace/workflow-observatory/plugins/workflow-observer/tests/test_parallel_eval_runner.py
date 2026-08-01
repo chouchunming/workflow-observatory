@@ -15,6 +15,8 @@ def _load_runner():
 
 
 class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
+    TRUSTED_ARCHIVE_SHA256 = "a" * 64
+
     def test_help_exposes_opt_in_parallel_modes_and_resume_root(self):
         runner = Path(__file__).with_name("run_marketplace_eval.py")
         result = subprocess.run(
@@ -27,6 +29,54 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("--parallel {diagnostic,discovery,formal}", result.stdout)
         self.assertIn("--resume-run-root", result.stdout)
+        self.assertIn("--archive", result.stdout)
+        self.assertIn("--expected-archive-sha256", result.stdout)
+
+    def test_every_parallel_mode_requires_external_archive_identity(self):
+        runner, namespace, runtime_globals = _load_runner()
+        for mode in ("diagnostic", "discovery", "formal"):
+            with self.subTest(mode=mode), mock.patch.object(
+                sys, "argv", [str(runner), "--parallel", mode]
+            ), mock.patch.object(
+                sys, "stderr", new_callable=io.StringIO
+            ) as stderr, mock.patch.dict(
+                runtime_globals,
+                {"validate_marketplace_manifest_hashes": mock.Mock()},
+            ), self.assertRaises(SystemExit) as raised:
+                namespace["main"]()
+
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn(
+                "--expected-archive-sha256 is required with --parallel",
+                stderr.getvalue(),
+            )
+
+    def test_every_parallel_mode_requires_explicit_external_archive_path(self):
+        runner, namespace, runtime_globals = _load_runner()
+        for mode in ("diagnostic", "discovery", "formal"):
+            with self.subTest(mode=mode), mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(runner),
+                    "--parallel",
+                    mode,
+                    "--expected-archive-sha256",
+                    self.TRUSTED_ARCHIVE_SHA256,
+                ],
+            ), mock.patch.object(
+                sys, "stderr", new_callable=io.StringIO
+            ) as stderr, mock.patch.dict(
+                runtime_globals,
+                {"validate_marketplace_manifest_hashes": mock.Mock()},
+            ), self.assertRaises(SystemExit) as raised:
+                namespace["main"]()
+
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn(
+                "--archive is required with --parallel",
+                stderr.getvalue(),
+            )
 
     def test_resume_root_requires_an_explicit_parallel_mode(self):
         runner, namespace, runtime_globals = _load_runner()
@@ -57,6 +107,34 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         )
         legacy_suite.assert_not_called()
 
+    def test_parallel_rejects_a_symlink_archive_path(self):
+        runner, namespace, runtime_globals = _load_runner()
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(temporary).resolve(strict=True)
+        target = root / "release.zip"
+        target.write_bytes(b"release")
+        archive = root / "release-link.zip"
+        archive.symlink_to(target)
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                str(runner),
+                "--parallel",
+                "discovery",
+                "--archive",
+                str(archive),
+                "--expected-archive-sha256",
+                self.TRUSTED_ARCHIVE_SHA256,
+            ],
+        ), mock.patch.dict(
+            runtime_globals,
+            {"validate_marketplace_manifest_hashes": mock.Mock()},
+        ), self.assertRaisesRegex(
+            ValueError, "regular non-symlink file"
+        ):
+            namespace["main"]()
+
     def test_parallel_modes_route_to_production_coordinator(self):
         runner, namespace, runtime_globals = _load_runner()
         statuses = {
@@ -73,6 +151,8 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         codex_executable.chmod(0o700)
         exact_repository = root / "repository"
         exact_repository.mkdir()
+        archive = root / "externally-trusted.zip"
+        archive.write_bytes(b"trusted archive fixture")
 
         for mode, status in statuses.items():
             with self.subTest(mode=mode):
@@ -90,7 +170,17 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                     )
 
                 with mock.patch.object(
-                    sys, "argv", [str(runner), "--parallel", mode]
+                    sys,
+                    "argv",
+                    [
+                        str(runner),
+                        "--parallel",
+                        mode,
+                        "--archive",
+                        str(archive),
+                        "--expected-archive-sha256",
+                        self.TRUSTED_ARCHIVE_SHA256,
+                    ],
                 ), mock.patch.object(
                     sys, "stdout", new_callable=io.StringIO
                 ) as stdout, mock.patch.dict(
@@ -149,6 +239,8 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                         "run_root",
                         "source_codex_home",
                         "codex_executable",
+                        "archive_path",
+                        "expected_archive_sha256",
                         "requested_model",
                         "requested_reasoning_effort",
                         "resume_run_root",
@@ -160,6 +252,11 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                 self.assertEqual(run_root, options.run_root)
                 self.assertEqual(source_codex_home, options.source_codex_home)
                 self.assertEqual(codex_executable, options.codex_executable)
+                self.assertEqual(archive, options.archive_path)
+                self.assertEqual(
+                    self.TRUSTED_ARCHIVE_SHA256,
+                    options.expected_archive_sha256,
+                )
                 self.assertIsNone(options.resume_run_root)
                 rendered = stdout.getvalue()
                 self.assertIn(f'"run_kind": "{mode}"', rendered)
@@ -183,6 +280,8 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         run_root.mkdir(mode=0o700)
         exact_repository = root / "repository"
         exact_repository.mkdir()
+        archive = root / "externally-trusted.zip"
+        archive.write_bytes(b"trusted archive fixture")
         calls = []
 
         def fake_parallel(**kwargs):
@@ -201,6 +300,10 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                 str(runner),
                 "--parallel",
                 "discovery",
+                "--archive",
+                str(archive),
+                "--expected-archive-sha256",
+                self.TRUSTED_ARCHIVE_SHA256,
                 "--resume-run-root",
                 str(run_root),
             ],
@@ -247,9 +350,21 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
         run_root.mkdir(mode=0o700)
         exact_repository = root / "repository"
         exact_repository.mkdir()
+        archive = root / "externally-trusted.zip"
+        archive.write_bytes(b"trusted archive fixture")
 
         with mock.patch.object(
-            sys, "argv", [str(runner), "--parallel", "discovery"]
+            sys,
+            "argv",
+            [
+                str(runner),
+                "--parallel",
+                "discovery",
+                "--archive",
+                str(archive),
+                "--expected-archive-sha256",
+                self.TRUSTED_ARCHIVE_SHA256,
+            ],
         ), mock.patch.object(
             sys, "stdout", new_callable=io.StringIO
         ) as stdout, mock.patch.dict(
@@ -357,6 +472,33 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                     "formal\n"
                     "epoch still require their separate review and approval "
                     "gates.",
+                    text,
+                )
+                self.assertIn(
+                    "Every parallel mode requires an externally trusted full "
+                    "archive SHA-256",
+                    text,
+                )
+                self.assertIn(
+                    "`--archive` must name the original absolute, regular, "
+                    "non-symlink ZIP path",
+                    text,
+                )
+                self.assertIn(
+                    "before `lane-ready` or any model-capable work",
+                    text,
+                )
+                self.assertIn(
+                    "WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256="
+                    "'64-lowercase-hex-from-trusted-channel'",
+                    text,
+                )
+                self.assertIn(
+                    "python3 -m unittest discover -v -s tests -p 'test_*.py'",
+                    text,
+                )
+                self.assertIn(
+                    "does not establish the archive's authenticity",
                     text,
                 )
 

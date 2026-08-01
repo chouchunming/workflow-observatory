@@ -100,10 +100,31 @@ serial discovery sweep, and default serial formal behavior when `--parallel` is
 absent. Parallel execution is opt-in:
 
 ```text
-run_marketplace_eval.py --parallel {diagnostic,discovery,formal}
+run_marketplace_eval.py --parallel {diagnostic,discovery,formal} \
+  --archive /absolute/path/to/original-release.zip \
+  --expected-archive-sha256 <trusted-archive-sha256>
 run_marketplace_eval.py --parallel discovery \
+  --archive /absolute/path/to/original-release.zip \
+  --expected-archive-sha256 <trusted-archive-sha256> \
   --resume-run-root /absolute/private/path/to/retained-run
 ```
+
+Every parallel mode requires an externally trusted full archive SHA-256. Obtain
+it from a trusted release descriptor or independent channel; the archive's own
+`SHA256SUMS.json` cannot authenticate itself. The coordinator hashes the raw ZIP
+bytes and compares the full expected and observed identities before invoking
+the archive verifier or opening the ZIP, then seals both identities into the
+epoch. Diagnostic and discovery remain non-authoritative, but they are not
+exempt because they still execute archive-owned code.
+
+`--archive` must name the original absolute, regular, non-symlink ZIP path.
+Keep that release artifact outside the extracted tree; an extracted release is
+not expected to contain a nested copy of itself.
+
+The coordinator also verifies that every live coordinator/protocol source
+matches its trusted archive member. Production workers start with isolated
+Python imports rooted only in the captured snapshot and attest the complete
+sealed evaluator identity before `lane-ready` or any model-capable work.
 
 `--parallel diagnostic` runs only the fixed non-authoritative
 `forward/3 reviewed-refactor` case through the reviewed coordinator/worker
@@ -142,8 +163,16 @@ The extracted release keeps reviewable repository evidence under `evidence/`:
 From an extracted release, reproduce the non-model gates with:
 
 ```bash
-python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
-(cd evidence && python3 -m unittest discover -s tests -p 'test_*.py')
+export WORKFLOW_OBSERVATORY_EVAL_ARCHIVE=/absolute/path/to/original-release.zip
+export WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256='64-lowercase-hex-from-trusted-channel'
+python3 -c 'import hashlib,os,pathlib; p=pathlib.Path(os.environ["WORKFLOW_OBSERVATORY_EVAL_ARCHIVE"]); expected=os.environ["WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256"]; observed=hashlib.sha256(p.read_bytes()).hexdigest(); assert observed == expected, (expected, observed)'
 python3 evidence/scripts/package_workflow_observatory.py --verify \
-  /absolute/path/to/workflow-observatory-0.1.0.zip
+  "$WORKFLOW_OBSERVATORY_EVAL_ARCHIVE"
+python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
+(cd evidence && python3 -m unittest discover -v -s tests -p 'test_*.py')
 ```
+
+The exported digest must come from an independent trusted release descriptor or
+channel; replace the quoted placeholder before running the commands. The
+subsequent archive verifier checks structure and internal
+consistency; it does not establish the archive's authenticity.

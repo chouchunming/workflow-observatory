@@ -161,6 +161,24 @@ the existing preflight, fixed single-case diagnostic, serial discovery sweep,
 and default serial formal paths keep their prior behavior and serial writer
 authority.
 
+Every parallel invocation requires both
+`--archive /absolute/path/to/original-release.zip` and
+`--expected-archive-sha256 <64-lowercase-hex>` from an externally trusted
+release descriptor or independent channel. The archive path must identify an
+absolute, regular, non-symlink file outside the extracted release; the release
+does not embed a recursive archive copy. This applies equally to diagnostic,
+discovery, and formal: authority differs by mode, but each mode materializes and
+executes archive-owned code. Before any archive verifier, ZIP inspection, or
+snapshot extraction, the coordinator hashes the raw complete archive and
+compares it with the trusted value. The epoch seals separate full expected and
+observed fields, and live coordinator/protocol sources must match the trusted
+archive identities before planning or worker launch.
+
+Production worker processes use Python isolated mode with only the captured
+snapshot's `evidence/` root inserted for evaluator imports. Each worker receives
+the sealed evaluator identity at spawn and recomputes the exact component
+digest from the read-only snapshot before its first `lane-ready` publication.
+
 The CLI passes the two frozen manifests and a sealed `RunKind` to the reviewed
 production coordinator. Diagnostic and discovery pass no result destinations
 and never acquire or claim result-writer authority. Discovery remains

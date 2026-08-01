@@ -269,6 +269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--source-codex-home", required=True, type=Path)
     parser.add_argument("--codex-executable", required=True, type=Path)
+    parser.add_argument("--archive", required=True, type=Path)
+    parser.add_argument("--expected-archive-sha256", required=True)
     parser.add_argument(
         "--run-kind",
         required=True,
@@ -290,6 +292,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             strict=True
         ),
         codex_executable=arguments.codex_executable.resolve(strict=True),
+        archive_path=arguments.archive.resolve(strict=True),
+        expected_archive_sha256=arguments.expected_archive_sha256,
         requested_model="no-model-integration",
         requested_reasoning_effort="minimal",
         resume_run_root=(
