@@ -67,7 +67,11 @@ from scripts.workflow_eval_sharding import (
 )
 
 
-CENTRAL_CLI = REPOSITORY_ROOT / "wiki_cli.py"
+CENTRAL_CLI = (
+    REPOSITORY_ROOT / "wiki_cli.py"
+    if _VERIFIED_SOURCE_CAPABILITY is None
+    else None
+)
 CENTRAL_COMMAND = (
     'python3 "${LLMWIKI_ROOT}/wiki_cli.py" '
     'observe --wiki-root "${LLMWIKI_ROOT}"'
@@ -3413,6 +3417,10 @@ def _run_case_impl(
     execution_sink: Callable[[CaseExecution], None] | None,
     workspace_parent: Path | None,
 ) -> dict:
+    if _VERIFIED_SOURCE_CAPABILITY is not None and runtime_factory is None:
+        raise CaseInfrastructureFailure(
+            "verified evaluator requires a runtime factory"
+        )
     gate_registered = False
     setup_primary: BaseException | None = None
     try:

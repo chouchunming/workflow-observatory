@@ -174,10 +174,16 @@ compares it with the trusted value. The epoch seals separate full expected and
 observed fields, and live coordinator/protocol sources must match the trusted
 archive identities before planning or worker launch.
 
-Production worker processes use Python isolated mode with only the captured
-snapshot's `evidence/` root inserted for evaluator imports. Each worker receives
-the sealed evaluator identity at spawn and recomputes the exact component
-digest from the read-only snapshot before its first `lane-ready` publication.
+Production worker processes use Python isolated no-site mode. Before any
+captured evaluator import, a stdlib-only bootstrap descriptor-reads the fixed
+evaluator origins, compares their exact component digest with the sealed
+identity, and retains the verified bytes behind a controlled loader. The
+snapshot is never added to `sys.path`. Each worker completes this check before
+its first `lane-ready` publication.
+
+Production Marketplace staging receives the sealed `marketplace_sha256`,
+copies the captured files into the private case tree, and verifies the exact
+staged component digest before the CLI or skills can be used.
 
 The CLI passes the two frozen manifests and a sealed `RunKind` to the reviewed
 production coordinator. Diagnostic and discovery pass no result destinations

@@ -607,8 +607,14 @@ def scan_attempts(
 ) -> tuple[AttemptRecord, ...]: ...
 def stage_marketplace_for_case(
     *, read_only_snapshot: Path, destination: Path,
+    expected_marketplace_sha256: str | None = None,
 ) -> Path: ...
 ```
+
+Generic test callers may omit `expected_marketplace_sha256`. Production always
+passes `plan.fingerprints.marketplace_sha256`; staging compares that sealed
+identity with the component digest of the exact copied tree and removes the
+destination on mismatch before any CLI or skill use.
 
 The exact E1/E2/E3/APP mapping remains the approved 8/8/8/4 table in
 `docs/parallel-evaluation-plan.md`. Plan rows remain in canonical manifest

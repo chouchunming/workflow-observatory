@@ -1396,6 +1396,42 @@ class Task9EvalRunnerTests(unittest.TestCase):
                 calls,
             )
 
+    def test_verified_evaluator_rejects_legacy_runtime_before_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary).resolve(strict=True)
+            case = {
+                "id": "retained-case",
+                "fixture": "empty",
+                "turns": [{"prompt": "one"}],
+            }
+
+            with (
+                mock.patch.object(
+                    task9_eval,
+                    "_VERIFIED_SOURCE_CAPABILITY",
+                    object(),
+                ),
+                mock.patch.object(
+                    task9_eval, "build_case_fixture"
+                ) as fixture,
+                mock.patch.object(
+                    task9_eval, "build_payload_audit"
+                ) as audit,
+            ):
+                with self.assertRaisesRegex(
+                    task9_eval.CaseInfrastructureFailure,
+                    "verified evaluator requires a runtime factory",
+                ):
+                    task9_eval._run_case(
+                        case,
+                        destination,
+                        lifecycle=False,
+                        runtime_factory=None,
+                    )
+
+            fixture.assert_not_called()
+            audit.assert_not_called()
+
     def test_execute_case_transport_requires_checkpoint_for_app_server(self):
         case = {
             "id": "late-trigger",
