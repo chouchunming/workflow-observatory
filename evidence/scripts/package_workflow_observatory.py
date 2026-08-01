@@ -262,6 +262,19 @@ def _evidence_files(
     return sorted(rows, key=lambda row: row[0])
 
 
+_TEXT_PATH_BOUNDARY = rb"(?=$|/|[\s`\"'()<>\[\]{},;:])"
+
+
+def _replace_path_prefix(
+    data: bytes, source: bytes, target: bytes
+) -> tuple[bytes, int]:
+    return re.subn(
+        re.escape(source) + _TEXT_PATH_BOUNDARY,
+        target,
+        data,
+    )
+
+
 def _normalize_text(data: bytes, origin: str) -> tuple[bytes, list[str]]:
     replacements = (
         (str(REPOSITORY_ROOT).encode("utf-8"), b"${LLMWIKI_ROOT}", "repository-root"),
@@ -275,12 +288,13 @@ def _normalize_text(data: bytes, origin: str) -> tuple[bytes, list[str]]:
     normalized = data
     applied = []
     for source, target, label in replacements:
-        if source in normalized:
+        updated, count = _replace_path_prefix(normalized, source, target)
+        if count:
             if origin not in PATH_NORMALIZATION_DECLARATIONS[label]:
                 raise PackageError(
                     f"undeclared path normalization `{label}`: {origin}"
                 )
-            normalized = normalized.replace(source, target)
+            normalized = updated
             applied.append(label)
     temporary_pattern = re.compile(
         rb"/private/var/" rb"folders/[^\s`\"']+/T/"

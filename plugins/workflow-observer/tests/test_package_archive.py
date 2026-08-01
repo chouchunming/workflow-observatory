@@ -353,6 +353,38 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(PackageError, "undeclared path normalization"):
             build_archive(self.source, self.archive, self.evidence)
 
+    def test_archive_rejects_user_home_prefix_collision(self):
+        plan = self.source / "docs/parallel-evaluation-mvp-implementation-plan.md"
+        plan.write_text(
+            plan.read_text(encoding="utf-8")
+            + f"\nprivate={Path.home()}-backup/private.txt\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PackageError, "personal path"):
+            build_archive(self.source, self.archive, self.evidence)
+
+    def test_archive_normalizes_codex_prefix_collision_via_home(self):
+        plan = self.source / "docs/parallel-evaluation-mvp-implementation-plan.md"
+        plan.write_text(
+            plan.read_text(encoding="utf-8")
+            + f"\n"
+            + f"codex-backup={Path.home() / '.codex-backup' / 'private.txt'}\n"
+            + f"codex-exact={Path.home() / '.codex' / 'skills'}\n"
+            + f"home-exact={Path.home() / 'private.txt'}\n",
+            encoding="utf-8",
+        )
+        build_archive(self.source, self.archive, self.evidence)
+        member = (
+            "workflow-observatory/docs/"
+            "parallel-evaluation-mvp-implementation-plan.md"
+        )
+        with zipfile.ZipFile(self.archive) as bundle:
+            packaged = bundle.read(member)
+        self.assertIn(b"codex-backup=${HOME}/.codex-backup/private.txt", packaged)
+        self.assertNotIn(b"${CODEX_HOME}-backup", packaged)
+        self.assertIn(b"codex-exact=${CODEX_HOME}/skills", packaged)
+        self.assertIn(b"home-exact=${HOME}/private.txt", packaged)
+
     def test_archive_fsyncs_regular_file_before_directory_replace(self):
         modes = []
         real_fsync = os.fsync
