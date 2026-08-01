@@ -14571,6 +14571,7 @@ def production_coordinator_dependencies(
         return (
             sys.executable,
             "-I",
+            "-S",
             "-c",
             _ISOLATED_WORKER_BOOTSTRAP,
             str(snapshot_evidence),
@@ -14649,6 +14650,12 @@ _PARALLEL_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
 _PARALLEL_ARCHIVE_ROOT = "workflow-observatory"
 _ISOLATED_WORKER_BOOTSTRAP = (
     "import runpy,sys;"
+    "assert sys.flags.no_site==1;"
+    "assert 'site' not in sys.modules;"
+    "assert 'sitecustomize' not in sys.modules;"
+    "assert not any('site-packages' in p for p in sys.path);"
+    "assert not any(n=='scripts' or n.startswith('scripts.') "
+    "for n in sys.modules);"
     "snapshot_evidence=sys.argv.pop(1);"
     "sys.path.insert(0,snapshot_evidence);"
     "runpy.run_module('scripts.run_observing_workflows_eval_worker',"

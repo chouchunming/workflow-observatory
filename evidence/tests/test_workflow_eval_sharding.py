@@ -15808,7 +15808,9 @@ class CoordinatorStateTests(unittest.TestCase):
                 "E1", self.plan, self._options(), self.root / "snapshot"
             )
         )
-        self.assertEqual((sys.executable, "-I", "-c"), command[:3])
+        self.assertEqual(
+            (sys.executable, "-I", "-S", "-c"), command[:4]
+        )
         self.assertIn(
             str((self.root / "snapshot" / "evidence").resolve()),
             command,
@@ -15827,6 +15829,63 @@ class CoordinatorStateTests(unittest.TestCase):
         signature = inspect.signature(sharding.worker_main)
         self.assertEqual(["argv"], list(signature.parameters))
         self.assertIsNone(signature.parameters["argv"].default)
+
+    def test_worker_interpreter_excludes_site_and_conflicting_evaluator(self):
+        dependencies = sharding.production_coordinator_dependencies(
+            snapshot_root=self.root / "snapshot"
+        )
+        command = tuple(
+            dependencies.worker_command_factory(
+                "E1", self.plan, self._options(), self.root / "snapshot"
+            )
+        )
+        conflict = self.root / "conflicting-python-environment"
+        (conflict / "scripts").mkdir(parents=True)
+        (conflict / "sitecustomize.py").write_text(
+            "raise RuntimeError('conflicting sitecustomize loaded')\n",
+            encoding="ascii",
+        )
+        (conflict / "scripts/__init__.py").write_text(
+            "NON_SNAPSHOT_EVALUATOR = True\n", encoding="ascii"
+        )
+        (conflict / "scripts/workflow_eval_sharding.py").write_text(
+            "raise RuntimeError('non-snapshot evaluator loaded')\n",
+            encoding="ascii",
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(conflict)
+        code_index = command.index("-c")
+        probe = (
+            "import json,sys;"
+            "print(json.dumps({"
+            "'no_site':sys.flags.no_site,"
+            "'site_loaded':'site' in sys.modules,"
+            "'sitecustomize_loaded':'sitecustomize' in sys.modules,"
+            "'site_packages':any('site-packages' in p "
+            "for p in sys.path),"
+            "'evaluator_loaded':any(n == 'scripts' or "
+            "n.startswith('scripts.') for n in sys.modules)"
+            "},sort_keys=True))"
+        )
+        completed = subprocess.run(
+            (*command[: code_index + 1], probe),
+            cwd=conflict,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            {
+                "evaluator_loaded": False,
+                "no_site": 1,
+                "site_loaded": False,
+                "site_packages": False,
+                "sitecustomize_loaded": False,
+            },
+            json.loads(completed.stdout),
+        )
 
     def test_every_parallel_mode_rejects_missing_trusted_archive_identity(self):
         for run_kind in ("diagnostic", "discovery", "formal"):
@@ -16024,9 +16083,10 @@ class CoordinatorStateTests(unittest.TestCase):
                 (
                     sys.executable,
                     "-I",
+                    "-S",
                     "-c",
                 ),
-                command[:3],
+                command[:4],
             )
         finally:
             if machine.phase in ("preflight", "running", "cancelling"):
