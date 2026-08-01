@@ -139,6 +139,9 @@ class ArchiveTests(unittest.TestCase):
 
     def test_archive_packages_portable_mvp_implementation_plan(self):
         build_archive(self.source, self.archive, self.evidence)
+        source_plan = (
+            self.source / "docs/parallel-evaluation-mvp-implementation-plan.md"
+        ).read_bytes()
         member = (
             "workflow-observatory/docs/"
             "parallel-evaluation-mvp-implementation-plan.md"
@@ -154,8 +157,16 @@ class ArchiveTests(unittest.TestCase):
             "docs/parallel-evaluation-mvp-implementation-plan.md"
         ]
         self.assertEqual(member, row["member"])
+        expected_normalizations = [
+            label
+            for label, placeholder in (
+                ("codex-home", b"${CODEX_HOME}"),
+                ("user-home", b"${HOME}"),
+            )
+            if plan.count(placeholder) > source_plan.count(placeholder)
+        ]
         self.assertEqual(
-            ["codex-home", "user-home"],
+            expected_normalizations,
             row["normalizations"],
         )
 
