@@ -9,6 +9,8 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Sequence
 
 from scripts import run_observing_workflows_eval_worker as worker
@@ -113,10 +115,12 @@ class _NoModelCaseDriver:
         plan: sharding.EpochPlan,
         snapshot_root: Path,
         collision_case_id: str | None,
+        execute_staged_cli_probe: bool,
     ) -> None:
         self._plan = plan
         self._marketplace = worker._captured_marketplace_root(snapshot_root)
         self._collision_case_id = collision_case_id
+        self._execute_staged_cli_probe = execute_staged_cli_probe
 
     def __call__(
         self,
@@ -142,7 +146,35 @@ class _NoModelCaseDriver:
         staged = sharding.stage_marketplace_for_case(
             read_only_snapshot=self._marketplace,
             destination=paths.staging / "marketplace",
+            expected_marketplace_sha256=(
+                self._plan.fingerprints.marketplace_sha256
+            ),
         )
+        if self._execute_staged_cli_probe:
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        staged
+                        / "plugins/workflow-observer/scripts/"
+                        "workflow_observer_cli.py"
+                    ),
+                ],
+                cwd=paths.workspace,
+                env={
+                    "HOME": str(paths.home),
+                    "PATH": os.environ.get("PATH", ""),
+                    "TMPDIR": str(paths.tmp),
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if probe.returncode != 0:
+                raise ValueError("staged CLI execution probe failed")
         worker._write_portable_store_config(paths.home, paths.store)
         installed = sharding.install_case_auth(
             bootstrap=worker._discover_auth_bootstrap(paths),
@@ -217,6 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--epoch-id", required=True)
     parser.add_argument("--resume-plan-hex", required=True)
     parser.add_argument("--inject-collision", action="store_true")
+    parser.add_argument("--execute-staged-cli-probe", action="store_true")
     arguments = parser.parse_args(argv)
 
     run_root = sharding.canonical_run_root(arguments.run_root)
@@ -254,6 +287,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan=plan,
             snapshot_root=arguments.snapshot_root,
             collision_case_id=collision_case_id,
+            execute_staged_cli_probe=(
+                arguments.execute_staged_cli_probe
+            ),
         ),
     )
     with _worker_writer_poison(run_root, arguments.lane):

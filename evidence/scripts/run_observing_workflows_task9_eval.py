@@ -26,7 +26,10 @@ import time
 from typing import Literal, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-if str(REPOSITORY_ROOT) not in sys.path:
+_VERIFIED_SOURCE_CAPABILITY = sys.modules.get(
+    "_workflow_observatory_verified_sources"
+)
+if _VERIFIED_SOURCE_CAPABILITY is None and str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tests.observing_workflows_eval_harness import (

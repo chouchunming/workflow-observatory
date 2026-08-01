@@ -2183,6 +2183,25 @@ class RuntimeIsolationTests(unittest.TestCase):
         root.chmod(0o555)
 
     @staticmethod
+    def _marketplace_digest(root: Path) -> str:
+        rows = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if relative == "SHA256SUMS.json" or relative.startswith(
+                "evidence/"
+            ):
+                continue
+            rows.append(
+                (
+                    f"workflow-observatory/{relative}",
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+            )
+        return sharding.component_digest(tuple(rows))
+
+    @staticmethod
     def _assignment(mode: str, ordinal: int, case_id: str):
         return sharding.CaseAssignment(
             key=sharding.CaseKey(mode, ordinal, case_id),
@@ -2214,10 +2233,20 @@ class RuntimeIsolationTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _plan(assignment, run_kind="diagnostic"):
+    def _plan(
+        assignment, run_kind="diagnostic", marketplace_root=None
+    ):
         epoch_id = "e" * 64
         fingerprints = replace(
-            input_fingerprints(run_kind), epoch_id=epoch_id
+            input_fingerprints(run_kind),
+            epoch_id=epoch_id,
+            marketplace_sha256=(
+                input_fingerprints(run_kind).marketplace_sha256
+                if marketplace_root is None
+                else RuntimeIsolationTests._marketplace_digest(
+                    Path(marketplace_root)
+                )
+            ),
         )
         return sharding.EpochPlan(
             schema_version=1,
@@ -2627,6 +2656,78 @@ class RuntimeIsolationTests(unittest.TestCase):
             self.assertEqual(attempt_2.root / "start.json", attempt_2.start)
             self.assertEqual(attempt_2.root / "terminal.json", attempt_2.terminal)
 
+    def test_staging_rejects_bytes_outside_sealed_marketplace_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            snapshot = root / "captured-marketplace"
+            self._write_read_only_marketplace(snapshot)
+            expected = self._marketplace_digest(snapshot)
+            staged = sharding.stage_marketplace_for_case(
+                read_only_snapshot=snapshot,
+                destination=root / "matching-stage",
+                expected_marketplace_sha256=expected,
+            )
+            self.assertTrue(staged.is_dir())
+
+            changed = snapshot / "README.md"
+            changed.chmod(0o644)
+            changed.write_text("same-mode replacement\n", encoding="ascii")
+            changed.chmod(0o444)
+            rejected = root / "rejected-stage"
+            with self.assertRaisesRegex(
+                ValueError, "captured marketplace identity differs"
+            ):
+                sharding.stage_marketplace_for_case(
+                    read_only_snapshot=snapshot,
+                    destination=rejected,
+                    expected_marketplace_sha256=expected,
+                )
+            self.assertFalse(rejected.exists())
+
+    def test_production_runtime_passes_sealed_marketplace_identity_to_stage(self):
+        from scripts import run_observing_workflows_eval_worker as worker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            run_root = root / "run"
+            run_root.mkdir(mode=0o700)
+            snapshot = root / "captured-marketplace"
+            self._write_read_only_marketplace(snapshot)
+            assignment = self._assignment("forward", 1, "shared-id")
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
+            paths = sharding.paths_for_case(run_root, assignment)
+            paths.workspace.mkdir(parents=True, mode=0o700)
+            executable = root / "fake-codex"
+            executable.write_text("#!/bin/sh\n", encoding="ascii")
+            executable.chmod(0o700)
+            config = self._transport_config(executable)
+            factory = worker.build_production_runtime_factory(
+                snapshot_root=snapshot,
+                transport_config=config,
+                plan=plan,
+            )
+
+            with mock.patch.object(
+                worker,
+                "stage_marketplace_for_case",
+                side_effect=RuntimeError("staging boundary reached"),
+            ) as stage, self.assertRaisesRegex(
+                RuntimeError, "staging boundary reached"
+            ):
+                factory(
+                    assignment=assignment,
+                    manifest_case={"id": "shared-id"},
+                    paths=paths,
+                    transport_config=config,
+                )
+
+            self.assertEqual(
+                plan.fingerprints.marketplace_sha256,
+                stage.call_args.kwargs["expected_marketplace_sha256"],
+            )
+
     def test_production_runtime_factory_uses_writable_stage(self):
         from scripts import run_observing_workflows_eval_worker as worker
         from scripts import run_observing_workflows_task9_eval as task9_eval
@@ -2647,7 +2748,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             auth.write_bytes(b'{"token":"TEST_ONLY_SECRET"}\n')
             auth.chmod(0o600)
             assignment = self._assignment("forward", 1, "shared-id")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -2760,7 +2863,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             snapshot = root / "captured-input" / "workflow-observatory"
             self._write_read_only_marketplace(snapshot)
             assignment = self._assignment("forward", 1, "shared-id")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = self._prepare_bootstrap(root, plan)
             paths = sharding.paths_for_case(run_root, assignment)
             executable = root / "fake-codex"
@@ -2889,7 +2994,9 @@ class RuntimeIsolationTests(unittest.TestCase):
                 directory.chmod(0o555)
 
             assignment = self._assignment("forward", 1, "shared-id")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=marketplace
+            )
             bootstrap = self._prepare_bootstrap(root, plan)
             paths = sharding.paths_for_case(run_root, assignment)
             executable = root / "fake-codex"
@@ -3218,7 +3325,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             coordinator = run_root / "coordinator"
             coordinator.mkdir(mode=0o700)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -3271,7 +3380,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             executable.chmod(0o700)
             config = self._transport_config(executable)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             with self.assertRaisesRegex(ValueError, "canonical|symlink"):
                 sharding.paths_for_case(run_root, assignment)
             canonical_paths = sharding.paths_for_case(target / "run", assignment)
@@ -3424,7 +3535,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             coordinator = run_root / "coordinator"
             coordinator.mkdir(mode=0o700)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -3483,7 +3596,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             auth.write_text("{}\n", encoding="utf-8")
             auth.chmod(0o600)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -3539,7 +3654,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             auth.write_text("{}\n", encoding="utf-8")
             auth.chmod(0o600)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -3594,7 +3711,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             auth.write_text("{}\n", encoding="utf-8")
             auth.chmod(0o600)
             assignment = self._assignment("forward", 1, "case")
-            plan = self._plan(assignment)
+            plan = self._plan(
+                assignment, marketplace_root=snapshot
+            )
             bootstrap = sharding.prepare_auth_bootstrap(
                 source_codex_home=source_home,
                 coordinator_root=coordinator,
@@ -15886,6 +16005,250 @@ class CoordinatorStateTests(unittest.TestCase):
             },
             json.loads(completed.stdout),
         )
+
+    def test_worker_rejects_tampered_transitive_source_before_execution(self):
+        repository = Path(__file__).resolve().parents[2]
+        coordinator_root = self.run_root / "coordinator"
+        coordinator_root.mkdir(parents=True, mode=0o700)
+        self.run_root.chmod(0o700)
+        snapshot_root = coordinator_root / "captured-snapshot"
+        archive_path, trusted_archive_sha256 = trusted_test_archive(
+            repository
+        )
+        _archive, capture_digests, _inventory, _inventory_bytes = (
+            sharding._verified_parallel_archive_inputs(
+                repository,
+                archive_path=archive_path,
+                expected_archive_sha256=trusted_archive_sha256,
+            )
+        )
+        sharding._materialize_parallel_snapshot(
+            repository_root=repository,
+            snapshot_root=snapshot_root,
+            expected_digests=capture_digests,
+            archive_path=archive_path,
+            expected_archive_sha256=trusted_archive_sha256,
+        )
+        plan = sharding.build_epoch_plan(
+            run_kind="discovery",
+            manifests=self.manifests,
+            fingerprints=replace(
+                input_fingerprints("discovery"),
+                expected_archive_sha256=capture_digests[0],
+                archive_sha256=capture_digests[0],
+                marketplace_sha256=capture_digests[1],
+                evaluator_sha256=capture_digests[2],
+            ),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(plan),
+        )
+        resume = sharding.ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=tuple(
+                assignment.key for assignment in plan.assignments
+            ),
+            invalid=(),
+        )
+        dependencies = sharding.production_coordinator_dependencies(
+            snapshot_root=snapshot_root
+        )
+        command_suffix = (
+            "--resume-plan-hex",
+            sharding.canonical_config_bytes(
+                sharding._encode_resume_plan_record(resume)
+            ).hex(),
+        )
+        tampered_origins = sharding._PARALLEL_EVALUATOR_ORIGINS
+        for index, origin in enumerate(tampered_origins):
+            with self.subTest(origin=origin):
+                if index:
+                    for path in sorted(
+                        snapshot_root.rglob("*"), reverse=True
+                    ):
+                        if path.is_dir():
+                            path.chmod(0o755)
+                    snapshot_root.chmod(0o755)
+                    shutil.rmtree(snapshot_root)
+                    sharding._materialize_parallel_snapshot(
+                        repository_root=repository,
+                        snapshot_root=snapshot_root,
+                        expected_digests=capture_digests,
+                        archive_path=archive_path,
+                        expected_archive_sha256=trusted_archive_sha256,
+                    )
+                marker = self.root / f"tampered-source-executed-{index}"
+                source = snapshot_root / "evidence" / origin
+                source.chmod(0o644)
+                source.write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('executed\\n', "
+                    "encoding='ascii')\n"
+                    "raise RuntimeError('tampered evaluator executed')\n",
+                    encoding="ascii",
+                )
+                source.chmod(0o444)
+                command = tuple(
+                    dependencies.worker_command_factory(
+                        "E1", plan, self._options(), snapshot_root
+                    )
+                ) + command_suffix
+
+                completed = subprocess.run(
+                    command,
+                    cwd=self.root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertNotEqual(0, completed.returncode)
+                self.assertIn(
+                    "captured evaluator identity differs", completed.stderr
+                )
+                self.assertFalse(marker.exists())
+
+    def test_worker_executes_retained_source_after_post_capture_swap(self):
+        repository = Path(__file__).resolve().parents[2]
+        coordinator_root = self.run_root / "coordinator"
+        coordinator_root.mkdir(parents=True, mode=0o700)
+        self.run_root.chmod(0o700)
+        snapshot_root = coordinator_root / "captured-snapshot"
+        archive_path, trusted_archive_sha256 = trusted_test_archive(
+            repository
+        )
+        _archive, capture_digests, _inventory, _inventory_bytes = (
+            sharding._verified_parallel_archive_inputs(
+                repository,
+                archive_path=archive_path,
+                expected_archive_sha256=trusted_archive_sha256,
+            )
+        )
+        sharding._materialize_parallel_snapshot(
+            repository_root=repository,
+            snapshot_root=snapshot_root,
+            expected_digests=capture_digests,
+            archive_path=archive_path,
+            expected_archive_sha256=trusted_archive_sha256,
+        )
+        capture_ready = self.root / "bootstrap-capture-ready"
+        release_import = self.root / "release-retained-import"
+        initializer = snapshot_root / "evidence/scripts/__init__.py"
+        initializer.chmod(0o644)
+        initializer.write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            f"ready = Path({str(capture_ready)!r})\n"
+            f"release = Path({str(release_import)!r})\n"
+            "ready.write_text('ready\\n', encoding='ascii')\n"
+            "deadline = time.monotonic() + 5.0\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        raise TimeoutError('test import release timed out')\n"
+            "    time.sleep(0.01)\n",
+            encoding="ascii",
+        )
+        initializer.chmod(0o444)
+        rows = sharding._validate_snapshot_root(snapshot_root)
+        captured = {
+            relative: digest
+            for relative, kind, _mode, _size, digest in rows
+            if kind == "file"
+        }
+        evaluator_digest = sharding.component_digest(
+            tuple(
+                (
+                    f"workflow-observatory/evidence/{origin}",
+                    captured[f"evidence/{origin}"],
+                )
+                for origin in sharding._PARALLEL_EVALUATOR_ORIGINS
+            )
+        )
+        plan = sharding.build_epoch_plan(
+            run_kind="discovery",
+            manifests=self.manifests,
+            fingerprints=replace(
+                input_fingerprints("discovery"),
+                expected_archive_sha256=capture_digests[0],
+                archive_sha256=capture_digests[0],
+                marketplace_sha256=capture_digests[1],
+                evaluator_sha256=evaluator_digest,
+            ),
+        )
+        sharding._atomic_write_record(
+            coordinator_root / "epoch-plan.json",
+            sharding._encode_epoch_plan_record(plan),
+        )
+        resume = sharding.ResumePlan(
+            run_kind=plan.run_kind,
+            reusable=(),
+            pending=tuple(
+                assignment.key for assignment in plan.assignments
+            ),
+            invalid=(),
+        )
+        dependencies = sharding.production_coordinator_dependencies(
+            snapshot_root=snapshot_root
+        )
+        command = tuple(
+            dependencies.worker_command_factory(
+                "E1", plan, self._options(), snapshot_root
+            )
+        ) + (
+            "--resume-plan-hex",
+            sharding.canonical_config_bytes(
+                sharding._encode_resume_plan_record(resume)
+            ).hex(),
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=self.root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not capture_ready.exists():
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(
+                        "worker exited before retained-source barrier: "
+                        f"stdout={stdout!r} stderr={stderr!r}"
+                    )
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    self.fail(
+                        "retained-source barrier timed out: "
+                        f"stdout={stdout!r} stderr={stderr!r}"
+                    )
+                time.sleep(0.01)
+            malicious_marker = self.root / "post-capture-source-executed"
+            worker_source = snapshot_root / (
+                "evidence/scripts/run_observing_workflows_eval_worker.py"
+            )
+            worker_source.chmod(0o644)
+            worker_source.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(malicious_marker)!r}).write_text("
+                "'executed\\n', encoding='ascii')\n"
+                "raise RuntimeError('post-capture source executed')\n",
+                encoding="ascii",
+            )
+            worker_source.chmod(0o444)
+            release_import.write_text("release\n", encoding="ascii")
+            stdout, stderr = process.communicate(timeout=10.0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertNotEqual(0, process.returncode)
+        self.assertIn("captured evaluator identity differs", stderr)
+        self.assertFalse(malicious_marker.exists())
 
     def test_every_parallel_mode_rejects_missing_trusted_archive_identity(self):
         for run_kind in ("diagnostic", "discovery", "formal"):

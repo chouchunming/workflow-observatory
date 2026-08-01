@@ -5655,11 +5655,37 @@ def _copy_staged_directory(
         raise ValueError("captured marketplace contains a special file")
 
 
+def _captured_marketplace_component_digest(root: Path) -> str:
+    entries = []
+    for relative, kind, _mode, _size, digest in _capture_directory_rows(root):
+        if (
+            kind != "file"
+            or relative == "SHA256SUMS.json"
+            or relative.startswith("evidence/")
+        ):
+            continue
+        if not _is_sha256(digest):
+            raise ValueError("captured marketplace file digest is invalid")
+        entries.append(
+            (f"{_PARALLEL_ARCHIVE_ROOT}/{relative}", digest)
+        )
+    return component_digest(tuple(entries))
+
+
 def stage_marketplace_for_case(
-    *, read_only_snapshot: Path, destination: Path
+    *,
+    read_only_snapshot: Path,
+    destination: Path,
+    expected_marketplace_sha256: str | None = None,
 ) -> Path:
     source = Path(read_only_snapshot)
     destination = Path(destination)
+    if expected_marketplace_sha256 is not None and not _is_sha256(
+        expected_marketplace_sha256
+    ):
+        raise ValueError(
+            "expected marketplace SHA-256 must be a full lowercase digest"
+        )
     try:
         source_metadata = source.lstat()
     except OSError:
@@ -5677,6 +5703,12 @@ def stage_marketplace_for_case(
         destination.mkdir(mode=0o700)
         destination.chmod(0o700)
         _copy_staged_directory(source, destination, PurePosixPath())
+        if (
+            expected_marketplace_sha256 is not None
+            and _captured_marketplace_component_digest(destination)
+            != expected_marketplace_sha256
+        ):
+            raise ValueError("captured marketplace identity differs")
     except BaseException as error:
         if not is_indeterminate_descriptor_close(error):
             try:
@@ -14575,6 +14607,11 @@ def production_coordinator_dependencies(
             "-c",
             _ISOLATED_WORKER_BOOTSTRAP,
             str(snapshot_evidence),
+            json.dumps(
+                _PARALLEL_EVALUATOR_ORIGINS,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
             "--lane",
             lane,
             "--run-root",
@@ -14648,19 +14685,334 @@ _PARALLEL_LIVE_MARKETPLACE_ORIGINS = (
 )
 _PARALLEL_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
 _PARALLEL_ARCHIVE_ROOT = "workflow-observatory"
-_ISOLATED_WORKER_BOOTSTRAP = (
-    "import runpy,sys;"
-    "assert sys.flags.no_site==1;"
-    "assert 'site' not in sys.modules;"
-    "assert 'sitecustomize' not in sys.modules;"
-    "assert not any('site-packages' in p for p in sys.path);"
-    "assert not any(n=='scripts' or n.startswith('scripts.') "
-    "for n in sys.modules);"
-    "snapshot_evidence=sys.argv.pop(1);"
-    "sys.path.insert(0,snapshot_evidence);"
-    "runpy.run_module('scripts.run_observing_workflows_eval_worker',"
-    "run_name='__main__')"
+_ISOLATED_WORKER_BOOTSTRAP = r"""
+import hashlib
+import importlib
+import importlib.abc
+import importlib.machinery
+import json
+import os
+import stat
+import sys
+import types
+
+assert sys.flags.no_site == 1
+assert "site" not in sys.modules
+assert "sitecustomize" not in sys.modules
+assert not any("site-packages" in path for path in sys.path)
+assert not any(
+    name == "scripts" or name.startswith("scripts.")
+    for name in sys.modules
 )
+assert not any(
+    name == "tests" or name.startswith("tests.")
+    for name in sys.modules
+)
+assert "_workflow_observatory_verified_sources" not in sys.modules
+
+snapshot_evidence = sys.argv.pop(1)
+encoded_origins = sys.argv.pop(1)
+if (
+    not os.path.isabs(snapshot_evidence)
+    or os.path.normpath(snapshot_evidence) != snapshot_evidence
+    or os.path.realpath(snapshot_evidence) != snapshot_evidence
+):
+    raise ValueError("captured evaluator root is non-canonical")
+
+
+def required_argument(name):
+    positions = [
+        index for index, value in enumerate(sys.argv) if value == name
+    ]
+    if len(positions) != 1 or positions[0] + 1 >= len(sys.argv):
+        raise ValueError(f"worker bootstrap requires exactly one {name}")
+    return sys.argv[positions[0] + 1]
+
+
+expected_evaluator_sha256 = required_argument(
+    "--expected-evaluator-sha256"
+)
+snapshot_root = required_argument("--snapshot-root")
+if (
+    len(expected_evaluator_sha256) != 64
+    or any(
+        character not in "0123456789abcdef"
+        for character in expected_evaluator_sha256
+    )
+):
+    raise ValueError(
+        "expected evaluator SHA-256 must be a full lowercase digest"
+    )
+if (
+    not os.path.isabs(snapshot_root)
+    or os.path.normpath(snapshot_root) != snapshot_root
+    or os.path.realpath(snapshot_root) != snapshot_root
+    or os.path.join(snapshot_root, "evidence") != snapshot_evidence
+):
+    raise ValueError("worker snapshot argument differs from evaluator root")
+for path in sys.path:
+    if not path:
+        continue
+    resolved = os.path.realpath(path)
+    if resolved in (snapshot_root, snapshot_evidence):
+        raise ValueError("captured snapshot must be absent from sys.path")
+
+try:
+    origins = json.loads(encoded_origins)
+except (TypeError, json.JSONDecodeError):
+    raise ValueError("captured evaluator origins are invalid") from None
+if (
+    type(origins) is not list
+    or not origins
+    or any(type(origin) is not str for origin in origins)
+    or len(set(origins)) != len(origins)
+):
+    raise ValueError("captured evaluator origins are invalid")
+
+directory_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+file_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+per_source_cap = 16 * 1024 * 1024
+total_source_cap = 64 * 1024 * 1024
+
+
+def stable_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+base_descriptor = os.open(snapshot_evidence, directory_flags)
+try:
+    base_before = os.fstat(base_descriptor)
+    base_named = os.stat(snapshot_evidence, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(base_before.st_mode)
+        or stat.S_IMODE(base_before.st_mode) != 0o555
+        or base_before.st_uid != os.geteuid()
+        or stable_identity(base_before) != stable_identity(base_named)
+    ):
+        raise ValueError("captured evaluator root is unsafe")
+
+    retained_sources = {}
+    total_source_bytes = 0
+    for origin in origins:
+        parts = origin.split("/")
+        if (
+            not parts
+            or any(
+                not part or part in (".", "..") or "\\" in part
+                for part in parts
+            )
+            or not origin.endswith(".py")
+        ):
+            raise ValueError("captured evaluator origin is invalid")
+        parent_descriptor = os.dup(base_descriptor)
+        try:
+            for part in parts[:-1]:
+                child_descriptor = os.open(
+                    part, directory_flags, dir_fd=parent_descriptor
+                )
+                child_metadata = os.fstat(child_descriptor)
+                if (
+                    not stat.S_ISDIR(child_metadata.st_mode)
+                    or stat.S_IMODE(child_metadata.st_mode) != 0o555
+                    or child_metadata.st_uid != os.geteuid()
+                ):
+                    os.close(child_descriptor)
+                    raise ValueError(
+                        "captured evaluator directory is unsafe"
+                    )
+                os.close(parent_descriptor)
+                parent_descriptor = child_descriptor
+            filename = parts[-1]
+            named_before = os.stat(
+                filename,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            source_descriptor = os.open(
+                filename, file_flags, dir_fd=parent_descriptor
+            )
+            try:
+                opened = os.fstat(source_descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or stat.S_IMODE(opened.st_mode) != 0o444
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_size > per_source_cap
+                    or stable_identity(named_before)
+                    != stable_identity(opened)
+                ):
+                    raise ValueError("captured evaluator source is unsafe")
+                chunks = []
+                observed_size = 0
+                while True:
+                    chunk = os.read(source_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    observed_size += len(chunk)
+                    total_source_bytes += len(chunk)
+                    if (
+                        observed_size > per_source_cap
+                        or total_source_bytes > total_source_cap
+                    ):
+                        raise ValueError(
+                            "captured evaluator sources exceed their byte cap"
+                        )
+                    chunks.append(chunk)
+                after = os.fstat(source_descriptor)
+                named_after = os.stat(
+                    filename,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    observed_size != opened.st_size
+                    or stable_identity(opened) != stable_identity(after)
+                    or stable_identity(after)
+                    != stable_identity(named_after)
+                ):
+                    raise ValueError(
+                        "captured evaluator source changed while reading"
+                    )
+                retained_sources[origin] = b"".join(chunks)
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    base_after = os.fstat(base_descriptor)
+    base_named_after = os.stat(
+        snapshot_evidence, follow_symlinks=False
+    )
+    if (
+        stable_identity(base_before) != stable_identity(base_after)
+        or stable_identity(base_after) != stable_identity(base_named_after)
+    ):
+        raise ValueError("captured evaluator root changed while reading")
+finally:
+    os.close(base_descriptor)
+
+evaluator_rows = [
+    (
+        "workflow-observatory/evidence/" + origin,
+        hashlib.sha256(retained_sources[origin]).hexdigest(),
+    )
+    for origin in origins
+]
+digest_payload = json.dumps(
+    sorted(evaluator_rows), ensure_ascii=True, separators=(",", ":")
+).encode("ascii")
+observed_evaluator_sha256 = hashlib.sha256(digest_payload).hexdigest()
+if observed_evaluator_sha256 != expected_evaluator_sha256:
+    raise ValueError("captured evaluator identity differs")
+
+capability_name = "_workflow_observatory_verified_sources"
+capability = types.ModuleType(capability_name)
+
+
+def retained_source(origin):
+    if type(origin) is not str or origin not in retained_sources:
+        raise ValueError("requested retained evaluator source is unavailable")
+    return retained_sources[origin]
+
+
+capability.retained_source = retained_source
+capability.snapshot_root = snapshot_root
+capability.evaluator_sha256 = observed_evaluator_sha256
+sys.modules[capability_name] = capability
+
+
+def module_details(origin):
+    if origin == "scripts/__init__.py":
+        return "scripts", True
+    stem = origin[:-3]
+    if stem.startswith("scripts/") or stem.startswith("tests/"):
+        return stem.replace("/", "."), False
+    if "/" not in stem:
+        return stem, False
+    raise ValueError("captured evaluator module origin is invalid")
+
+
+retained_modules = {}
+for origin in origins:
+    module_name, is_package = module_details(origin)
+    if module_name in retained_modules:
+        raise ValueError("captured evaluator module is duplicated")
+    retained_modules[module_name] = (origin, is_package)
+
+
+class RetainedSourceLoader(importlib.abc.Loader):
+    def __init__(self, fullname, origin, is_package):
+        self.fullname = fullname
+        self.origin = origin
+        self.is_package = is_package
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        if module.__name__ != self.fullname:
+            raise ImportError("retained evaluator module name changed")
+        source_path = os.path.join(snapshot_evidence, self.origin)
+        module.__file__ = source_path
+        if self.is_package:
+            module.__path__ = []
+        code = compile(
+            retained_source(self.origin), source_path, "exec"
+        )
+        exec(code, module.__dict__)
+
+
+class RetainedSourceFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "tests":
+            spec = importlib.machinery.ModuleSpec(
+                fullname, loader=None, is_package=True
+            )
+            spec.submodule_search_locations = []
+            return spec
+        details = retained_modules.get(fullname)
+        if details is None:
+            return None
+        origin, is_package = details
+        loader = RetainedSourceLoader(fullname, origin, is_package)
+        spec = importlib.machinery.ModuleSpec(
+            fullname,
+            loader,
+            origin=os.path.join(snapshot_evidence, origin),
+            is_package=is_package,
+        )
+        spec.has_location = True
+        return spec
+
+
+sys.meta_path.insert(0, RetainedSourceFinder())
+worker = importlib.import_module(
+    "scripts.run_observing_workflows_eval_worker"
+)
+if any(
+    path
+    and os.path.realpath(path) in (snapshot_root, snapshot_evidence)
+    for path in sys.path
+):
+    raise ValueError("captured snapshot entered sys.path during import")
+raise SystemExit(worker.worker_main())
+"""
 
 
 def _require_trusted_archive_sha256(value: object) -> str:

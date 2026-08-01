@@ -282,39 +282,79 @@ def publish_progress_and_wait_for_ack(
 
 
 def _load_captured_evaluator(snapshot_root: Path) -> ModuleType:
-    try:
-        snapshot = Path(snapshot_root).resolve(strict=True)
-    except OSError:
-        raise ValueError("captured evaluator root is unavailable") from None
     relative = Path("evidence/scripts/run_observing_workflows_task9_eval.py")
-    candidates = (
-        snapshot / relative,
-        snapshot / "workflow-observatory" / relative,
+    capability = sys.modules.get(
+        "_workflow_observatory_verified_sources"
     )
-    matches = []
-    for candidate in candidates:
+    if capability is not None:
+        if type(capability) is not ModuleType:
+            raise ValueError("verified evaluator capability is invalid")
+        capability_root = getattr(capability, "snapshot_root", None)
+        capability_digest = getattr(
+            capability, "evaluator_sha256", None
+        )
+        retained_source = getattr(capability, "retained_source", None)
+        snapshot = Path(snapshot_root)
+        if (
+            type(capability_root) is not str
+            or not isinstance(capability_digest, str)
+            or len(capability_digest) != 64
+            or not callable(retained_source)
+            or str(snapshot) != capability_root
+        ):
+            raise ValueError("verified evaluator capability is invalid")
         try:
-            metadata = candidate.lstat()
+            source_bytes = retained_source(
+                "scripts/run_observing_workflows_task9_eval.py"
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "verified captured evaluator source is unavailable"
+            ) from None
+        if type(source_bytes) is not bytes:
+            raise ValueError(
+                "verified captured evaluator source is invalid"
+            )
+        source = snapshot / relative
+    else:
+        try:
+            snapshot = Path(snapshot_root).resolve(strict=True)
         except OSError:
-            continue
-        if (
-            stat.S_ISREG(metadata.st_mode)
-            and not stat.S_ISLNK(metadata.st_mode)
-            and stat.S_IMODE(metadata.st_mode) == 0o444
-        ):
-            matches.append(candidate)
-    if len(matches) != 1:
-        raise ValueError("captured evaluator source is missing or ambiguous")
-    source = matches[0]
-    try:
-        if (
-            source.resolve(strict=True) != source
-            or not source.is_relative_to(snapshot)
-        ):
-            raise ValueError("captured evaluator source is non-canonical")
-        source_bytes = source.read_bytes()
-    except OSError:
-        raise ValueError("captured evaluator source is unavailable") from None
+            raise ValueError("captured evaluator root is unavailable") from None
+        candidates = (
+            snapshot / relative,
+            snapshot / "workflow-observatory" / relative,
+        )
+        matches = []
+        for candidate in candidates:
+            try:
+                metadata = candidate.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISREG(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and stat.S_IMODE(metadata.st_mode) == 0o444
+            ):
+                matches.append(candidate)
+        if len(matches) != 1:
+            raise ValueError(
+                "captured evaluator source is missing or ambiguous"
+            )
+        source = matches[0]
+        try:
+            if (
+                source.resolve(strict=True) != source
+                or not source.is_relative_to(snapshot)
+            ):
+                raise ValueError(
+                    "captured evaluator source is non-canonical"
+                )
+            source_bytes = source.read_bytes()
+        except OSError:
+            raise ValueError(
+                "captured evaluator source is unavailable"
+            ) from None
     digest = hashlib.sha256(
         os.fsencode(str(source)) + b"\0" + source_bytes
     ).hexdigest()
@@ -1077,6 +1117,9 @@ class _ProductionRuntimeFactory:
             staged_marketplace = stage_marketplace_for_case(
                 read_only_snapshot=self._marketplace,
                 destination=paths.staging / _MARKETPLACE_RELATIVE,
+                expected_marketplace_sha256=(
+                    self._plan.fingerprints.marketplace_sha256
+                ),
             )
             staged_plugin = staged_marketplace / _PLUGIN_RELATIVE
             fixture_skills = _install_fixture_skills(

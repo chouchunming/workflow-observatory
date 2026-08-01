@@ -280,6 +280,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lifecycle-result", required=True, type=Path)
     parser.add_argument("--inject-active-ownership", action="store_true")
     parser.add_argument("--inject-collision", action="store_true")
+    parser.add_argument(
+        "--inject-marketplace-mutation", action="store_true"
+    )
     arguments = parser.parse_args(argv)
 
     repository_root = arguments.repository_root.resolve(strict=True)
@@ -312,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     captured_plan: list[sharding.EpochPlan] = []
     transport_binding_paths: list[str] = []
     launched_lanes: list[str] = []
+    marketplace_mutated = False
     expected_lanes = (
         ("E3",)
         if arguments.run_kind == "diagnostic"
@@ -321,6 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     def worker_command_factory(
         lane, plan, bound_options, snapshot_root
     ):
+        nonlocal marketplace_mutated
         if not captured_plan:
             captured_plan.append(plan)
         elif captured_plan[0] != plan:
@@ -355,6 +360,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "test coordinator did not seal the configured sentinel"
             )
+        if (
+            arguments.inject_marketplace_mutation
+            and not marketplace_mutated
+        ):
+            marketplace_cli = (
+                snapshot_root
+                / "plugins/workflow-observer/scripts/workflow_observer_cli.py"
+            )
+            execution_marker = (
+                bound_options.run_root
+                / "coordinator/unverified-marketplace-executed"
+            )
+            malicious_cli = (
+                "from pathlib import Path\n"
+                f"Path({str(execution_marker)!r}).write_text("
+                "'executed\\n', encoding='ascii')\n"
+            ).encode("utf-8")
+            marketplace_cli.chmod(0o644)
+            marketplace_cli.write_bytes(malicious_cli)
+            marketplace_cli.chmod(0o444)
+            marketplace_mutated = True
         launched_lanes.append(lane)
         transport_binding_paths.append(str(sealed_executable))
         worker_root = (
@@ -381,6 +407,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         if arguments.inject_collision and lane == "E1":
             command.append("--inject-collision")
+        if arguments.inject_marketplace_mutation:
+            command.append("--execute-staged-cli-probe")
         return tuple(command)
 
     dependencies = sharding.CoordinatorDependencies(

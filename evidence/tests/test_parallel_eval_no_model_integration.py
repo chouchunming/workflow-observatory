@@ -532,6 +532,27 @@ class ParallelNoModelIntegrationTests(unittest.TestCase):
         self.assertEqual([".keep"], self._result_inventory())
         self.assertFalse(self.sentinel_marker.exists())
 
+    def test_post_capture_marketplace_mutation_fails_before_case_use(self):
+        run_root, summary = self._run_coordinator(
+            "formal", extra=("--inject-marketplace-mutation",)
+        )
+
+        self.assertEqual("failed", summary["status"], summary)
+        self.assertEqual([], summary["sealed_keys"])
+        self.assertTrue(summary["all_workers_joined"])
+        self.assertEqual(
+            [],
+            list(run_root.glob("cases/*/output/no-model-environment.json")),
+        )
+        self.assertFalse(
+            (
+                run_root
+                / "coordinator/unverified-marketplace-executed"
+            ).exists()
+        )
+        self.assertEqual([".keep"], self._result_inventory())
+        self.assertFalse(self.sentinel_marker.exists())
+
     def test_production_worker_cli_exposes_no_test_driver_flag(self):
         completed = subprocess.run(
             [
