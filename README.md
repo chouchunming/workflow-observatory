@@ -21,9 +21,8 @@ automatically.
 
 ## Workflow Evolution Foundation v0.2
 
-The v0.2 foundation design is approved. Its implementation plan was revised on
-2026-08-02 after final focused external re-review and is awaiting focused
-approval of the Decision recurrence cohort-size amendment.
+The v0.2 foundation design and implementation plan are approved as of
+2026-08-02.
 Implementation has not started, and these capabilities are not part of the
 current released plugin.
 
@@ -50,11 +49,9 @@ A future proposal must cite both `snapshot_id` and `candidate_id`, and no live
 data baseline will run without separate approval.
 
 Review the approved
-[design](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
-and revised
-[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
-These links intentionally follow the review branch; pin them to the immutable
-external-approval commit before Task 1 begins.
+[design](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
+and
+[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
 
 ## Install from GitHub
 

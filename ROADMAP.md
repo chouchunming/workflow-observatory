@@ -28,10 +28,8 @@ are documented in
 
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
-Status: design approved; implementation plan revised after final focused
-external re-review and awaiting focused approval of the Decision recurrence
-cohort-size amendment as of 2026-08-02. Implementation has not started and is
-not included in the current release.
+Status: design and implementation plan approved as of 2026-08-02.
+Implementation has not started and is not included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -79,11 +77,9 @@ its evidence remains bound to one immutable Learning Snapshot. A bounded live
 data baseline is a separate approval gate after the fake-store acceptance suite.
 
 See the approved
-[v0.2 design](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
-and revised
-[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
-These links intentionally follow the review branch and must be pinned to the
-immutable external-approval commit before Task 1 starts.
+[v0.2 design](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
+and
+[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
 
 ## Next — concurrency and operability
 
