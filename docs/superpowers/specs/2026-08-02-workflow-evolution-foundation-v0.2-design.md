@@ -1,21 +1,24 @@
 # Workflow Evolution Foundation v0.2 Design
 
 Date: 2026-08-02
-Status: Draft for external review
-Review mode: Architecture, then adversarial
+Status: Approved for bounded foundation implementation planning
+Review mode: Architecture, then adversarial — complete
 
 ## Section status
 
 - Section 1 — Product boundary and components: Approved
 - Section 2 — Episode v2 and Decision Events: Approved baseline
-- Section 2 additive amendment — Workflow generation: Revised draft for approval
-- Section 3 — Learning Snapshot, comparability, and improvement candidates: Revised draft for approval
-- Error behavior, experiment lifecycle, and verification design: Not yet designed
+- Section 2 additive amendment — Workflow generation: Approved
+- Section 3 — Learning Snapshot, comparability, and improvement candidates: Approved
+- Evolution Proposal schema, experiment lifecycle, and formal acceptance
+  execution: Deferred to a later design
 
-This document is not implementation-ready. Sections marked Approved are the
-review baseline and must not be silently changed. Section 3 is the current
-review target. Later sections and an implementation plan require separate
-approval.
+Sections 1–3 are the approved baseline for a bounded foundation implementation
+plan and must not be silently changed. This approval authorizes planning for
+Episode v2, the Data Trust Gate, canonical snapshot input, Learning Snapshots,
+and deterministic candidates. It does not authorize production-code changes,
+Evolution Proposal creation, experiment execution, or formal acceptance
+publication.
 
 ## Purpose
 
@@ -34,8 +37,10 @@ Knowledge
 ```
 
 The first milestone analyzes the bounded history from 2026-07-15 through
-2026-08-02 and may create only read-only learning and proposal artifacts. It
-does not modify a workflow, create a pull request, or execute an experiment.
+2026-08-02 and may create only read-only Learning Snapshots and deterministic
+candidates. A later approved design may add Evolution Proposal artifacts. The
+foundation milestone does not modify a workflow, create a pull request, or
+execute an experiment.
 
 ## Existing decisions
 
@@ -767,6 +772,63 @@ descriptive output. These names identify analysis candidates, not conclusions.
     a producer capability declaration affects only Episodes on or after its
     immutable effective boundary.
 
+## Approved implementation-plan constraints
+
+These constraints were accepted with the final Section 2 amendment and
+Section 3 approval. They refine implementation mechanics without changing the
+approved semantic model.
+
+### Deterministic code artifact manifests
+
+Registry and policy JSON artifacts use JCS directly. Analyzer and
+canonicalizer source-code identities use a deterministic JCS artifact manifest
+rather than archive bytes or filesystem traversal order. The manifest contains
+only normalized relative POSIX paths, lowercase SHA-256 file digests, and an
+`executable` boolean derived from executable permission bits. It rejects
+absolute paths, `.` or `..` components, symlinks, duplicate paths, invalid
+Unicode, and non-regular files. Entries are sorted by the UTF-8 bytes of the
+exact relative path before JCS serialization. Package timestamps, owner IDs,
+and tar or zip metadata never enter the code artifact identity.
+
+The implementation plan must define one shared manifest builder and test it
+with reversed discovery order, changed executable bits, changed file bytes,
+and unsafe path fixtures.
+
+### Effective-boundary discriminated union
+
+Every producer-capability entry contains exactly one machine-readable boundary
+form:
+
+```json
+{
+  "effective_boundary": {
+    "type": "started_at",
+    "from": "2026-08-03T00:00:00Z"
+  }
+}
+```
+
+or:
+
+```json
+{
+  "effective_boundary": {
+    "type": "producer_generation",
+    "from": "producer@3"
+  }
+}
+```
+
+The schema rejects unknown boundary types, fields from both variants, missing
+variant fields, and any object that attempts to declare both boundaries.
+
+### Future proposal candidate reference
+
+An Evolution Proposal must cite the compound evidence identity
+`snapshot_id + candidate_id`; `candidate_id` alone is insufficient. This
+constraint is recorded now for provenance continuity, but proposal artifact
+creation remains outside the bounded foundation implementation plan.
+
 ## Resolved Section 3 questions
 
 - Model/runtime identity is optional and never inferred. Known incompatible or
@@ -781,27 +843,10 @@ descriptive output. These names identify analysis candidates, not conclusions.
 - Every result-affecting registry and policy is closed by immutable version and
   hash in the semantic core.
 
-## External review request
+## Approval record
 
-Review the Section 2 additive amendment and revised Section 3 first in
-architecture mode, then adversarial mode. Check:
-
-- compatibility with the Approved Sections 1 and 2 baseline;
-- canonical adapter acquisition and stable-read behavior;
-- semantic content addressing and artifact authority;
-- absolute-window reproducibility;
-- outcome versus lifecycle denominators;
-- field-specific metric semantics and missingness;
-- Decision Event Episode-level support;
-- Trust Gate Diagnostic isolation;
-- v1/v2 derived-view deduplication;
-- privacy, cardinality, and approval-gate bypasses;
-- coverage of the fifteen acceptance-test requirements.
-
-Return one of:
-
-- Approved
-- Approved with required changes
-- Not approved
-
-Separate required corrections from optional improvements.
+Sections 1 and 2 baseline were approved before the Section 2 additive
+amendment and Section 3 review. The additive amendment and Section 3 received
+final approval on 2026-08-02 after two architecture and adversarial review
+cycles. The final approval added only the implementation-plan constraints
+above; it did not reopen or redefine the approved semantic model.
