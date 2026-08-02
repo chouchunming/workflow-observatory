@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -17,12 +18,39 @@ REPOSITORY_ROOT = (
     else MARKETPLACE_ROOT / "evidence"
 )
 CLI = PLUGIN_ROOT / "scripts/workflow_observer_cli.py"
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+from store_config import LLMWIKI_SEMANTICS, PORTABLE_SEMANTICS
+
 SCOPE_TEXT = """## Scope
 
 - Goal: Compare adapters
 - Included: Shared lifecycle matrix
 - Excluded: None
 """
+TASK_TEXT = """---
+type: task
+id: example
+title: Example task
+status: pending
+tags: [workflow]
+timestamp: 2026-08-02
+sources: []
+---
+"""
+EPISODE_TEXT = json.dumps({
+    "schema_version": 2,
+    "execution": {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "cost_amount": None,
+        "cost_currency": None,
+        "measurement_source": "unavailable",
+    },
+    "quality": {"test_failures": 0, "timeout_count": 0},
+    "decisions": [],
+})
 COMPLETION_TEXT = """## Execution evidence
 
 - Verification: matrix pass
@@ -62,29 +90,34 @@ class AdapterConformanceTests(unittest.TestCase):
         self.subject.mkdir()
         self.scope = self.base / "scope.md"
         self.completion = self.base / "completion.md"
+        self.episode = self.base / "episode.json"
         write_private(self.scope, SCOPE_TEXT)
         write_private(self.completion, COMPLETION_TEXT)
+        write_private(self.episode, EPISODE_TEXT)
 
         self.homes = {
             "portable": self.base / "portable-home",
             "llmwiki": self.base / "llmwiki-home",
         }
-        llm_root = self.base / "temporary llm wiki"
-        llm_root.mkdir()
-        shutil.copy2(REPOSITORY_ROOT / "wiki_cli.py", llm_root / "wiki_cli.py")
-        shutil.copy2(REPOSITORY_ROOT / "wiki_observations.py", llm_root / "wiki_observations.py")
+        self.llm_root = self.base / "temporary llm wiki"
+        self.llm_root.mkdir()
+        shutil.copy2(REPOSITORY_ROOT / "wiki_cli.py", self.llm_root / "wiki_cli.py")
+        shutil.copy2(
+            REPOSITORY_ROOT / "wiki_observations.py",
+            self.llm_root / "wiki_observations.py",
+        )
         self.homes["llmwiki"].mkdir()
         (self.homes["llmwiki"] / "config.json").write_text(
             json.dumps({
                 "schema_version": 1,
                 "adapter": "llmwiki",
-                "cli_path": str(llm_root / "wiki_cli.py"),
-                "wiki_root": str(llm_root),
+                "cli_path": str(self.llm_root / "wiki_cli.py"),
+                "wiki_root": str(self.llm_root),
             }),
             encoding="utf-8",
         )
-        (llm_root / "wiki/observations/.locks").mkdir(parents=True)
-        (llm_root / "wiki/observations/invalidations").mkdir()
+        (self.llm_root / "wiki/observations/.locks").mkdir(parents=True)
+        (self.llm_root / "wiki/observations/invalidations").mkdir()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -104,10 +137,17 @@ class AdapterConformanceTests(unittest.TestCase):
             check=False,
         )
 
-    def start(self, adapter: str, *, title="Matrix Example", task_type="maintenance",
-              variant="maintenance-basic"):
-        return self.run_cli(
-            adapter,
+    def start(
+        self,
+        adapter: str,
+        *,
+        title="Matrix Example",
+        task_type="maintenance",
+        variant="maintenance-basic",
+        task: str | None = None,
+        schema_version: int = 1,
+    ):
+        arguments = [
             "start",
             "--title", title,
             "--subject-root", str(self.subject),
@@ -116,7 +156,175 @@ class AdapterConformanceTests(unittest.TestCase):
             "--task-type", task_type,
             "--workflow-variant", variant,
             "--scope-from-file", str(self.scope),
+        ]
+        if task is not None:
+            arguments.extend(["--task", task])
+        if schema_version == 2:
+            arguments.extend([
+                "--episode-schema-version", "2",
+                "--workflow-generation", f"{variant}@2",
+            ])
+        return self.run_cli(adapter, *arguments)
+
+    def _select_delegate_probe(self, *, exit_code: int = 0) -> Path:
+        marker = self.llm_root / "delegate-probe.log"
+        probe = self.llm_root / "delegate_probe.py"
+        probe.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "marker = Path(__file__).with_name('delegate-probe.log')\n"
+            "with marker.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "if 'start' in sys.argv:\n"
+            "    print('obs-20260802-120000-abcdef')\n"
+            "if 'report' in sys.argv:\n"
+            "    print('delegated report')\n"
+            f"raise SystemExit({exit_code})\n",
+            encoding="utf-8",
         )
+        config_path = self.homes["llmwiki"] / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["cli_path"] = str(probe)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        return marker
+
+    def test_selected_adapters_validate_equivalent_current_task_layouts(self):
+        self.assertEqual("portable", PORTABLE_SEMANTICS.name)
+        self.assertEqual("llmwiki", LLMWIKI_SEMANTICS.name)
+        portable_root = self.homes["portable"] / "store"
+        portable_task = portable_root / "wiki/tasks/example.md"
+        portable_task.parent.mkdir(parents=True)
+        portable_task.write_text(TASK_TEXT, encoding="utf-8")
+        llmwiki_task = self.llm_root / "wiki/tasks/records/example.md"
+        llmwiki_task.parent.mkdir(parents=True)
+        llmwiki_task.write_text(TASK_TEXT, encoding="utf-8")
+
+        started = self.start("portable", task="example")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        portable_record = portable_root / "wiki/observations" / f"{run_id}.md"
+        llmwiki_record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        llmwiki_record.write_bytes(portable_record.read_bytes())
+        self.assertEqual(portable_record.read_bytes(), llmwiki_record.read_bytes())
+
+        portable = self.run_cli("portable", "validate")
+        llmwiki = self.run_cli("llmwiki", "validate")
+
+        self.assertEqual(
+            (0, "valid records=1 invalidated=0\n", ""),
+            (portable.returncode, portable.stdout, portable.stderr),
+        )
+        self.assertEqual(
+            (0, "valid records=1 invalidated=0\n", ""),
+            (llmwiki.returncode, llmwiki.stdout, llmwiki.stderr),
+        )
+
+    def test_record_documents_bind_exact_record_and_reference_bytes(self):
+        from wiki_observations import (
+            ObservationPaths,
+            ReferenceEvidence,
+            collect_record_documents,
+            collect_records,
+        )
+
+        portable_root = self.homes["portable"] / "store"
+        task = portable_root / "wiki/tasks/example.md"
+        task.parent.mkdir(parents=True)
+        task.write_text(TASK_TEXT, encoding="utf-8")
+        started = self.start("portable", task="example")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        record = portable_root / "wiki/observations" / f"{run_id}.md"
+
+        collection = collect_record_documents(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        )
+
+        self.assertEqual(1, len(collection.records))
+        document = collection.records[0]
+        self.assertEqual(run_id, document.run_id)
+        self.assertEqual(hashlib.sha256(record.read_bytes()).hexdigest(),
+                         document.source_sha256)
+        self.assertEqual(
+            (ReferenceEvidence(
+                "task",
+                "[[example]]",
+                hashlib.sha256(task.read_bytes()).hexdigest(),
+            ),),
+            document.references,
+        )
+        records, invalidated = collect_records(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        )
+        self.assertEqual([run_id], [row["run_id"] for row in records])
+        self.assertEqual(set(), invalidated)
+
+    def test_llmwiki_obsolete_task_layout_fails_closed(self):
+        portable_root = self.homes["portable"] / "store"
+        portable_task = portable_root / "wiki/tasks/example.md"
+        portable_task.parent.mkdir(parents=True)
+        portable_task.write_text(TASK_TEXT, encoding="utf-8")
+        obsolete_task = self.llm_root / "wiki/tasks/example.md"
+        obsolete_task.parent.mkdir(parents=True, exist_ok=True)
+        obsolete_task.write_text(TASK_TEXT, encoding="utf-8")
+
+        started = self.start("portable", task="example")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        source = portable_root / "wiki/observations" / f"{run_id}.md"
+        (self.llm_root / "wiki/observations" / f"{run_id}.md").write_bytes(
+            source.read_bytes()
+        )
+
+        result = self.run_cli("llmwiki", "validate")
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("task_ref points to no task record", result.stderr)
+
+    def test_llmwiki_schema_v1_lifecycle_and_report_remain_delegated(self):
+        started = self.start("llmwiki")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        marker = self._select_delegate_probe()
+
+        finished = self.run_cli(
+            "llmwiki", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        another_start = self.start("llmwiki")
+        report = self.run_cli("llmwiki", "report")
+
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        self.assertEqual(0, another_start.returncode, another_start.stderr)
+        self.assertEqual("obs-20260802-120000-abcdef\n", another_start.stdout)
+        self.assertEqual((0, "delegated report\n", ""),
+                         (report.returncode, report.stdout, report.stderr))
+        calls = marker.read_text(encoding="utf-8")
+        self.assertIn(f"finish {run_id}", calls)
+        self.assertIn(" start ", f" {calls}")
+        self.assertIn(" report", calls)
+
+    def test_llmwiki_schema_v2_lifecycle_uses_bundled_core(self):
+        marker = self._select_delegate_probe(exit_code=91)
+
+        started = self.start("llmwiki", title="LLMWiki v2", schema_version=2)
+
+        self.assertEqual(0, started.returncode, started.stderr)
+        self.assertFalse(marker.exists())
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "llmwiki", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+            "--episode-from-file", str(self.episode),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        self.assertFalse(marker.exists())
+        record = (self.llm_root / "wiki/observations" / f"{run_id}.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("schema_version: 2\n", record)
+        self.assertIn("## Episode data\n", record)
 
     def test_shared_adapter_conformance_matrix(self):
         results = {}

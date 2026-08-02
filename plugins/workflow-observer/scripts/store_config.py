@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, Mapping, Any
+
+from canonical_json import CanonicalizationError, strict_json_loads
 
 
 class ConfigError(ValueError):
@@ -18,6 +19,37 @@ class StoreConfig:
     adapter: Literal["portable", "llmwiki"]
     root: Path
     cli_path: Path | None
+
+
+@dataclass(frozen=True)
+class AdapterSemantics:
+    name: Literal["portable", "llmwiki"]
+    projection_version: str
+    task_records_relative: PurePosixPath
+
+
+PORTABLE_SEMANTICS = AdapterSemantics(
+    "portable",
+    "episode-projection@2",
+    PurePosixPath("wiki/tasks"),
+)
+LLMWIKI_SEMANTICS = AdapterSemantics(
+    "llmwiki",
+    "episode-projection@2",
+    PurePosixPath("wiki/tasks/records"),
+)
+
+
+def adapter_semantics(config: StoreConfig) -> AdapterSemantics:
+    """Return the immutable semantics selected by validated configuration."""
+
+    if not isinstance(config, StoreConfig):
+        raise ConfigError("store config has the wrong type")
+    if config.adapter == "portable":
+        return PORTABLE_SEMANTICS
+    if config.adapter == "llmwiki":
+        return LLMWIKI_SEMANTICS
+    raise ConfigError(f"unsupported adapter: {config.adapter!r}")
 
 
 def _absolute_path(value: Any, field: str) -> Path:
@@ -99,7 +131,7 @@ def load_store_config(home=None, environ=None) -> StoreConfig:
     if not path.exists():
         return StoreConfig("portable", base / "store", None)
     try:
-        decoded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        decoded = strict_json_loads(path.read_bytes())
+    except (OSError, CanonicalizationError) as error:
         raise ConfigError(f"invalid config JSON: {error}") from error
     return parse_store_config(decoded)

@@ -21,6 +21,9 @@ import sys
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from policy_artifacts import PolicyError, read_regular_file_evidence
+from store_config import AdapterSemantics, PORTABLE_SEMANTICS
+
 if TYPE_CHECKING:
     from episode_schema import EpisodeV2Supplement
 
@@ -43,6 +46,7 @@ _REVISION_RE = re.compile(r"^(?:[0-9a-f]{7,40}|unknown)$")
 _TASK_REF_RE = re.compile(r"^\[\[([A-Za-z0-9][A-Za-z0-9._-]*)\]\]$")
 _WORKFLOW_GENERATION_RE = re.compile(r"^[a-z0-9][a-z0-9._:@+\-]{0,199}$")
 _PAYLOAD_LIMIT = 64 * 1024
+_REFERENCE_LIMIT = 1024 * 1024
 _SCALAR_LIMIT = 200
 _MAX_INTEGER_DIGITS = 18
 _ABSOLUTE_POSIX_PATH_RE = re.compile(r"(?<![A-Za-z0-9_./-])/(?!/)[^\s]+")
@@ -187,6 +191,132 @@ class ReportFilters:
     status: str | None = None
     since: date | None = None
     until: date | None = None
+
+
+@dataclass(frozen=True)
+class ReferenceEvidence:
+    kind: str
+    identity: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class RecordDocument:
+    run_id: str
+    metadata: dict
+    body: str
+    source_sha256: str
+    references: tuple[ReferenceEvidence, ...]
+
+
+@dataclass(frozen=True)
+class ObservationCollection:
+    records: tuple[RecordDocument, ...]
+    invalidated: frozenset[str]
+    invalidation_sha256: tuple[tuple[str, str], ...]
+
+
+class ReferenceResolver:
+    def __init__(
+        self, paths: ObservationPaths, semantics: AdapterSemantics
+    ) -> None:
+        if not isinstance(semantics, AdapterSemantics):
+            raise _validation("adapter semantics have the wrong type")
+        self.paths = _canonical_observation_paths(paths)
+        self.semantics = semantics
+        self._references: dict[tuple[str, str], ReferenceEvidence] = {}
+
+    @property
+    def references(self) -> tuple[ReferenceEvidence, ...]:
+        return tuple(self._references.values())
+
+    @staticmethod
+    def _missing_cause(error: BaseException) -> bool:
+        current: BaseException | None = error
+        while current is not None:
+            if isinstance(current, (FileNotFoundError, NotADirectoryError)):
+                return True
+            current = current.__cause__
+        return False
+
+    def _read(
+        self,
+        kind: str,
+        identity: str,
+        relative: PurePosixPath,
+    ):
+        key = (kind, identity)
+        existing = self._references.get(key)
+        if existing is not None:
+            return existing, None
+        try:
+            opened = read_regular_file_evidence(
+                self.paths.root,
+                relative.as_posix(),
+                max_bytes=_REFERENCE_LIMIT,
+            )
+        except PolicyError as error:
+            if self._missing_cause(error):
+                raise FileNotFoundError(relative.as_posix()) from error
+            raise _validation("reference target must be a stable regular file") from error
+        evidence = ReferenceEvidence(kind, identity, opened.sha256)
+        return evidence, opened.content
+
+    def _remember(self, evidence: ReferenceEvidence) -> ReferenceEvidence:
+        self._references[(evidence.kind, evidence.identity)] = evidence
+        return evidence
+
+    def source(self, identity: str) -> ReferenceEvidence:
+        if not isinstance(identity, str) or not identity.startswith("raw/"):
+            raise _validation("source identity must start with raw/")
+        relative = PurePosixPath(identity)
+        evidence, _content = self._read("source", identity, relative)
+        return self._remember(evidence)
+
+    def task(self, task_id: str) -> ReferenceEvidence:
+        if not isinstance(task_id, str) or _TASK_REF_RE.fullmatch(
+            f"[[{task_id}]]"
+        ) is None:
+            raise _validation("task identity has an invalid format")
+        identity = f"[[{task_id}]]"
+        relative = self.semantics.task_records_relative / f"{task_id}.md"
+        evidence, content = self._read("task", identity, relative)
+        if content is not None and not _task_record_is_valid(content, task_id):
+            raise _validation("task reference is not a valid task record")
+        return self._remember(evidence)
+
+    def supersession(
+        self, run_id: str, reference_chain: frozenset[str]
+    ) -> ReferenceEvidence:
+        if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+            raise _validation("supersession identity has an invalid format")
+        evidence, content = self._read(
+            "supersession-target",
+            run_id,
+            PurePosixPath("wiki/observations") / f"{run_id}.md",
+        )
+        if content is not None:
+            try:
+                text = content.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise _validation(
+                    "supersession target must be UTF-8 text"
+                ) from error
+            metadata, body = _parse_frontmatter(text)
+            if metadata.get("run_id") != run_id:
+                raise _validation("record run_id does not match filename")
+            self._remember(evidence)
+            errors = validate_record(
+                metadata,
+                body,
+                self.paths,
+                reference_chain,
+                self.semantics,
+                self,
+            )
+            if errors:
+                raise _validation(errors[0])
+        return self._remember(evidence)
 
 
 def _validation(message: str) -> ObservationError:
@@ -655,46 +785,18 @@ def _aware_datetime(value: object, field: str) -> datetime:
     return parsed
 
 
-def _secure_reference_file(
-    base: Path, relative: PurePosixPath, wiki_root: Path
-) -> Path:
+def _task_record_is_valid(content: bytes, expected_id: str) -> bool:
     try:
-        root_resolved = wiki_root.resolve(strict=True)
-        if base.is_symlink():
-            raise _validation("reference directory must not be a symlink")
-        base_resolved = base.resolve(strict=True)
-        base_resolved.relative_to(root_resolved)
-        candidate = base.joinpath(*relative.parts)
-        current = base
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise _validation("reference target must not be a symlink")
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(base_resolved)
-        if not resolved.is_file():
-            raise FileNotFoundError(str(candidate))
-        return resolved
-    except ObservationError:
-        raise
-    except (FileNotFoundError, NotADirectoryError):
-        raise
-    except (OSError, ValueError) as error:
-        raise _validation("reference target escapes its required directory") from error
-
-
-def _task_record_is_valid(path: Path, expected_id: str) -> bool:
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
         return False
-    if not content.startswith("---\n"):
+    if not text.startswith("---\n"):
         return False
-    closing = content.find("\n---\n", 4)
+    closing = text.find("\n---\n", 4)
     if closing < 0:
         return False
     fields: dict[str, object] = {}
-    for line in content[4:closing].splitlines():
+    for line in text[4:closing].splitlines():
         if ":" not in line:
             return False
         key, value = line.split(":", 1)
@@ -752,7 +854,9 @@ def validate_record(
     metadata: dict,
     body: str,
     paths: ObservationPaths,
-    _reference_chain: frozenset[str] | None = None,
+    reference_chain: frozenset[str] | None = None,
+    semantics: AdapterSemantics = PORTABLE_SEMANTICS,
+    resolver: ReferenceResolver | None = None,
 ) -> list[str]:
     errors: list[str] = []
     required = {
@@ -813,18 +917,24 @@ def validate_record(
     )
     errors.extend(_start_request_errors(request))
 
+    try:
+        active_resolver = resolver or ReferenceResolver(paths, semantics)
+        if active_resolver.semantics != semantics:
+            raise _validation("reference resolver semantics do not match selection")
+        if active_resolver.paths.root != _canonical_observation_paths(paths).root:
+            raise _validation("reference resolver paths do not match record paths")
+    except ObservationError as error:
+        errors.append(str(error))
+        return errors
+
     if isinstance(sources, list):
         for source in sources:
             if isinstance(source, str) and source.startswith("raw/"):
                 try:
-                    _secure_reference_file(
-                        paths.root / "raw",
-                        PurePosixPath(source).relative_to("raw"),
-                        paths.root,
-                    )
+                    active_resolver.source(source)
                 except (FileNotFoundError, NotADirectoryError):
                     errors.append(f"source does not exist: {source}")
-                except (ObservationError, ValueError):
+                except ObservationError:
                     errors.append(f"source must not be a symlink or escape raw: {source}")
     task_ref = metadata.get("task_ref")
     if isinstance(task_ref, str):
@@ -832,18 +942,11 @@ def validate_record(
         if match:
             task_id = match.group(1)
             try:
-                task_path = _secure_reference_file(
-                    paths.root / "wiki" / "tasks",
-                    PurePosixPath(f"{task_id}.md"),
-                    paths.root,
-                )
+                active_resolver.task(task_id)
             except (FileNotFoundError, NotADirectoryError):
                 errors.append("task_ref points to no task record")
             except ObservationError:
                 errors.append("task_ref points to an invalid task record")
-            else:
-                if not _task_record_is_valid(task_path, task_id):
-                    errors.append("task_ref points to an invalid task record")
 
     status = metadata.get("status")
     if not isinstance(status, str) or status not in FINAL_STATUSES | {"draft"}:
@@ -896,30 +999,21 @@ def validate_record(
             errors.append("superseded status requires superseded_by")
         elif superseded_by == run_id:
             errors.append("superseded_by must not reference itself")
-        elif _reference_chain and superseded_by in _reference_chain:
+        elif reference_chain and superseded_by in reference_chain:
             errors.append("superseded_by must not create a cycle")
         else:
             try:
-                _secure_reference_file(
-                    paths.observations,
-                    PurePosixPath(f"{superseded_by}.md"),
-                    paths.root,
-                )
-                target_metadata, target_body = read_record(paths, superseded_by)
-            except (FileNotFoundError, NotADirectoryError, ObservationError) as error:
-                if isinstance(error, ObservationError) and error.kind != "state":
-                    errors.append("superseded_by points to an invalid observation record")
-                else:
-                    errors.append("superseded_by points to no observation record")
-            else:
-                chain = (_reference_chain or frozenset()) | {
+                chain = (reference_chain or frozenset()) | {
                     run_id if isinstance(run_id, str) else ""
                 }
-                target_errors = validate_record(
-                    target_metadata, target_body, paths, frozenset(chain)
+                active_resolver.supersession(
+                    superseded_by,
+                    frozenset(chain),
                 )
-                if target_metadata.get("run_id") != superseded_by or target_errors:
-                    errors.append("superseded_by points to an invalid observation record")
+            except (FileNotFoundError, NotADirectoryError):
+                errors.append("superseded_by points to no observation record")
+            except ObservationError:
+                errors.append("superseded_by points to an invalid observation record")
     elif superseded_by is not None:
         errors.append("superseded_by is only valid for superseded status")
 
@@ -1188,6 +1282,7 @@ def start_observation(
     request: StartRequest,
     scope: ScopePayload,
     now: datetime | None = None,
+    semantics: AdapterSemantics = PORTABLE_SEMANTICS,
 ) -> str:
     """Create one validated draft through an atomic exclusive hard-link claim."""
 
@@ -1201,7 +1296,12 @@ def start_observation(
         validation_id, started, request, scope_text
     )
     _raise_record_validation(
-        validate_record(validation_metadata, scope_text, secure_paths)
+        validate_record(
+            validation_metadata,
+            scope_text,
+            secure_paths,
+            semantics=semantics,
+        )
     )
 
     try:
@@ -1216,7 +1316,12 @@ def start_observation(
             _assert_directory_identity(directory_fd, secure_paths.observations)
             run_id = f"obs-{started:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
             metadata, content = _render_draft(run_id, started, request, scope_text)
-            _raise_record_validation(validate_record(metadata, scope_text, secure_paths))
+            _raise_record_validation(validate_record(
+                metadata,
+                scope_text,
+                secure_paths,
+                semantics=semantics,
+            ))
             destination_name = f"{run_id}.md"
             temporary_name: str | None = None
             try:
@@ -1392,6 +1497,7 @@ def _render_completed_record(
     finished: datetime,
     paths: ObservationPaths,
     episode_v2: EpisodeV2Supplement | None,
+    semantics: AdapterSemantics,
 ) -> str:
     started = _aware_datetime(metadata.get("timestamp"), "timestamp")
     if finished < started:
@@ -1433,7 +1539,12 @@ def _render_completed_record(
     elif episode_v2 is not None:
         raise _validation("schema-v1 observation cannot contain an Episode supplement")
     _raise_record_validation(
-        validate_record(completed_metadata, completed_body, paths)
+        validate_record(
+            completed_metadata,
+            completed_body,
+            paths,
+            semantics=semantics,
+        )
     )
     return _render_frontmatter(completed_metadata) + completed_body
 
@@ -1582,7 +1693,10 @@ def _close_stream_preserving_error(stream) -> None:
 
 
 def _read_record_from_directory(
-    paths: ObservationPaths, run_id: str, directory_fd: int
+    paths: ObservationPaths,
+    run_id: str,
+    directory_fd: int,
+    semantics: AdapterSemantics,
 ) -> tuple[dict[str, object], str, object]:
     name = f"{run_id}.md"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1619,7 +1733,12 @@ def _read_record_from_directory(
             metadata, body = _parse_frontmatter(content)
             if metadata.get("run_id") != run_id:
                 raise _validation("record run_id does not match filename")
-            _raise_record_validation(validate_record(metadata, body, paths))
+            _raise_record_validation(validate_record(
+                metadata,
+                body,
+                paths,
+                semantics=semantics,
+            ))
             return metadata, body, stream
         except ObservationError:
             _close_stream_preserving_error(stream)
@@ -1747,6 +1866,7 @@ def finish_observation(
     superseded_by: str | None = None,
     now: datetime | None = None,
     episode_v2: EpisodeV2Supplement | None = None,
+    semantics: AdapterSemantics = PORTABLE_SEMANTICS,
 ) -> None:
     """Atomically transition one draft record to exactly one final status."""
 
@@ -1771,7 +1891,10 @@ def finish_observation(
         run_lock.verify()
         observations_fd = _open_observation_directory(secure_paths.observations)
         metadata, scope_body, record_stream = _read_record_from_directory(
-            secure_paths, run_id, observations_fd
+            secure_paths,
+            run_id,
+            observations_fd,
+            semantics,
         )
         if metadata.get("status") != "draft":
             raise ObservationError("state", f"{run_id} is already final")
@@ -1784,6 +1907,7 @@ def finish_observation(
             finished,
             secure_paths,
             episode_v2,
+            semantics,
         )
         run_lock.verify()
         _replace_completed_record(
@@ -2091,7 +2215,7 @@ def _report_entry_names(directory_fd: int, label: str) -> list[str]:
 
 def _read_report_regular_file(
     directory_fd: int, name: str, expected, label: str
-) -> str:
+) -> bytes:
     if stat.S_ISLNK(expected.st_mode):
         raise _validation(f"{label} must not be a symlink")
     if not stat.S_ISREG(expected.st_mode):
@@ -2132,11 +2256,32 @@ def _read_report_regular_file(
             or len(identities) != 1
         ):
             raise _validation(f"{label} changed during report discovery")
+        if opened.st_size > _REFERENCE_LIMIT:
+            raise _validation(f"{label} exceeds maximum byte size")
         try:
-            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            with os.fdopen(descriptor, "rb", buffering=0) as stream:
                 descriptor = -1
-                return stream.read()
-        except (OSError, UnicodeError) as error:
+                content = stream.read(_REFERENCE_LIMIT + 1)
+                after = os.fstat(stream.fileno())
+                current_after = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            if (
+                len(content) > _REFERENCE_LIMIT
+                or len(content) != opened.st_size
+                or not stat.S_ISREG(after.st_mode)
+                or not stat.S_ISREG(current_after.st_mode)
+                or len({
+                    (opened.st_dev, opened.st_ino),
+                    (after.st_dev, after.st_ino),
+                    (current_after.st_dev, current_after.st_ino),
+                }) != 1
+                or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise _validation(f"{label} changed during report discovery")
+            return content
+        except OSError as error:
             raise ObservationError("io", f"could not read {label}: {error}") from error
     finally:
         if descriptor >= 0:
@@ -2204,22 +2349,28 @@ def _read_invalidation_target(content: str, filename: str) -> str:
     return target
 
 
-def collect_records(paths: ObservationPaths) -> tuple[list[dict], set[str]]:
-    """Read direct, validated observation records and invalidation targets."""
+def collect_record_documents(
+    paths: ObservationPaths,
+    semantics: AdapterSemantics,
+) -> ObservationCollection:
+    """Securely read validated records and their descriptor-bound evidence."""
 
     secure_paths = _canonical_observation_paths(paths)
+    if not isinstance(semantics, AdapterSemantics):
+        raise _validation("adapter semantics have the wrong type")
     root_fd = _open_report_root(secure_paths.root)
     wiki_fd: int | None = None
     observations_fd: int | None = None
     invalidations_fd: int | None = None
-    records: list[dict] = []
+    documents: list[RecordDocument] = []
     invalidated: set[str] = set()
+    invalidation_sha256: list[tuple[str, str]] = []
     try:
         wiki_fd = _open_report_child_directory(
             root_fd, "wiki", "wiki directory", missing_ok=True
         )
         if wiki_fd is None:
-            return [], set()
+            return ObservationCollection((), frozenset(), ())
         observations_fd = _open_report_child_directory(
             wiki_fd,
             "observations",
@@ -2227,7 +2378,7 @@ def collect_records(paths: ObservationPaths) -> tuple[list[dict], set[str]]:
             missing_ok=True,
         )
         if observations_fd is None:
-            return [], set()
+            return ObservationCollection((), frozenset(), ())
 
         invalidations_entry = None
         for name in _report_entry_names(observations_fd, "observation records"):
@@ -2248,30 +2399,47 @@ def collect_records(paths: ObservationPaths) -> tuple[list[dict], set[str]]:
             run_id = Path(name).stem
             if _RUN_ID_RE.fullmatch(run_id) is None:
                 raise _validation("observation filename has an invalid run_id")
-            content = _read_report_regular_file(
+            content_bytes = _read_report_regular_file(
                 observations_fd, name, entry, f"observation record {run_id}"
             )
+            try:
+                content = content_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise ObservationError(
+                    "io", f"could not read observation record {run_id}: {error}"
+                ) from error
             metadata, body = _parse_frontmatter(content)
             if metadata.get("run_id") != run_id:
                 raise _validation("record run_id does not match filename")
-            validation_errors = validate_record(metadata, body, secure_paths)
+            resolver = ReferenceResolver(secure_paths, semantics)
+            validation_errors = validate_record(
+                metadata,
+                body,
+                secure_paths,
+                semantics=semantics,
+                resolver=resolver,
+            )
             if validation_errors:
                 raise _validation(
                     f"invalid observation {run_id}: {validation_errors[0]}"
                 )
-            row = dict(metadata)
-            row["metrics"] = _metrics_from_record(body, metadata.get("status"))
-            records.append(row)
+            documents.append(RecordDocument(
+                run_id,
+                dict(metadata),
+                body,
+                hashlib.sha256(content_bytes).hexdigest(),
+                resolver.references,
+            ))
 
-        records.sort(
-            key=lambda row: (
-                str(row.get("timestamp", "")),
-                str(row.get("run_id", "")),
+        documents.sort(
+            key=lambda document: (
+                str(document.metadata.get("timestamp", "")),
+                document.run_id,
             )
         )
-        by_id = {row["run_id"]: row for row in records}
+        by_id = {document.run_id: document for document in documents}
         if invalidations_entry is None:
-            return records, invalidated
+            return ObservationCollection(tuple(documents), frozenset(), ())
         invalidations_fd = _open_report_child_directory(
             observations_fd,
             "invalidations",
@@ -2287,24 +2455,54 @@ def collect_records(paths: ObservationPaths) -> tuple[list[dict], set[str]]:
                 raise _validation("invalidations storage must not contain symlinks")
             if stat.S_ISDIR(entry.st_mode) or Path(name).suffix != ".md":
                 continue
-            content = _read_report_regular_file(
+            content_bytes = _read_report_regular_file(
                 invalidations_fd,
                 name,
                 entry,
                 f"invalidation tombstone {Path(name).stem}",
             )
+            try:
+                content = content_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise ObservationError(
+                    "io", f"could not read invalidation tombstone: {error}"
+                ) from error
             target = _read_invalidation_target(content, name)
             target_record = by_id.get(target)
             if target_record is None:
                 raise _validation("invalidation points to no observation record")
-            if target_record.get("status") == "draft":
+            if target_record.metadata.get("status") == "draft":
                 raise _validation("invalidation must reference a final observation")
             invalidated.add(target)
-        return records, invalidated
+            invalidation_sha256.append(
+                (target, hashlib.sha256(content_bytes).hexdigest())
+            )
+        return ObservationCollection(
+            tuple(documents),
+            frozenset(invalidated),
+            tuple(invalidation_sha256),
+        )
     finally:
         for descriptor in (invalidations_fd, observations_fd, wiki_fd, root_fd):
             if descriptor is not None:
                 _close_preserving_error(descriptor)
+
+
+def collect_records(
+    paths: ObservationPaths,
+    semantics: AdapterSemantics = PORTABLE_SEMANTICS,
+) -> tuple[list[dict], set[str]]:
+    """Compatibility projection over the single secure document collection."""
+
+    collection = collect_record_documents(paths, semantics)
+    records: list[dict] = []
+    for document in collection.records:
+        row = dict(document.metadata)
+        row["metrics"] = _metrics_from_record(
+            document.body, document.metadata.get("status")
+        )
+        records.append(row)
+    return records, set(collection.invalidated)
 
 
 def _validate_report_filters(filters: ReportFilters) -> None:

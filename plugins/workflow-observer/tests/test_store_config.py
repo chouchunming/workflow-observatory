@@ -48,12 +48,45 @@ class StoreConfigTests(unittest.TestCase):
                 load_store_config(home=home, environ={}),
             )
 
+    def test_selected_adapter_semantics_are_fixed_by_configuration(self):
+        from store_config import adapter_semantics
+
+        portable = adapter_semantics(
+            StoreConfig("portable", Path("/tmp/store"), None)
+        )
+        llmwiki = adapter_semantics(
+            StoreConfig("llmwiki", Path("/tmp/wiki"), Path("/tmp/wiki/wiki_cli.py"))
+        )
+
+        self.assertEqual(
+            ("portable", "episode-projection@2", "wiki/tasks"),
+            (portable.name, portable.projection_version,
+             portable.task_records_relative.as_posix()),
+        )
+        self.assertEqual(
+            ("llmwiki", "episode-projection@2", "wiki/tasks/records"),
+            (llmwiki.name, llmwiki.projection_version,
+             llmwiki.task_records_relative.as_posix()),
+        )
+
     def test_rejects_invalid_json_as_config_error(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / "config.json").write_text("not json", encoding="utf-8")
 
             with self.assertRaisesRegex(ConfigError, "invalid config JSON"):
+                load_store_config(home=home, environ={})
+
+    def test_duplicate_key_rejected_in_store_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.json").write_text(
+                '{"schema_version":1,"adapter":"portable",'
+                '"adapter":"llmwiki","root":"/tmp/store"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "duplicate JSON key: adapter"):
                 load_store_config(home=home, environ={})
 
     def test_rejects_unknown_schema_version(self):

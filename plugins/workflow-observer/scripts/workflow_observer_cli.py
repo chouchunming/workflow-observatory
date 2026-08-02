@@ -13,7 +13,13 @@ import subprocess
 import sys
 from typing import Sequence
 
-from store_config import ConfigError, StoreConfig, load_store_config
+from store_config import (
+    AdapterSemantics,
+    ConfigError,
+    StoreConfig,
+    adapter_semantics,
+    load_store_config,
+)
 import wiki_observations
 from episode_schema import EpisodeSchemaError, parse_v2_supplement
 from wiki_observations import ObservationError, ObservationPaths
@@ -159,6 +165,113 @@ def _read_private_payload(path_value: str, label: str) -> str:
 
 def _directory_open_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
+    """Securely read only a draft's frontmatter to select its lifecycle core."""
+
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ObservationError("validation", "run_id has an invalid format")
+    secure_paths = wiki_observations._canonical_observation_paths(paths)
+    directory_fd = wiki_observations._open_observation_directory(
+        secure_paths.observations
+    )
+    descriptor = -1
+    name = f"{run_id}.md"
+    try:
+        wiki_observations._assert_directory_identity(
+            directory_fd, secure_paths.observations
+        )
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise ObservationError(
+                "state", f"observation {run_id} does not exist"
+            ) from error
+        except OSError as error:
+            raise ObservationError("io", str(error)) from error
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ObservationError(
+                "validation", "observation record must be a regular file"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        except OSError as error:
+            raise ObservationError(
+                "validation", "observation record changed while opening"
+            ) from error
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ObservationError(
+                "validation", "observation record changed while opening"
+            )
+
+        frontmatter = bytearray()
+        delimiter = b"\n---\n"
+        while not frontmatter.endswith(delimiter):
+            if len(frontmatter) >= 64 * 1024:
+                raise ObservationError(
+                    "validation", "observation frontmatter is too large"
+                )
+            chunk = os.read(descriptor, 1)
+            if not chunk:
+                raise ObservationError(
+                    "validation", "record has malformed frontmatter"
+                )
+            frontmatter.extend(chunk)
+
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        wiki_observations._assert_directory_identity(
+            directory_fd, secure_paths.observations
+        )
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or len({
+                (before.st_dev, before.st_ino),
+                (opened.st_dev, opened.st_ino),
+                (after.st_dev, after.st_ino),
+                (current.st_dev, current.st_ino),
+            }) != 1
+        ):
+            raise ObservationError(
+                "validation", "observation record changed while reading schema"
+            )
+        try:
+            text = bytes(frontmatter).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ObservationError(
+                "validation", "record frontmatter must be UTF-8 text"
+            ) from error
+        metadata, _body = wiki_observations._parse_frontmatter(text)
+        if metadata.get("run_id") != run_id:
+            raise ObservationError(
+                "validation", "record run_id does not match filename"
+            )
+        if metadata.get("status") != "draft":
+            raise ObservationError("state", f"{run_id} is already final")
+        schema_version = metadata.get("schema_version", 1)
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise ObservationError(
+                "validation", "draft schema_version is ambiguous"
+            )
+        return schema_version
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
 
 
 def _walk_portable_directory(
@@ -327,13 +440,30 @@ def _empty_report(filters: wiki_observations.ReportFilters) -> str:
     )
 
 
-def _run_portable(args: argparse.Namespace, config: StoreConfig) -> int:
+def _run_bundled(
+    args: argparse.Namespace,
+    config: StoreConfig,
+    semantics: AdapterSemantics,
+) -> int:
     if args.command == "start":
-        paths = initialize_portable_root(config.root)
+        paths = (
+            initialize_portable_root(config.root)
+            if semantics.name == "portable"
+            else ObservationPaths.from_root(config.root)
+        )
         request, scope = _start_request(args)
-        print(wiki_observations.start_observation(paths, request, scope))
+        print(wiki_observations.start_observation(
+            paths, request, scope, semantics=semantics
+        ))
         return 0
-    paths = _portable_paths(config, missing_ok=args.command in {"report", "validate", "integrity"})
+    paths = (
+        _portable_paths(
+            config,
+            missing_ok=args.command in {"report", "validate", "integrity"},
+        )
+        if semantics.name == "portable"
+        else ObservationPaths.from_root(config.root)
+    )
     if args.command == "finish":
         assert paths is not None
         payload = wiki_observations.parse_completion_payload(
@@ -357,18 +487,21 @@ def _run_portable(args: argparse.Namespace, config: StoreConfig) -> int:
             payload,
             superseded_by=args.superseded_by,
             episode_v2=episode_v2,
+            semantics=semantics,
         )
         return 0
     if args.command == "report":
         if paths is None:
             sys.stdout.write(_empty_report(_filters(args)))
         else:
-            records, invalidated = wiki_observations.collect_records(paths)
+            records, invalidated = wiki_observations.collect_records(
+                paths, semantics
+            )
             sys.stdout.write(wiki_observations.render_observation_report(
                 records, invalidated, _filters(args), datetime.now().astimezone()
             ))
         return 0
-    return _run_read_only(args.command, paths)
+    return _run_read_only(args.command, paths, semantics)
 
 
 def _normalized_args(args: argparse.Namespace) -> list[str]:
@@ -495,11 +628,15 @@ def _check_integrity_layout(paths: ObservationPaths) -> None:
                 raise ObservationError("validation", f"unexpected invalidation entry: {entry.name}")
 
 
-def _run_read_only(command: str, paths: ObservationPaths | None) -> int:
+def _run_read_only(
+    command: str,
+    paths: ObservationPaths | None,
+    semantics: AdapterSemantics,
+) -> int:
     if paths is None:
         records, invalidated = [], set()
     else:
-        records, invalidated = wiki_observations.collect_records(paths)
+        records, invalidated = wiki_observations.collect_records(paths, semantics)
         if command == "integrity":
             _check_integrity_layout(paths)
     label = "healthy" if command == "integrity" else "valid"
@@ -516,12 +653,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         config = load_store_config()
+        semantics = adapter_semantics(config)
         if config.adapter == "llmwiki":
             if args.command in {"validate", "integrity"}:
                 paths = ObservationPaths.from_root(config.root)
-                return _run_read_only(args.command, paths)
-            return _delegate(args, config)
-        return _run_portable(args, config)
+                return _run_read_only(args.command, paths, semantics)
+            if args.command == "report":
+                return _delegate(args, config)
+            if args.command == "start" and args.episode_schema_version == 1:
+                return _delegate(args, config)
+            if args.command == "finish":
+                paths = ObservationPaths.from_root(config.root)
+                if _read_draft_schema(paths, args.run_id) == 1:
+                    return _delegate(args, config)
+            return _run_bundled(args, config, semantics)
+        return _run_bundled(args, config, semantics)
     except ConfigError as error:
         return _fail(ObservationError("validation", str(error)))
     except ObservationError as error:
