@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import stat
@@ -11,6 +12,9 @@ from unittest import mock
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 CLI = PLUGIN_ROOT / "scripts/workflow_observer_cli.py"
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+sys.path.insert(0, str(PLUGIN_ROOT / "tests"))
+from episode_schema import parse_episode_block
+from workflow_evolution_fixtures import load_projection_policy
 import workflow_observer_cli
 
 SCOPE = """## Scope
@@ -124,6 +128,13 @@ class PortableCliTests(unittest.TestCase):
             str(self.completion),
         )
         self.assertEqual((0, "", ""), (finished.returncode, finished.stdout, finished.stderr))
+        record = (
+            self.home / "store/wiki/observations" / f"{run_id}.md"
+        ).read_text(encoding="utf-8")
+        frontmatter, body = record.split("---\n", 2)[1:]
+        self.assertNotIn("schema_version:", frontmatter)
+        self.assertNotIn("workflow_generation:", frontmatter)
+        self.assertNotIn("## Episode data\n", body)
         validated = run_cli(self.home, "validate")
         self.assertEqual((0, "valid records=1 invalidated=0\n", ""),
                          (validated.returncode, validated.stdout, validated.stderr))
@@ -131,6 +142,145 @@ class PortableCliTests(unittest.TestCase):
         self.assertEqual(0, report.returncode)
         self.assertIn("maintenance-basic", report.stdout)
         self.assertEqual("", report.stderr)
+
+    def test_v2_start_and_finish_write_one_canonical_episode_block(self):
+        supplement = self.base / "episode.json"
+        write_private(supplement, json.dumps({
+            "schema_version": 2,
+            "execution": {
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+                "cost_amount": None,
+                "cost_currency": None,
+                "measurement_source": "unavailable",
+            },
+            "quality": {"test_failures": 0, "timeout_count": 0},
+            "decisions": [],
+        }))
+        started = run_cli(
+            self.home, "start", "--title", "v2", "--subject-root", str(self.subject),
+            "--agent-surface", "codex", "--start-mode", "planned",
+            "--task-type", "maintenance", "--workflow-variant", "maintenance-basic",
+            "--scope-from-file", str(self.scope), "--episode-schema-version", "2",
+            "--workflow-generation", "maintenance-basic@2",
+        )
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = run_cli(
+            self.home, "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion), "--episode-from-file", str(supplement),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        record = (
+            self.home / "store/wiki/observations" / f"{run_id}.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("schema_version: 2\n", record)
+        self.assertIn('workflow_generation: "maintenance-basic@2"\n', record)
+        self.assertEqual(1, record.count("## Episode data\n"))
+        _human, episode = parse_episode_block(
+            record.split("---\n", 2)[2].lstrip(), load_projection_policy()
+        )
+        self.assertEqual(2, episode["schema_version"])
+
+    def test_rejected_v1_v2_combinations_preserve_record_bytes(self):
+        valid_supplement = {
+            "schema_version": 2,
+            "execution": {
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+                "cost_amount": None,
+                "cost_currency": None,
+                "measurement_source": "unavailable",
+            },
+            "quality": {"test_failures": 0, "timeout_count": 0},
+            "decisions": [],
+        }
+        valid_episode = self.base / "valid-episode.json"
+        write_private(valid_episode, json.dumps(valid_supplement))
+        invalid_episode = self.base / "invalid-episode.json"
+        invalid_decision = {
+            "sequence": 1,
+            "phase": "not-a-phase",
+            "actor_role": "implementer",
+            "decision_type": "reject",
+            "reason_code": "integrity-risk",
+            "result": "supported",
+            "summary": "Rejected an unsafe mutation at the evidence boundary",
+        }
+        write_private(
+            invalid_episode,
+            json.dumps({**valid_supplement, "decisions": [invalid_decision]}),
+        )
+
+        def records() -> dict[str, bytes]:
+            observations = self.home / "store/wiki/observations"
+            return {
+                path.name: path.read_bytes()
+                for path in observations.glob("obs-*.md")
+            } if observations.exists() else {}
+
+        def start_v2(title: str) -> str:
+            result = run_cli(
+                self.home, "start", "--title", title,
+                "--subject-root", str(self.subject), "--agent-surface", "codex",
+                "--start-mode", "planned", "--task-type", "maintenance",
+                "--workflow-variant", "implementation-with-review",
+                "--scope-from-file", str(self.scope),
+                "--episode-schema-version", "2", "--workflow-generation",
+                "implementation-with-review@2",
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            return result.stdout.strip()
+
+        v2_missing = start_v2("v2 missing supplement")
+        v1_with_supplement = self.start(title="v1 with supplement").stdout.strip()
+        v2_invalid = start_v2("v2 invalid decision")
+        cases = (
+            (
+                "v2 finish without supplement",
+                lambda: run_cli(
+                    self.home, "finish", v2_missing, "--status", "success",
+                    "--from-file", str(self.completion),
+                ),
+            ),
+            (
+                "v1 start with workflow generation",
+                lambda: run_cli(
+                    self.home, "start", "--title", "invalid v1 generation",
+                    "--subject-root", str(self.subject), "--agent-surface", "codex",
+                    "--start-mode", "planned", "--task-type", "maintenance",
+                    "--workflow-variant", "maintenance-basic", "--scope-from-file",
+                    str(self.scope), "--workflow-generation", "maintenance-basic@2",
+                ),
+            ),
+            (
+                "v1 finish with supplement",
+                lambda: run_cli(
+                    self.home, "finish", v1_with_supplement, "--status", "success",
+                    "--from-file", str(self.completion), "--episode-from-file",
+                    str(valid_episode),
+                ),
+            ),
+            (
+                "v2 invalid Decision Event",
+                lambda: run_cli(
+                    self.home, "finish", v2_invalid, "--status", "success",
+                    "--from-file", str(self.completion), "--episode-from-file",
+                    str(invalid_episode),
+                ),
+            ),
+        )
+        for name, rejected_call in cases:
+            with self.subTest(name=name):
+                before = records()
+                rejected = rejected_call()
+                self.assertEqual(2, rejected.returncode, rejected.stderr)
+                self.assertTrue(rejected.stderr.startswith(
+                    "workflow observer validation error:"
+                ))
+                self.assertEqual(before, records())
 
     def test_start_creates_only_private_portable_layout(self):
         self.assertEqual(0, self.start().returncode)

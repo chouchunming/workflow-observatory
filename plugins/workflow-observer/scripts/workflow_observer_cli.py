@@ -15,6 +15,7 @@ from typing import Sequence
 
 from store_config import ConfigError, StoreConfig, load_store_config
 import wiki_observations
+from episode_schema import EpisodeSchemaError, parse_v2_supplement
 from wiki_observations import ObservationError, ObservationPaths
 
 
@@ -61,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     start.add_argument("--scope-from-file", required=True)
+    start.add_argument("--episode-schema-version", type=int, choices=(1, 2), default=1)
+    start.add_argument("--workflow-generation")
     start.add_argument("--task")
     start.add_argument("--source", action="append", default=[])
 
@@ -68,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("run_id")
     finish.add_argument("--status", required=True, choices=sorted(wiki_observations.FINAL_STATUSES))
     finish.add_argument("--from-file", required=True)
+    finish.add_argument("--episode-from-file")
     finish.add_argument("--superseded-by")
 
     report = subparsers.add_parser("report")
@@ -299,6 +303,8 @@ def _start_request(args: argparse.Namespace) -> tuple[wiki_observations.StartReq
         workflow_variant=args.workflow_variant,
         task_ref=f"[[{args.task}]]" if args.task is not None else None,
         sources=tuple(args.source),
+        episode_schema_version=args.episode_schema_version,
+        workflow_generation=args.workflow_generation,
     )
     return request, scope
 
@@ -333,8 +339,24 @@ def _run_portable(args: argparse.Namespace, config: StoreConfig) -> int:
         payload = wiki_observations.parse_completion_payload(
             _read_private_payload(args.from_file, "completion payload")
         )
+        episode_v2 = None
+        if args.episode_from_file is not None:
+            try:
+                episode_v2 = parse_v2_supplement(
+                    _read_private_payload(
+                        args.episode_from_file, "Episode supplement"
+                    ),
+                    wiki_observations._episode_projection_policy(),
+                )
+            except EpisodeSchemaError as error:
+                raise ObservationError("validation", str(error)) from error
         wiki_observations.finish_observation(
-            paths, args.run_id, args.status, payload, superseded_by=args.superseded_by
+            paths,
+            args.run_id,
+            args.status,
+            payload,
+            superseded_by=args.superseded_by,
+            episode_v2=episode_v2,
         )
         return 0
     if args.command == "report":
@@ -359,6 +381,12 @@ def _normalized_args(args: argparse.Namespace) -> list[str]:
         ]
         if args.project is not None:
             values.extend(["--project", args.project])
+        if args.episode_schema_version != 1:
+            values.extend([
+                "--episode-schema-version", str(args.episode_schema_version)
+            ])
+        if args.workflow_generation is not None:
+            values.extend(["--workflow-generation", args.workflow_generation])
         if args.task is not None:
             values.extend(["--task", args.task])
         for source in args.source:
@@ -368,6 +396,8 @@ def _normalized_args(args: argparse.Namespace) -> list[str]:
         values = ["finish", args.run_id, "--status", args.status, "--from-file", args.from_file]
         if args.superseded_by is not None:
             values.extend(["--superseded-by", args.superseded_by])
+        if args.episode_from_file is not None:
+            values.extend(["--episode-from-file", args.episode_from_file])
         return values
     values = ["report"]
     for option in ("project", "workspace", "workspace_id", "task_type", "status"):

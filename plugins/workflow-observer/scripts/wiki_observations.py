@@ -18,7 +18,11 @@ import secrets
 import stat
 import subprocess
 import sys
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from episode_schema import EpisodeV2Supplement
 
 
 TAXONOMY = {
@@ -37,6 +41,7 @@ _RUN_ID_RE = re.compile(r"^obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 _WORKSPACE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _REVISION_RE = re.compile(r"^(?:[0-9a-f]{7,40}|unknown)$")
 _TASK_REF_RE = re.compile(r"^\[\[([A-Za-z0-9][A-Za-z0-9._-]*)\]\]$")
+_WORKFLOW_GENERATION_RE = re.compile(r"^[a-z0-9][a-z0-9._:@+\-]{0,199}$")
 _PAYLOAD_LIMIT = 64 * 1024
 _SCALAR_LIMIT = 200
 _MAX_INTEGER_DIGITS = 18
@@ -148,6 +153,8 @@ class StartRequest:
     workflow_variant: str
     task_ref: str | None
     sources: tuple[str, ...]
+    episode_schema_version: int = 1
+    workflow_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +384,20 @@ def _start_request_errors(request: StartRequest) -> list[str]:
         or request.workflow_variant not in TAXONOMY[request.task_type]
     ):
         errors.append("invalid taxonomy combination")
+    if type(request.episode_schema_version) is not int or request.episode_schema_version not in {
+        1,
+        2,
+    }:
+        errors.append("episode_schema_version must be exact integer 1 or 2")
+    elif request.episode_schema_version == 1:
+        if request.workflow_generation is not None:
+            errors.append("schema-v1 start cannot contain workflow_generation")
+    elif request.workflow_generation is not None and (
+        not isinstance(request.workflow_generation, str)
+        or _WORKFLOW_GENERATION_RE.fullmatch(request.workflow_generation) is None
+        or request.workflow_generation in {"unknown", "unavailable"}
+    ):
+        errors.append("workflow_generation is invalid")
     try:
         _validate_task_ref(request.task_ref)
     except ObservationError as error:
@@ -741,7 +762,12 @@ def validate_record(
     }
     if not isinstance(metadata, dict):
         return ["observation metadata must be an object"]
-    allowed = required | {"task_ref", "superseded_by"}
+    allowed = required | {
+        "task_ref",
+        "superseded_by",
+        "schema_version",
+        "workflow_generation",
+    }
     for field in sorted(set(metadata) - allowed):
         errors.append(f"unexpected frontmatter field `{field}`")
     for field in sorted(required - set(metadata)):
@@ -770,12 +796,20 @@ def validate_record(
 
     sources = metadata.get("sources")
     request = StartRequest(
-        metadata.get("title"), metadata.get("project"), metadata.get("workspace"),
-        metadata.get("workspace_id"), metadata.get("revision"),
-        metadata.get("working_tree"), metadata.get("agent_surface"),
-        metadata.get("start_mode"), metadata.get("task_type"),
-        metadata.get("workflow_variant"), metadata.get("task_ref"),
-        tuple(sources) if isinstance(sources, list) else sources,
+        title=metadata.get("title"),
+        project=metadata.get("project"),
+        workspace=metadata.get("workspace"),
+        workspace_id=metadata.get("workspace_id"),
+        revision=metadata.get("revision"),
+        working_tree=metadata.get("working_tree"),
+        agent_surface=metadata.get("agent_surface"),
+        start_mode=metadata.get("start_mode"),
+        task_type=metadata.get("task_type"),
+        workflow_variant=metadata.get("workflow_variant"),
+        task_ref=metadata.get("task_ref"),
+        sources=tuple(sources) if isinstance(sources, list) else sources,
+        episode_schema_version=metadata.get("schema_version", 1),
+        workflow_generation=metadata.get("workflow_generation"),
     )
     errors.extend(_start_request_errors(request))
 
@@ -816,20 +850,34 @@ def validate_record(
         errors.append(f"invalid status `{status}`")
     superseded_by = metadata.get("superseded_by")
 
+    human_body = body
+    try:
+        from episode_schema import (
+            EpisodeSchemaError,
+            canonical_episode_projection,
+            parse_episode_block,
+        )
+
+        projection = _episode_projection_policy()
+        human_body, _episode = parse_episode_block(body, projection)
+        canonical_episode_projection(metadata, body, projection)
+    except (EpisodeSchemaError, ObservationError) as error:
+        errors.append(str(error))
+
     if status == "draft":
         if superseded_by is not None:
             errors.append("draft record must not contain superseded_by")
         try:
-            parse_scope_payload(body)
+            parse_scope_payload(human_body)
         except ObservationError:
             errors.append("draft record must contain only Scope")
         return errors
 
     scope_marker = "\n## Execution evidence"
-    if scope_marker not in body:
+    if scope_marker not in human_body:
         errors.append("final record must contain Scope and completion sections")
         return errors
-    scope_text, completion_tail = body.split(scope_marker, 1)
+    scope_text, completion_tail = human_body.split(scope_marker, 1)
     try:
         parse_scope_payload(scope_text.rstrip() + "\n")
     except ObservationError as error:
@@ -926,6 +974,12 @@ def _draft_metadata(
         "title": request.title,
         "tags": ["observation", "workflow"],
         "run_id": run_id,
+    }
+    if request.episode_schema_version == 2:
+        metadata["schema_version"] = 2
+        if request.workflow_generation is not None:
+            metadata["workflow_generation"] = request.workflow_generation
+    metadata.update({
         "timestamp": started.isoformat(),
         "project": request.project,
         "workspace": request.workspace,
@@ -937,7 +991,7 @@ def _draft_metadata(
         "workflow_variant": request.workflow_variant,
         "status": "draft",
         "start_mode": request.start_mode,
-    }
+    })
     if request.task_ref is not None:
         metadata["task_ref"] = request.task_ref
     metadata["sources"] = list(request.sources)
@@ -952,6 +1006,20 @@ def _render_frontmatter(metadata: dict[str, object]) -> str:
         )
     lines.extend(["---", ""])
     return "\n".join(lines)
+
+
+def _episode_projection_policy() -> dict[str, dict[str, object]]:
+    from policy_artifacts import load_policy_set
+
+    policy_root = Path(__file__).resolve().parents[1] / "policies"
+    try:
+        return load_policy_set(
+            policy_root,
+            analyzer_files=(),
+            canonicalizer_files=("scripts/canonical_json.py",),
+        ).documents
+    except (OSError, ValueError) as error:
+        raise _validation(f"could not load Episode projection policy: {error}") from error
 
 
 def _render_draft(
@@ -1323,6 +1391,7 @@ def _render_completed_record(
     superseded_by: str | None,
     finished: datetime,
     paths: ObservationPaths,
+    episode_v2: EpisodeV2Supplement | None,
 ) -> str:
     started = _aware_datetime(metadata.get("timestamp"), "timestamp")
     if finished < started:
@@ -1338,6 +1407,31 @@ def _render_completed_record(
         + "\n\n"
         + _render_completion(payload, finished, elapsed_seconds)
     )
+    if metadata.get("schema_version", 1) == 2:
+        if episode_v2 is None:
+            raise _validation("final schema-v2 observation requires an Episode supplement")
+        try:
+            from episode_schema import build_episode_v2, render_episode_block
+
+            episode = build_episode_v2(
+                elapsed_seconds=elapsed_seconds,
+                completion_metrics={
+                    "verification": payload.verification,
+                    "review_rounds": payload.review_rounds,
+                    "defects_found": payload.defects_found,
+                    "rework_count": payload.rework_count,
+                },
+                supplement=episode_v2,
+            )
+            completed_body = (
+                completed_body.rstrip()
+                + "\n\n"
+                + render_episode_block(episode)
+            )
+        except ValueError as error:
+            raise _validation(str(error)) from error
+    elif episode_v2 is not None:
+        raise _validation("schema-v1 observation cannot contain an Episode supplement")
     _raise_record_validation(
         validate_record(completed_metadata, completed_body, paths)
     )
@@ -1652,6 +1746,7 @@ def finish_observation(
     payload: CompletionPayload,
     superseded_by: str | None = None,
     now: datetime | None = None,
+    episode_v2: EpisodeV2Supplement | None = None,
 ) -> None:
     """Atomically transition one draft record to exactly one final status."""
 
@@ -1662,6 +1757,11 @@ def finish_observation(
             raise _validation("superseded status requires superseded_by")
     elif superseded_by is not None:
         raise _validation("superseded_by is only valid for superseded status")
+    if episode_v2 is not None:
+        from episode_schema import EpisodeV2Supplement
+
+        if not isinstance(episode_v2, EpisodeV2Supplement):
+            raise _validation("episode_v2 must be a validated EpisodeV2Supplement")
     finished = _validated_event_time(now, "finish time")
     secure_paths, run_lock = _open_run_lock(paths, run_id)
     observations_fd: int | None = None
@@ -1683,6 +1783,7 @@ def finish_observation(
             superseded_by,
             finished,
             secure_paths,
+            episode_v2,
         )
         run_lock.verify()
         _replace_completed_record(

@@ -29,6 +29,7 @@ from episode_schema import (
     parse_v2_supplement,
     render_episode_block,
 )
+from wiki_observations import StartRequest, validate_start_request
 from workflow_evolution_fixtures import (
     DECISION,
     EXPECTED_CANONICAL_EPISODE_KEYS,
@@ -61,6 +62,46 @@ class EpisodeV2Tests(unittest.TestCase):
             supplement=supplement,
         )
         return V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
+
+    def _start_request(self, **overrides):
+        values = {
+            "title": "Workflow evolution lifecycle",
+            "project": "workflow-observatory",
+            "workspace": "workflow-observatory",
+            "workspace_id": "0123456789ab",
+            "revision": "0123456789abcdef",
+            "working_tree": "clean",
+            "agent_surface": "codex",
+            "start_mode": "planned",
+            "task_type": "maintenance",
+            "workflow_variant": "implementation-with-review",
+            "task_ref": None,
+            "sources": (),
+        }
+        values.update(overrides)
+        return StartRequest(**values)
+
+    def test_lifecycle_start_request_defaults_preserve_schema_v1(self):
+        request = self._start_request()
+
+        validate_start_request(request)
+
+        self.assertEqual(1, request.episode_schema_version)
+        self.assertIsNone(request.workflow_generation)
+
+    def test_lifecycle_start_request_accepts_explicit_v2_generation(self):
+        request = self._start_request(
+            episode_schema_version=2,
+            workflow_generation="implementation-with-review@2",
+        )
+
+        validate_start_request(request)
+
+        self.assertEqual(2, request.episode_schema_version)
+        self.assertEqual(
+            "implementation-with-review@2",
+            request.workflow_generation,
+        )
 
     def test_v2_round_trip_is_canonical(self):
         supplement = parse_v2_supplement(V2_SUPPLEMENT, self.projection)
