@@ -1,8 +1,8 @@
 # Workflow Evolution Foundation v0.2 Implementation Plan
 
-Status: Revised after the second external review; focused external re-approval
-of the five remaining execution-contract amendments is required before Task 1.
-The underlying design remains approved.
+Status: Revised after focused external re-review; final focused approval of the
+Candidate Eligibility and Identity amendment is required before Task 1. The
+underlying design remains approved.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` (recommended) or `executing-plans` to implement
@@ -730,12 +730,17 @@ top-level keys `schema_version`, `version`, `candidate_classes`,
 ```
 
 `minimum_denominator` is `one-observed-episode@1` for non-Decision rules and
-`decision-pattern-support@1` for Decision rules. Rule rows name the exact evidence fields
-defined in Task 8. Zero-only defect, rework, test-failure, and timeout values do
-not emit candidates. All non-Decision candidates are `descriptive` in v0.2;
-only a Decision pattern satisfying its independent support policy is
-`recurring`. Adding a rule, changing a predicate, or changing evidence fields
-requires new candidate-policy bytes/version.
+`decision-pattern-support@1` for Decision rules. The former means at least one
+eligible Episode in the rule's source collection, not at least one observed
+metric value; the rule predicate supplies any stronger observed-value
+requirement. `any-metric` is a selector expanded over concrete metric keys and
+is prohibited in emitted candidate evidence. Rule rows name the exact evidence
+fields defined in Task 8. Zero-only defect, rework, test-failure, and timeout
+values do not emit candidates. All non-Decision candidates are `descriptive`
+in v0.2; only a Decision pattern satisfying both its independent support policy
+and Task 7 comparative-inference eligibility is `recurring`. Adding a rule,
+changing a predicate, or changing evidence fields requires new
+candidate-policy bytes/version.
 
 - [ ] **Step 4: Implement manifest validation and policy loading**
 
@@ -1097,6 +1102,16 @@ retains its normalized decimal string without conversion. `runtime_provenance`
 is JSON null in projection version `episode-projection@2` because neither v1
 nor the bounded v2 supplement records a versioned model/runtime identity; it
 is never inferred.
+
+`started_at` and a final Episode's `finished_at` are canonical
+second-precision UTC `Z` instants. A draft has JSON-null `finished_at`; no other
+status may omit it. The v2 Episode block retains validated
+`measurement_source` as source attribution for human/audit readback, but
+`episode-projection@2` deliberately does not copy it into the Learning Snapshot
+because v0.2 defines no comparison, grouping, candidate, or denominator
+semantics for that shared execution qualifier. It is not inferred or silently
+converted into a per-metric label. An analyzer that consumes it requires a new
+projection policy version and reviewed metric semantics.
 
 Each Decision object has exactly `sequence`, `phase`, `actor_role`,
 `decision_type`, `reason_code`, `result`, and `summary`. `summary` remains
@@ -1810,6 +1825,15 @@ Group outcomes by the exact six-part key:
 )
 ```
 
+Every cohort and legacy descriptive collection exposes the exact handoff fields
+`comparative_inference_eligible` and `comparative_inference_exclusions`.
+Eligibility is true only when the exclusions array is empty. The array contains
+only the sorted bounded values `generation-unavailable` and
+`heterogeneous-runtime-provenance`; it is derived from the same facts that
+produce the exclusion ledger and cannot be independently overridden by Task 8.
+Sample size and Decision support remain separate gates: a cohort can be
+comparable but too small for a particular inference.
+
 Final non-invalidated `success`, `partial`, `failed`, and `rolled-back`
 Episodes enter outcome analysis. Draft, superseded, and invalidated records
 enter only overlapping lifecycle predicates. Generation `unavailable` uses a
@@ -1901,8 +1925,13 @@ Define `self.core_with_decisions(events_by_run_id)` by placing the supplied
 Decision arrays into five otherwise equivalent v2 Episode projections and
 calling public `build_snapshot_core`. Define `self.lifecycle_candidate(as_of)`
 from one stale-draft fixture and `self.core_with_multiple_candidates()` from
-one fixture that deterministically triggers two candidate classes. No helper
-computes IDs or support itself.
+one fixture that deterministically triggers two candidate classes.
+`self.core_with_recurring_decision_pattern(...)` builds five valid projections
+that share one supported pattern while varying only the named generation or
+runtime provenance through the Task 7 fixture boundary.
+`self.core_with_equal_missingness(metrics)` assigns equal missingness to the
+named concrete metrics. No helper computes IDs, support, comparability, wildcard
+expansion, or candidate eligibility itself.
 
 ```python
 def test_one_episode_cannot_dominate_decision_recurrence(self):
@@ -1956,6 +1985,57 @@ def test_zero_only_adverse_metrics_emit_no_quality_or_timeout_candidate(self):
     self.assertTrue({
         "defect-observed", "rework-observed", "test-failure-observed", "timeout-observed"
     }.isdisjoint(types))
+
+
+def test_unavailable_generation_decision_pattern_remains_descriptive(self):
+    core = self.core_with_recurring_decision_pattern(
+        workflow_generation={"availability": "unavailable", "value": None},
+    )
+    self.assertEqual(
+        "descriptive",
+        core["decision_patterns"][0]["evidence_strength"],
+    )
+    self.assertFalse(any(
+        candidate["class"] == "decision-pattern"
+        for candidate in core["candidates"]
+    ))
+
+
+def test_heterogeneous_runtime_cohort_emits_no_decision_candidate(self):
+    core = self.core_with_recurring_decision_pattern(
+        runtime_generations=["runtime@1", "runtime@2"],
+    )
+    self.assertIn(
+        "heterogeneous-runtime-provenance",
+        {row["reason"] for row in core["exclusion_ledger"]},
+    )
+    self.assertEqual(
+        "descriptive",
+        core["decision_patterns"][0]["evidence_strength"],
+    )
+    self.assertFalse(any(
+        candidate["class"] == "decision-pattern"
+        for candidate in core["candidates"]
+    ))
+
+
+def test_any_metric_candidates_bind_concrete_metric_identity(self):
+    core = self.core_with_equal_missingness(
+        metrics=("input_tokens", "output_tokens"),
+    )
+    candidates = [
+        item for item in core["candidates"]
+        if item["candidate_type"] == "metric-missingness"
+    ]
+    self.assertEqual(
+        {"input_tokens", "output_tokens"},
+        {item["source"]["identity"] for item in candidates},
+    )
+    self.assertTrue(all(
+        item["evidence"]["missingness"]["observed_n"] == 0
+        for item in candidates
+    ))
+    self.assertEqual(2, len({item["candidate_id"] for item in candidates}))
 ```
 
 - [ ] **Step 2: Run named tests and verify RED**
@@ -1990,9 +2070,18 @@ one to `episode_count_with_event`. `support_fraction` has exact integer keys
 `numerator` and `denominator`; compare it to the policy's normalized decimal
 threshold through `fractions.Fraction`, never float or rounded decimal output.
 Below the independent `3 Episodes + 0.40` policy the row is `descriptive`; at
-or above both thresholds it is `recurring` and may emit a Decision candidate.
-Pattern rows remain sorted by JCS bytes of
+or above both thresholds it is eligible for the comparability gate described
+next. Pattern rows remain sorted by JCS bytes of
 `(pattern_kind, pattern)`.
+
+A Decision pattern is `recurring` only when both numeric support thresholds
+are satisfied **and** its containing cohort has
+`comparative_inference_eligible: true` from Task 7. A cohort whose exclusions
+contain `generation-unavailable` or `heterogeneous-runtime-provenance` may
+still expose deterministic Decision pattern counts, but every pattern remains
+`descriptive` and no `decision-pattern` candidate is emitted. Task 8 consumes
+the Task 7 comparability fields directly and may not recompute, weaken, or
+override them.
 
 - [ ] **Step 4: Emit deterministic unranked candidates**
 
@@ -2025,6 +2114,24 @@ named by that rule's `policy_identity_keys`; no mutable label is substituted.
 For lifecycle candidates it includes the exact staleness policy and `as_of` in
 evidence. Non-Decision candidates remain `descriptive` in v0.2. A Decision
 candidate is emitted only for a `recurring` pattern row.
+
+For a metric rule, the policy `source` is a selector, never the emitted source
+identity. A concrete source such as `input_tokens` selects exactly that metric.
+`any-metric` iterates every concrete key in `metric_semantics.json` in UTF-8
+byte order and evaluates the predicate independently. Every emitted metric
+candidate sets `source.kind` to `metric`, `source.identity` to that concrete
+metric key, and `source.semantics_id` to that metric entry's exact semantics
+ID. Consequently `input_tokens` and `output_tokens` remain different candidate
+evidence even when their semantics IDs and missingness counts are equal; the
+concrete identity is included in `candidate_id` input.
+
+`one-observed-episode@1` means the rule's applicable source collection has at
+least one eligible Episode. It does **not** mean a metric has
+`observed_n > 0`. The rule predicate remains the authoritative additional
+threshold: `observed-count-positive` and `positive-observed-value` require
+observed metric values, while missingness, unsupported-schema, stale,
+invalidation, generation, and outcome rules may trigger with metric
+`observed_n == 0` when their own named count is positive.
 
 Build all values from deterministic snapshot fields only. Compute:
 
@@ -2480,9 +2587,9 @@ begins.
 | `test_02_machine_timezone_does_not_change_manifest` | Acquire the same Taipei date query under `TZ=UTC` and `TZ=America/Los_Angeles`; assert equal manifest bytes. |
 | `test_03_store_change_aborts_without_snapshot` | Finalize a selected draft between acquisition A and B; assert normalized state error and an empty snapshots directory. |
 | `test_04_adapter_fixtures_project_identically` | Build equivalent portable and current-layout LLMWiki roots; assert equal semantic bundle bytes. |
-| `test_05_v1_absence_is_not_zero_or_v2_missing` | Mix four v1, two v2-null, and two v2-observed values; assert the exact 4/2/2/0 missingness partition. |
+| `test_05_v1_absence_is_not_zero_or_v2_missing` | Mix four v1, two v2-null, and two v2-observed values; assert the exact 4/2/2/0 missingness partition, then give `input_tokens` and `output_tokens` equal zero-observed missingness and assert distinct concrete source identities and candidate IDs. |
 | `test_06_lifecycle_records_do_not_enter_outcome_denominator` | Mix four outcomes, drafts, superseded, and invalidated records; assert outcome `n=4` and separate overlapping lifecycle counts. |
-| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. |
+| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. Repeat a numerically supported pattern in generation-unavailable and heterogeneous-runtime cohorts; assert descriptive patterns and no Decision candidates. |
 | `test_08_reviewed_mapping_derived_view_counts_once` | Present one physical Episode plus its reviewed workflow-generation mapping; assert exactly one canonical projected Episode for that `run_id`. |
 | `test_09_gate_failure_produces_no_snapshot_or_proposal` | Break a task reference; assert no snapshot directory member and no proposal artifact anywhere in the fake home. |
 | `test_10_authoritative_tamper_is_not_acceptance` | Change learning artifact `authoritative` to true; assert schema rejection even after recomputing a generic file digest. |
