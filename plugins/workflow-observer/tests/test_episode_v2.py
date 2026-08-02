@@ -11,6 +11,10 @@ import unittest
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = PLUGIN_ROOT / "scripts"
 TESTS = PLUGIN_ROOT / "tests"
+EXPECTED_FIXTURE_SHA256 = {
+    "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
+    "v2": "7ac2d72af20edee8bf0303b4612551132ac8bfd316178292d3eb4d0819dadf08",
+}
 for module_root in (SCRIPTS, TESTS):
     if str(module_root) not in sys.path:
         sys.path.insert(0, str(module_root))
@@ -32,6 +36,7 @@ from workflow_evolution_fixtures import (
     PRIVACY_SENTINEL,
     V1_BODY,
     V1_METADATA,
+    V2_METADATA,
     V2_SUPPLEMENT,
     load_projection_policy,
     temporary_timezone,
@@ -101,6 +106,18 @@ class EpisodeV2Tests(unittest.TestCase):
             projected["metrics"]["test_failures"]["availability"],
         )
         self.assertEqual([], projected["decisions"])
+        self.assertEqual(
+            {"availability": "unavailable", "value": None},
+            projected["workflow_generation"],
+        )
+
+    def test_v1_projection_rejects_additive_workflow_generation_metadata(self):
+        metadata = {
+            **V1_METADATA,
+            "workflow_generation": "implementation-with-review@2",
+        }
+        with self.assertRaisesRegex(EpisodeSchemaError, "workflow_generation"):
+            canonical_episode_projection(metadata, V1_BODY, self.projection)
 
     def test_projection_has_exact_privacy_safe_keys(self):
         metadata = {
@@ -259,7 +276,7 @@ class EpisodeV2Tests(unittest.TestCase):
         )
         body = V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
         projected = canonical_episode_projection(
-            V1_METADATA,
+            V2_METADATA,
             body,
             self.projection,
         )
@@ -286,6 +303,78 @@ class EpisodeV2Tests(unittest.TestCase):
         self.assertIsNone(projected["runtime_provenance"])
         self.assertNotIn("measurement_source", canonicalize(projected).decode())
 
+    def test_v2_missing_generation_is_unavailable_and_never_inferred(self):
+        supplement = parse_v2_supplement(V2_SUPPLEMENT, self.projection)
+        episode = build_episode_v2(
+            elapsed_seconds=120,
+            completion_metrics={
+                "verification": "pass",
+                "review_rounds": 1,
+                "defects_found": 0,
+                "rework_count": 0,
+            },
+            supplement=supplement,
+        )
+        body = V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
+        metadata = {
+            **V1_METADATA,
+            "workflow_variant": "maintenance-basic",
+            "revision": "fedcba9876543210",
+            "timestamp": "2026-08-02T00:00:00Z",
+        }
+        projected = canonical_episode_projection(metadata, body, self.projection)
+        self.assertEqual(
+            {"availability": "unavailable", "value": None},
+            projected["workflow_generation"],
+        )
+
+    def test_v2_generation_uses_only_valid_explicit_metadata(self):
+        supplement = parse_v2_supplement(V2_SUPPLEMENT, self.projection)
+        episode = build_episode_v2(
+            elapsed_seconds=120,
+            completion_metrics={
+                "verification": "pass",
+                "review_rounds": 1,
+                "defects_found": 0,
+                "rework_count": 0,
+            },
+            supplement=supplement,
+        )
+        body = V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
+        explicit = "reviewed.gen+candidate@2"
+        projected = canonical_episode_projection(
+            {**V1_METADATA, "workflow_generation": explicit},
+            body,
+            self.projection,
+        )
+        self.assertEqual(
+            {"availability": "observed", "value": explicit},
+            projected["workflow_generation"],
+        )
+
+        invalid = (
+            None,
+            2,
+            "",
+            "unknown",
+            "unavailable",
+            "Uppercase@2",
+            "-leading-hyphen",
+            "contains space",
+            "contains/slash",
+            "x" * 201,
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                EpisodeSchemaError,
+                "workflow_generation",
+            ):
+                canonical_episode_projection(
+                    {**V1_METADATA, "workflow_generation": value},
+                    body,
+                    self.projection,
+                )
+
     def test_projection_uses_utc_second_instants_independent_of_process_timezone(self):
         with temporary_timezone("Pacific/Honolulu"):
             projected = canonical_episode_projection(
@@ -309,6 +398,14 @@ class EpisodeV2Tests(unittest.TestCase):
         for adapter in ("portable", "llmwiki"):
             with self.subTest(adapter=adapter), FakeObservationStore(adapter) as store:
                 store.store_root.resolve().relative_to(store.base)
+                self.assertTrue(
+                    hasattr(store, "expected_raw_bytes"),
+                    "fixture must expose expected bytes assembled before writing",
+                )
+                self.assertEqual(
+                    EXPECTED_FIXTURE_SHA256,
+                    store.expected_raw_sha256,
+                )
                 expected_task_suffix = (
                     "wiki/tasks"
                     if adapter == "portable"
@@ -316,13 +413,15 @@ class EpisodeV2Tests(unittest.TestCase):
                 )
                 self.assertTrue(store.tasks.as_posix().endswith(expected_task_suffix))
                 for path, key in ((store.v1_path, "v1"), (store.v2_path, "v2")):
+                    raw = path.read_bytes()
                     self.assertEqual(
                         stat.S_IMODE(path.stat().st_mode),
                         0o600,
                     )
+                    self.assertEqual(store.expected_raw_bytes[key], raw)
                     self.assertEqual(
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                        store.expected_raw_sha256[key],
+                        EXPECTED_FIXTURE_SHA256[key],
+                        hashlib.sha256(raw).hexdigest(),
                     )
                 self.assertEqual(0o600, stat.S_IMODE(store.task_path.stat().st_mode))
 

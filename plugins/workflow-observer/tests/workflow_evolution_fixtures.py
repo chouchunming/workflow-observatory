@@ -15,6 +15,10 @@ from policy_artifacts import load_policy_set
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 POLICY_ROOT = PLUGIN_ROOT / "policies"
 PRIVACY_SENTINEL = "PRIVATE-EVIDENCE-6f92d978b81f"
+_EXPECTED_RAW_SHA256 = {
+    "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
+    "v2": "7ac2d72af20edee8bf0303b4612551132ac8bfd316178292d3eb4d0819dadf08",
+}
 EXPECTED_CANONICAL_EPISODE_KEYS = {
     "run_id",
     "episode_schema_version",
@@ -80,6 +84,10 @@ V1_METADATA = {
     "status": "success",
     "start_mode": "planned",
     "sources": [],
+}
+V2_METADATA = {
+    **V1_METADATA,
+    "workflow_generation": "implementation-with-review@2",
 }
 V1_BODY = """## Scope
 
@@ -236,28 +244,29 @@ class FakeObservationStore:
             directory.chmod(0o700)
 
         self.task_path = self.tasks / "fixture-task.md"
-        self._write_private(self.task_path, "# Fixture task\n")
+        self._write_private(self.task_path, b"# Fixture task\n")
         self.v1_path = self.observations / "obs-20260802-000000-abcdef.md"
-        v2_metadata = {**V1_METADATA, "run_id": "obs-20260802-000001-fedcba"}
-        self.v2_path = self.observations / "obs-20260802-000001-fedcba.md"
-        self._write_private(
-            self.v1_path,
-            _render_frontmatter(V1_METADATA) + V1_BODY,
-        )
-        self._write_private(
-            self.v2_path,
-            _render_frontmatter(v2_metadata) + _v2_body(),
-        )
-        self.expected_raw_sha256 = {
-            "v1": hashlib.sha256(self.v1_path.read_bytes()).hexdigest(),
-            "v2": hashlib.sha256(self.v2_path.read_bytes()).hexdigest(),
+        v2_metadata = {
+            **V2_METADATA,
+            "run_id": "obs-20260802-000001-fedcba",
         }
+        self.v2_path = self.observations / "obs-20260802-000001-fedcba.md"
+        self.expected_raw_bytes = {
+            "v1": (_render_frontmatter(V1_METADATA) + V1_BODY).encode("utf-8"),
+            "v2": (_render_frontmatter(v2_metadata) + _v2_body()).encode("utf-8"),
+        }
+        self.expected_raw_sha256 = dict(_EXPECTED_RAW_SHA256)
+        for key, expected in self.expected_raw_bytes.items():
+            if hashlib.sha256(expected).hexdigest() != self.expected_raw_sha256[key]:
+                raise AssertionError(f"reviewed {key} fixture digest is stale")
+        self._write_private(self.v1_path, self.expected_raw_bytes["v1"])
+        self._write_private(self.v2_path, self.expected_raw_bytes["v2"])
         self.v1_raw_sha256 = self.expected_raw_sha256["v1"]
         self.v2_raw_sha256 = self.expected_raw_sha256["v2"]
 
-    def _write_private(self, path: Path, text: str) -> None:
+    def _write_private(self, path: Path, content: bytes) -> None:
         path.resolve(strict=False).relative_to(self.base)
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(content)
         path.chmod(0o600)
 
     def close(self) -> None:

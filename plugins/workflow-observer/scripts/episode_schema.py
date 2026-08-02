@@ -23,6 +23,9 @@ from wiki_observations import (
 _MAX_SAFE_INTEGER = (2**53) - 1
 _COST_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?")
 _CURRENCY_PATTERN = re.compile(r"[A-Z]{3}")
+_WORKFLOW_GENERATION_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9._:@+\-]{0,199}"
+)
 _ABSOLUTE_POSIX_PATH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_./-])/(?!/)[^\s]+"
 )
@@ -526,6 +529,28 @@ def _metadata_string(metadata: Mapping, name: str) -> str:
     return value
 
 
+def _project_workflow_generation(
+    metadata: Mapping,
+    schema_version: int,
+) -> dict[str, object]:
+    if schema_version == 1:
+        if "workflow_generation" in metadata:
+            raise EpisodeSchemaError(
+                "schema-v1 metadata cannot contain workflow_generation"
+            )
+        return {"availability": "unavailable", "value": None}
+    if "workflow_generation" not in metadata:
+        return {"availability": "unavailable", "value": None}
+    value = metadata["workflow_generation"]
+    if (
+        not isinstance(value, str)
+        or _WORKFLOW_GENERATION_PATTERN.fullmatch(value) is None
+        or value in {"unknown", "unavailable"}
+    ):
+        raise EpisodeSchemaError("workflow_generation metadata is invalid")
+    return {"availability": "observed", "value": value}
+
+
 def canonical_episode_projection(
     metadata: Mapping,
     body: str,
@@ -639,10 +664,10 @@ def canonical_episode_projection(
         "agent_surface": _metadata_string(metadata, "agent_surface"),
         "task_type": _metadata_string(metadata, "task_type"),
         "workflow_variant": workflow_variant,
-        "workflow_generation": {
-            "availability": "observed",
-            "value": f"{workflow_variant}@{schema_version}",
-        },
+        "workflow_generation": _project_workflow_generation(
+            metadata,
+            schema_version,
+        ),
         "status": status,
         "metrics": metrics,
         "runtime_provenance": None,
