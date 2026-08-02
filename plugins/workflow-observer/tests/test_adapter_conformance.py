@@ -21,6 +21,7 @@ CLI = PLUGIN_ROOT / "scripts/workflow_observer_cli.py"
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 from store_config import LLMWIKI_SEMANTICS, PORTABLE_SEMANTICS
+from canonical_json import canonicalize
 
 SCOPE_TEXT = """## Scope
 
@@ -549,6 +550,107 @@ class AdapterConformanceTests(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertEqual("", result.stdout)
         self.assertTrue(result.stderr.startswith("workflow observer io error:"))
+
+    def test_snapshot_input_cli_has_canonical_adapter_neutral_semantics(self):
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        portable_record = (
+            self.homes["portable"] / "store/wiki/observations" / f"{run_id}.md"
+        )
+        llmwiki_record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        llmwiki_record.write_bytes(portable_record.read_bytes())
+
+        arguments = (
+            "snapshot-input",
+            "--since", "2020-01-01",
+            "--until", "2030-12-31",
+            "--timezone", "UTC",
+        )
+        portable = self.run_cli("portable", *arguments)
+        llmwiki = self.run_cli("llmwiki", *arguments)
+
+        self.assertEqual((0, ""), (portable.returncode, portable.stderr))
+        self.assertEqual((0, ""), (llmwiki.returncode, llmwiki.stderr))
+        portable_bundle = json.loads(portable.stdout)
+        llmwiki_bundle = json.loads(llmwiki.stdout)
+        self.assertEqual(
+            {"adapter", "store_identity", "semantic_bundle"},
+            set(portable_bundle),
+        )
+        self.assertEqual(
+            canonicalize(portable_bundle).decode("utf-8") + "\n",
+            portable.stdout,
+        )
+        self.assertEqual(
+            canonicalize(llmwiki_bundle).decode("utf-8") + "\n",
+            llmwiki.stdout,
+        )
+        self.assertEqual(
+            portable_bundle["semantic_bundle"],
+            llmwiki_bundle["semantic_bundle"],
+        )
+        self.assertEqual("portable", portable_bundle["adapter"]["name"])
+        self.assertEqual("llmwiki", llmwiki_bundle["adapter"]["name"])
+        self.assertNotIn(str(self.base), portable.stdout)
+        self.assertNotIn(str(self.base), llmwiki.stdout)
+
+    def test_snapshot_input_cli_rejects_noncanonical_as_of_without_stdout(self):
+        result = self.run_cli(
+            "portable",
+            "snapshot-input",
+            "--since", "2026-08-02",
+            "--until", "2026-08-02",
+            "--timezone", "UTC",
+            "--as-of", "2026-08-03T00:00:00+00:00",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertTrue(result.stderr.startswith(
+            "workflow observer validation error:"
+        ))
+
+    def test_snapshot_input_cli_rejects_explicit_empty_as_of(self):
+        result = self.run_cli(
+            "portable",
+            "snapshot-input",
+            "--since", "2026-08-02",
+            "--until", "2026-08-02",
+            "--timezone", "UTC",
+            "--as-of", "",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("lifecycle_as_of", result.stderr)
+
+    def test_snapshot_input_cli_requires_extended_iso_dates(self):
+        result = self.run_cli(
+            "portable",
+            "snapshot-input",
+            "--since", "20260802",
+            "--until", "2026-08-02",
+            "--timezone", "UTC",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("snapshot dates must use YYYY-MM-DD", result.stderr)
+
+    def test_snapshot_input_cli_rejects_sensitive_filter_before_store_access(self):
+        result = self.run_cli(
+            "portable",
+            "snapshot-input",
+            "--since", "2026-08-02",
+            "--until", "2026-08-02",
+            "--timezone", "UTC",
+            "--project", "/Users/alice/private-project",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("sensitive path or credential", result.stderr)
 
 
 if __name__ == "__main__":

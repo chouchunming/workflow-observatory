@@ -22,6 +22,16 @@ from store_config import (
 )
 import wiki_observations
 from episode_schema import EpisodeSchemaError, parse_v2_supplement
+from policy_artifacts import PolicyError, load_policy_set
+from canonical_json import CanonicalizationError
+from snapshot_input import (
+    SNAPSHOT_ANALYZER_FILES,
+    SnapshotInputError,
+    SnapshotQuery,
+    acquire_snapshot_input,
+    canonical_interval,
+    validate_snapshot_query,
+)
 from wiki_observations import ObservationError, ObservationPaths
 
 
@@ -42,6 +52,19 @@ def _report_date(value: str) -> date:
     except (TypeError, ValueError) as error:
         raise ObservationError(
             "validation", "report dates must use YYYY-MM-DD"
+        ) from error
+
+
+def _snapshot_date(value: str) -> date:
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None:
+        raise ObservationError(
+            "validation", "snapshot dates must use YYYY-MM-DD"
+        )
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError) as error:
+        raise ObservationError(
+            "validation", "snapshot dates must use YYYY-MM-DD"
         ) from error
 
 
@@ -88,6 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--status")
     report.add_argument("--since", type=_report_date)
     report.add_argument("--until", type=_report_date)
+
+    snapshot = subparsers.add_parser("snapshot-input")
+    snapshot.add_argument("--since", required=True, type=_snapshot_date)
+    snapshot.add_argument("--until", required=True, type=_snapshot_date)
+    snapshot.add_argument("--timezone", required=True)
+    snapshot.add_argument("--project")
+    snapshot.add_argument("--workspace")
+    snapshot.add_argument("--workspace-id")
+    snapshot.add_argument("--task-type")
+    snapshot.add_argument("--as-of")
 
     subparsers.add_parser("validate")
     subparsers.add_parser("integrity")
@@ -440,6 +473,37 @@ def _empty_report(filters: wiki_observations.ReportFilters) -> str:
     )
 
 
+def _snapshot_query(args: argparse.Namespace) -> SnapshotQuery:
+    interval = canonical_interval(args.since, args.until, args.timezone)
+    query = SnapshotQuery(
+        interval=interval,
+        lifecycle_as_of=(
+            args.as_of
+            if args.as_of is not None
+            else interval["until_exclusive"]
+        ),
+        project=args.project,
+        workspace=args.workspace,
+        workspace_id=args.workspace_id,
+        task_type=args.task_type,
+    )
+    validate_snapshot_query(query)
+    return query
+
+
+def _snapshot_policy_set():
+    plugin_root = Path(__file__).resolve().parents[1]
+    try:
+        return load_policy_set(
+            plugin_root / "policies",
+            analyzer_files=SNAPSHOT_ANALYZER_FILES,
+            canonicalizer_files=("scripts/canonical_json.py",),
+        )
+    except (PolicyError, CanonicalizationError, OSError) as error:
+        kind = "io" if isinstance(error, OSError) else "validation"
+        raise SnapshotInputError(kind, f"could not load snapshot policy: {error}") from error
+
+
 def _run_bundled(
     args: argparse.Namespace,
     config: StoreConfig,
@@ -455,6 +519,20 @@ def _run_bundled(
         print(wiki_observations.start_observation(
             paths, request, scope, semantics=semantics
         ))
+        return 0
+    if args.command == "snapshot-input":
+        query = _snapshot_query(args)
+        policy_set = _snapshot_policy_set()
+        paths = (
+            _portable_paths(config, missing_ok=False)
+            if semantics.name == "portable"
+            else ObservationPaths.from_root(config.root)
+        )
+        assert paths is not None
+        acquired = acquire_snapshot_input(
+            paths, semantics, query, policy_set
+        )
+        sys.stdout.write(acquired.manifest_bytes.decode("utf-8") + "\n")
         return 0
     paths = (
         _portable_paths(
@@ -667,6 +745,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_bundled(args, config, semantics)
         return _run_bundled(args, config, semantics)
     except ConfigError as error:
+        return _fail(ObservationError("validation", str(error)))
+    except (PolicyError, EpisodeSchemaError, CanonicalizationError) as error:
         return _fail(ObservationError("validation", str(error)))
     except ObservationError as error:
         return _fail(error)
