@@ -1321,16 +1321,28 @@ git commit -m "feat: write backward-compatible Episode v2 records"
   opened bytes.
 - Produces: `RecordDocument(run_id, metadata, body, source_sha256, references)`
   and `collect_record_documents(paths, semantics) -> ObservationCollection`.
+- Produces: `InvalidationEvidence(run_id, timestamp, source_sha256)` from one
+  securely opened, validated, and hashed tombstone byte sequence. `timestamp`
+  is a canonical second-precision UTC `Z` instant.
+- `ObservationCollection` stores `records` and a run-ID-sorted tuple of
+  `invalidations`. Its `invalidated` and `invalidation_sha256` compatibility
+  views are derived properties over those immutable evidence rows rather than
+  independently maintained parallel collections.
 - Portable semantics: `wiki/tasks`.
 - LLMWiki semantics: `wiki/tasks/records`.
 - Extends: `validate_record(metadata: dict, body: str, paths: ObservationPaths, reference_chain: frozenset[str] | None = None, semantics: AdapterSemantics = PORTABLE_SEMANTICS, resolver: ReferenceResolver | None = None) -> list[str]`.
 - Extends: `collect_records(paths: ObservationPaths, semantics: AdapterSemantics = PORTABLE_SEMANTICS) -> tuple[list[dict], set[str]]`.
 - Extends: Task 4 `start_observation` and `finish_observation` with an explicit
   `semantics: AdapterSemantics = PORTABLE_SEMANTICS` final parameter.
-- Preserves: existing delegated v1 start/finish/report behavior.
+- Preserves: existing delegated v1 start/finish behavior.
 - Adds: v2 LLMWiki start/finish through the bundled atomic core with the
-  selected LLMWiki semantics. Human `report` remains delegated; canonical
-  snapshot acquisition never delegates or combines cores.
+  selected LLMWiki semantics.
+- Routes every LLMWiki human `report`, for v1-only, v2-only, and mixed stores,
+  through bundled `collect_records(paths, selected_llmwiki_semantics)`. Report,
+  validate, and integrity therefore share one scanner and current
+  `wiki/tasks/records` reference semantics; no report routing decision depends
+  on store contents. Canonical snapshot acquisition remains a separate
+  machine-readable operation and never parses human report output.
 
 - [ ] **Step 1: Add the failing current-layout LLMWiki reference fixture**
 
@@ -1404,6 +1416,12 @@ reference evidence, and preserves current sorting. Existing `collect_records`
 becomes a compatibility projection over that collection, so human report
 behavior does not fork into a second scanner.
 
+Each invalidation tombstone is parsed, validated, timestamp-normalized, and
+SHA-256 hashed from the same descriptor-bound bytes. Store the resulting
+`InvalidationEvidence` row in `ObservationCollection`; Task 6 must not reopen
+the tombstone to recover its timestamp. Preserve existing human-report callers
+through derived `invalidated` and `invalidation_sha256` properties.
+
 For a selected LLMWiki adapter, dispatch schema-v1 lifecycle commands exactly
 as before. Dispatch schema-v2 `start` directly to the bundled atomic core with
 LLMWiki semantics. On `finish`, securely read only the target draft's
@@ -1412,6 +1430,10 @@ bundled core and a v1 draft delegates. Reject schema ambiguity before consuming
 the completion payload. This permits v2 LLMWiki records without requiring an
 unversioned external CLI extension and never switches semantics within one
 lifecycle.
+
+All LLMWiki `report` commands use the bundled compatibility projection with
+selected LLMWiki semantics. Do not delegate reports and do not choose the
+report implementation by inspecting whether the store contains v2 records.
 
 - [ ] **Step 5: Run adapter, portable CLI, and config tests**
 
@@ -1425,6 +1447,17 @@ caffeinate -i -m python3 -m unittest \
 ```
 
 Expected: all tests pass with no adapter fallback.
+
+The adapter suite must include:
+
+- a v2 LLMWiki `start -> finish -> validate -> integrity -> report` lifecycle
+  proving report succeeds without invoking the configured delegate;
+- a LLMWiki report whose task exists only at
+  `wiki/tasks/records/{task_id}.md`, proving report and validate use the same
+  current-layout semantics; and
+- an invalidation collection fixture proving run ID, canonical UTC timestamp,
+  and SHA-256 all come from the exact tombstone bytes returned by the secure
+  scanner.
 
 - [ ] **Step 6: Commit the adapter-semantics unit**
 
