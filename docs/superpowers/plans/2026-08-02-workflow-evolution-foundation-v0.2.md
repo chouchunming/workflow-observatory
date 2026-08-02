@@ -1,7 +1,7 @@
 # Workflow Evolution Foundation v0.2 Implementation Plan
 
-Status: Revised after focused external re-review; final focused approval of the
-Candidate Eligibility and Identity amendment is required before Task 1. The
+Status: Revised after final focused external re-review; focused approval of the
+Decision recurrence cohort-size amendment is required before Task 1. The
 underlying design remains approved.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
@@ -562,6 +562,11 @@ def test_metric_and_candidate_policy_schemas_are_closed(self):
         {"single-event", "contiguous-adjacent-pair"},
         set(policies.documents["decision_support_policy"]["pattern_kinds"]),
     )
+    self.assertEqual(
+        5,
+        policies.documents["decision_support_policy"]
+        ["decision_recurring_minimum_outcome_episodes"],
+    )
 ```
 
 - [ ] **Step 2: Run the focused test and verify RED**
@@ -630,6 +635,7 @@ The remaining policy documents use these exact values:
   "quantiles": ["0.25", "0.50", "0.75"],
   "decision_min_episode_support": 3,
   "decision_min_support_ratio": "0.40",
+  "decision_recurring_minimum_outcome_episodes": 5,
   "draft_stale_after_seconds": 86400,
   "candidate_classes": ["decision-pattern", "efficiency", "lifecycle-health", "outcome-reliability", "quality"],
   "candidate_order": "candidate-id-ascending-byte-order",
@@ -673,7 +679,11 @@ bytes/version and changes snapshot identity.
 `decision_support_policy.json` additionally fixes pattern kinds to
 `single-event` and `contiguous-adjacent-pair`, the analyzable event-key fields
 to `phase`, `actor_role`, `decision_type`, `reason_code`, and `result`, minimum
-distinct-Episode support to `3`, and minimum support ratio to `0.40`.
+distinct-Episode support to `3`, minimum support ratio to `0.40`, and the
+containing cohort's minimum comparable outcome count for recurring evidence to
+`5`. These are three separate fields in the immutable hashed policy. The first
+two are pattern-support thresholds; the third is the independent cohort-size
+threshold and must not be inferred from `comparative_inference_eligible`.
 
 `candidate_emission_policy.json` contains exact-key rule rows with
 `candidate_type`, `class`, `source_kind`, `source`, `predicate`,
@@ -1917,7 +1927,8 @@ git commit -m "feat: build deterministic workflow learning cohorts"
   candidates.
 - Produces: `candidate_id(candidate_evidence: Mapping) -> str`.
 - Uses: `decision-pattern-support@1` minimum three distinct Episodes and at
-  least 40 percent of eligible Episodes.
+  least 40 percent of eligible Episodes, plus a separately owned minimum of
+  five comparable outcome Episodes before recurring evidence is allowed.
 
 - [ ] **Step 1: Add failing Episode-support and candidate-identity tests**
 
@@ -1926,9 +1937,10 @@ Decision arrays into five otherwise equivalent v2 Episode projections and
 calling public `build_snapshot_core`. Define `self.lifecycle_candidate(as_of)`
 from one stale-draft fixture and `self.core_with_multiple_candidates()` from
 one fixture that deterministically triggers two candidate classes.
-`self.core_with_recurring_decision_pattern(...)` builds five valid projections
-that share one supported pattern while varying only the named generation or
-runtime provenance through the Task 7 fixture boundary.
+`self.core_with_recurring_decision_pattern(...)` accepts explicit
+`outcome_episode_n` and `supporting_episode_n`, builds that many valid
+projections sharing one supported pattern, and may vary only the named
+generation or runtime provenance through the Task 7 fixture boundary.
 `self.core_with_equal_missingness(metrics)` assigns equal missingness to the
 named concrete metrics. No helper computes IDs, support, comparability, wildcard
 expansion, or candidate eligibility itself.
@@ -1989,6 +2001,8 @@ def test_zero_only_adverse_metrics_emit_no_quality_or_timeout_candidate(self):
 
 def test_unavailable_generation_decision_pattern_remains_descriptive(self):
     core = self.core_with_recurring_decision_pattern(
+        outcome_episode_n=5,
+        supporting_episode_n=3,
         workflow_generation={"availability": "unavailable", "value": None},
     )
     self.assertEqual(
@@ -2003,6 +2017,8 @@ def test_unavailable_generation_decision_pattern_remains_descriptive(self):
 
 def test_heterogeneous_runtime_cohort_emits_no_decision_candidate(self):
     core = self.core_with_recurring_decision_pattern(
+        outcome_episode_n=5,
+        supporting_episode_n=3,
         runtime_generations=["runtime@1", "runtime@2"],
     )
     self.assertIn(
@@ -2017,6 +2033,43 @@ def test_heterogeneous_runtime_cohort_emits_no_decision_candidate(self):
         candidate["class"] == "decision-pattern"
         for candidate in core["candidates"]
     ))
+
+
+def test_small_comparable_cohort_cannot_emit_recurring_decision_candidate(self):
+    core = self.core_with_recurring_decision_pattern(
+        outcome_episode_n=4,
+        supporting_episode_n=3,
+    )
+    pattern = core["decision_patterns"][0]
+    self.assertEqual(3, pattern["episode_count_with_event"])
+    self.assertEqual(
+        {"numerator": 3, "denominator": 4},
+        pattern["support_fraction"],
+    )
+    self.assertEqual("descriptive", pattern["evidence_strength"])
+    self.assertFalse(any(
+        candidate["class"] == "decision-pattern"
+        for candidate in core["candidates"]
+    ))
+
+
+def test_five_comparable_outcomes_can_emit_recurring_decision_candidate(self):
+    core = self.core_with_recurring_decision_pattern(
+        outcome_episode_n=5,
+        supporting_episode_n=3,
+    )
+    pattern = core["decision_patterns"][0]
+    self.assertEqual(3, pattern["episode_count_with_event"])
+    self.assertEqual(
+        {"numerator": 3, "denominator": 5},
+        pattern["support_fraction"],
+    )
+    self.assertEqual("recurring", pattern["evidence_strength"])
+    candidates = [
+        candidate for candidate in core["candidates"]
+        if candidate["class"] == "decision-pattern"
+    ]
+    self.assertEqual(1, len(candidates))
 
 
 def test_any_metric_candidates_bind_concrete_metric_identity(self):
@@ -2074,14 +2127,25 @@ or above both thresholds it is eligible for the comparability gate described
 next. Pattern rows remain sorted by JCS bytes of
 `(pattern_kind, pattern)`.
 
-A Decision pattern is `recurring` only when both numeric support thresholds
-are satisfied **and** its containing cohort has
-`comparative_inference_eligible: true` from Task 7. A cohort whose exclusions
-contain `generation-unavailable` or `heterogeneous-runtime-provenance` may
-still expose deterministic Decision pattern counts, but every pattern remains
-`descriptive` and no `decision-pattern` candidate is emitted. Task 8 consumes
-the Task 7 comparability fields directly and may not recompute, weaken, or
-override them.
+A Decision pattern is `recurring` if and only if all four conditions hold:
+
+1. `episode_count_with_event >= decision_min_episode_support`;
+2. `support_fraction >= decision_min_support_ratio`;
+3. the containing cohort has `comparative_inference_eligible: true` from Task
+   7; and
+4. `outcome_episode_n >= decision_recurring_minimum_outcome_episodes`.
+
+The three numeric thresholds are read from the immutable, hashed
+`decision_support_policy`; none may be duplicated as an implementation
+constant. Failure of any condition leaves the pattern `descriptive` and emits
+no `decision-pattern` candidate. In particular, four comparable outcome
+Episodes with three supporting Episodes remain descriptive, while five
+comparable outcomes with three supporting Episodes cross the cohort-size and
+support boundaries. A cohort whose exclusions contain
+`generation-unavailable` or `heterogeneous-runtime-provenance` may still
+expose deterministic Decision pattern counts, but every pattern remains
+`descriptive`. Task 8 consumes the Task 7 comparability fields directly and
+may not recompute, weaken, or override them.
 
 - [ ] **Step 4: Emit deterministic unranked candidates**
 
@@ -2132,6 +2196,13 @@ threshold: `observed-count-positive` and `positive-observed-value` require
 observed metric values, while missingness, unsupported-schema, stale,
 invalidation, generation, and outcome rules may trigger with metric
 `observed_n == 0` when their own named count is positive.
+
+For the two Decision rules, `decision-support-satisfied` is the exact
+four-condition predicate defined in Step 3: the pattern meets the hashed
+distinct-Episode and support-ratio thresholds, the cohort is eligible for
+comparative inference, and the cohort meets the hashed minimum of five
+comparable outcome Episodes. The 18 policy rules remain unchanged; this
+predicate cannot be weakened by a code default.
 
 Build all values from deterministic snapshot fields only. Compute:
 
@@ -2589,7 +2660,7 @@ begins.
 | `test_04_adapter_fixtures_project_identically` | Build equivalent portable and current-layout LLMWiki roots; assert equal semantic bundle bytes. |
 | `test_05_v1_absence_is_not_zero_or_v2_missing` | Mix four v1, two v2-null, and two v2-observed values; assert the exact 4/2/2/0 missingness partition, then give `input_tokens` and `output_tokens` equal zero-observed missingness and assert distinct concrete source identities and candidate IDs. |
 | `test_06_lifecycle_records_do_not_enter_outcome_denominator` | Mix four outcomes, drafts, superseded, and invalidated records; assert outcome `n=4` and separate overlapping lifecycle counts. |
-| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. Repeat a numerically supported pattern in generation-unavailable and heterogeneous-runtime cohorts; assert descriptive patterns and no Decision candidates. |
+| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. With no comparability exclusions, assert four outcomes with three supporting Episodes remain descriptive and emit no Decision candidate, while five outcomes with three supporting Episodes become recurring and emit exactly one Decision candidate. Repeat a numerically supported pattern in generation-unavailable and heterogeneous-runtime cohorts; assert descriptive patterns and no Decision candidates. |
 | `test_08_reviewed_mapping_derived_view_counts_once` | Present one physical Episode plus its reviewed workflow-generation mapping; assert exactly one canonical projected Episode for that `run_id`. |
 | `test_09_gate_failure_produces_no_snapshot_or_proposal` | Break a task reference; assert no snapshot directory member and no proposal artifact anywhere in the fake home. |
 | `test_10_authoritative_tamper_is_not_acceptance` | Change learning artifact `authoritative` to true; assert schema rejection even after recomputing a generic file digest. |

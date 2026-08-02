@@ -22,8 +22,8 @@ automatically.
 ## Workflow Evolution Foundation v0.2
 
 The v0.2 foundation design is approved. Its implementation plan was revised on
-2026-08-02 after focused external re-review and is awaiting final focused
-approval of the Candidate Eligibility and Identity amendment.
+2026-08-02 after final focused external re-review and is awaiting focused
+approval of the Decision recurrence cohort-size amendment.
 Implementation has not started, and these capabilities are not part of the
 current released plugin.
 

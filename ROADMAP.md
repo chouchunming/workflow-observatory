@@ -28,10 +28,10 @@ are documented in
 
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
-Status: design approved; implementation plan revised after focused external
-re-review and awaiting final focused approval of the Candidate Eligibility and
-Identity amendment as of 2026-08-02. Implementation has not started and is not
-included in the current release.
+Status: design approved; implementation plan revised after final focused
+external re-review and awaiting focused approval of the Decision recurrence
+cohort-size amendment as of 2026-08-02. Implementation has not started and is
+not included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
