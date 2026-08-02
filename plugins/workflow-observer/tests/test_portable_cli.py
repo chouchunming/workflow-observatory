@@ -183,6 +183,63 @@ class PortableCliTests(unittest.TestCase):
         )
         self.assertEqual(2, episode["schema_version"])
 
+    def test_v2_complete_lifecycle_reads_human_completion_metrics(self):
+        completion = self.base / "v2-completion.md"
+        write_private(
+            completion,
+            COMPLETION.replace(
+                "review_rounds: 0\ndefects_found: 0\nrework_count: 0\n"
+                "rework_reason: none",
+                "review_rounds: 2\ndefects_found: 3\nrework_count: 1\n"
+                "rework_reason: corrected-readback",
+            ),
+        )
+        supplement = self.base / "v2-episode.json"
+        write_private(supplement, json.dumps({
+            "schema_version": 2,
+            "execution": {
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+                "cost_amount": None,
+                "cost_currency": None,
+                "measurement_source": "unavailable",
+            },
+            "quality": {"test_failures": 7, "timeout_count": 0},
+            "decisions": [],
+        }))
+        started = run_cli(
+            self.home, "start", "--title", "v2 readback",
+            "--subject-root", str(self.subject), "--agent-surface", "codex",
+            "--start-mode", "planned", "--task-type", "maintenance",
+            "--workflow-variant", "maintenance-basic", "--scope-from-file",
+            str(self.scope), "--episode-schema-version", "2",
+            "--workflow-generation", "maintenance-basic@2",
+        )
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+
+        finished = run_cli(
+            self.home, "finish", run_id, "--status", "success",
+            "--from-file", str(completion), "--episode-from-file",
+            str(supplement),
+        )
+        validated = run_cli(self.home, "validate")
+        integrity = run_cli(self.home, "integrity")
+        report = run_cli(self.home, "report")
+
+        self.assertEqual((0, "", ""),
+                         (finished.returncode, finished.stdout, finished.stderr))
+        self.assertEqual((0, "valid records=1 invalidated=0\n", ""),
+                         (validated.returncode, validated.stdout, validated.stderr))
+        self.assertEqual((0, "healthy records=1 invalidated=0\n", ""),
+                         (integrity.returncode, integrity.stdout, integrity.stderr))
+        self.assertEqual(0, report.returncode, report.stderr)
+        self.assertIn("Total defects found: 3", report.stdout)
+        self.assertIn("Total rework count: 1", report.stdout)
+        self.assertIn("Average review rounds: 2", report.stdout)
+        self.assertNotIn("Total defects found: 7", report.stdout)
+
     def test_rejected_v1_v2_combinations_preserve_record_bytes(self):
         valid_supplement = {
             "schema_version": 2,

@@ -2292,10 +2292,18 @@ def _read_report_regular_file(
 def _metrics_from_record(body: str, status: object) -> dict[str, object]:
     if status == "draft":
         return {}
+    try:
+        from episode_schema import EpisodeSchemaError, parse_episode_block
+
+        human_body, _episode = parse_episode_block(
+            body, _episode_projection_policy()
+        )
+    except EpisodeSchemaError as error:
+        raise _validation(str(error)) from error
     marker = "\n## Execution evidence"
-    if marker not in body:
+    if marker not in human_body:
         raise _validation("final observation is missing completion metrics")
-    _, completion_tail = body.split(marker, 1)
+    _, completion_tail = human_body.split(marker, 1)
     payload, derived = _parse_completion(
         "## Execution evidence" + completion_tail, allow_derived=True
     )
