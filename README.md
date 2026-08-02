@@ -23,8 +23,8 @@ automatically.
 
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
-Implementation has not started, and these capabilities are not part of the
-current released plugin.
+Implementation started on 2026-08-02; Task 1 is complete on the design branch.
+These capabilities are not part of the current released plugin.
 
 The bounded milestone will extend the existing observation layer through this
 evidence path:
