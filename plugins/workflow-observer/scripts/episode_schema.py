@@ -529,6 +529,17 @@ def _metadata_string(metadata: Mapping, name: str) -> str:
     return value
 
 
+def _metadata_schema_version(metadata: Mapping) -> int:
+    if "schema_version" not in metadata:
+        return 1
+    value = metadata["schema_version"]
+    if type(value) is not int or value != 2:
+        raise EpisodeSchemaError(
+            "metadata schema_version must be absent for v1 or exact integer 2"
+        )
+    return 2
+
+
 def _project_workflow_generation(
     metadata: Mapping,
     schema_version: int,
@@ -559,12 +570,21 @@ def canonical_episode_projection(
     if not isinstance(metadata, Mapping):
         raise EpisodeSchemaError("observation metadata must be a mapping")
     projection_document = _projection_document(projection)
+    schema_version = _metadata_schema_version(metadata)
     human_body, episode = parse_episode_block(body, projection)
     status = _metadata_string(metadata, "status")
     if status not in FINAL_STATUSES | {"draft"}:
         raise EpisodeSchemaError("observation status is invalid")
     if status == "draft" and episode is not None:
         raise EpisodeSchemaError("draft observations cannot contain Episode data")
+    if status != "draft" and schema_version == 1 and episode is not None:
+        raise EpisodeSchemaError(
+            "schema-v1 metadata cannot contain schema-2 Episode data"
+        )
+    if status != "draft" and schema_version == 2 and episode is None:
+        raise EpisodeSchemaError(
+            "final schema-v2 observation requires Episode data"
+        )
 
     completion, derived = _parse_human_lifecycle(human_body, status)
     started_at = _canonical_utc_instant(metadata.get("timestamp"), "started_at")
@@ -602,7 +622,6 @@ def canonical_episode_projection(
             ),
         }
 
-    schema_version = 2 if episode is not None else 1
     if episode is not None:
         for name, value in lifecycle_values.items():
             if episode["quality"][name] != value:

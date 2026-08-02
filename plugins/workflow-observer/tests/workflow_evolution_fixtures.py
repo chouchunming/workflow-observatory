@@ -17,7 +17,7 @@ POLICY_ROOT = PLUGIN_ROOT / "policies"
 PRIVACY_SENTINEL = "PRIVATE-EVIDENCE-6f92d978b81f"
 _EXPECTED_RAW_SHA256 = {
     "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
-    "v2": "7ac2d72af20edee8bf0303b4612551132ac8bfd316178292d3eb4d0819dadf08",
+    "v2": "7b909fe173fbd8425ea3e136c72f5a0892072c164484d6733903fcdc72a809e1",
 }
 EXPECTED_CANONICAL_EPISODE_KEYS = {
     "run_id",
@@ -88,6 +88,7 @@ V1_METADATA = {
 V2_METADATA = {
     **V1_METADATA,
     "workflow_generation": "implementation-with-review@2",
+    "schema_version": 2,
 }
 V1_BODY = """## Scope
 

@@ -13,7 +13,7 @@ SCRIPTS = PLUGIN_ROOT / "scripts"
 TESTS = PLUGIN_ROOT / "tests"
 EXPECTED_FIXTURE_SHA256 = {
     "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
-    "v2": "7ac2d72af20edee8bf0303b4612551132ac8bfd316178292d3eb4d0819dadf08",
+    "v2": "7b909fe173fbd8425ea3e136c72f5a0892072c164484d6733903fcdc72a809e1",
 }
 for module_root in (SCRIPTS, TESTS):
     if str(module_root) not in sys.path:
@@ -47,6 +47,20 @@ from workflow_evolution_fixtures import (
 class EpisodeV2Tests(unittest.TestCase):
     def setUp(self):
         self.projection = load_projection_policy()
+
+    def _v2_final_body(self):
+        supplement = parse_v2_supplement(V2_SUPPLEMENT, self.projection)
+        episode = build_episode_v2(
+            elapsed_seconds=120,
+            completion_metrics={
+                "verification": "pass",
+                "review_rounds": 1,
+                "defects_found": 0,
+                "rework_count": 0,
+            },
+            supplement=supplement,
+        )
+        return V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
 
     def test_v2_round_trip_is_canonical(self):
         supplement = parse_v2_supplement(V2_SUPPLEMENT, self.projection)
@@ -94,6 +108,7 @@ class EpisodeV2Tests(unittest.TestCase):
             )
 
     def test_v1_projection_does_not_fabricate_v2_fields(self):
+        self.assertNotIn("schema_version", V1_METADATA)
         projected = canonical_episode_projection(
             V1_METADATA,
             V1_BODY,
@@ -110,6 +125,89 @@ class EpisodeV2Tests(unittest.TestCase):
             {"availability": "unavailable", "value": None},
             projected["workflow_generation"],
         )
+
+    def test_v2_draft_schema_comes_from_frontmatter_without_episode_block(self):
+        draft_metadata = {
+            **V2_METADATA,
+            "schema_version": 2,
+            "status": "draft",
+        }
+        draft_body = V1_BODY.split("\n## Execution evidence", 1)[0].rstrip() + "\n"
+        try:
+            projected = canonical_episode_projection(
+                draft_metadata,
+                draft_body,
+                self.projection,
+            )
+        except EpisodeSchemaError as error:
+            self.fail(f"valid v2 draft was rejected: {error}")
+        self.assertEqual(2, projected["episode_schema_version"])
+        self.assertIsNone(projected["finished_at"])
+        self.assertEqual(
+            {
+                "availability": "observed",
+                "value": "implementation-with-review@2",
+            },
+            projected["workflow_generation"],
+        )
+        self.assertEqual([], projected["decisions"])
+        self.assertTrue(all(
+            metric == {
+                "availability": "not_recorded",
+                "value": None,
+                "unit": None,
+            }
+            for metric in projected["metrics"].values()
+        ))
+
+    def test_final_v2_requires_matching_frontmatter_and_episode_block(self):
+        body = self._v2_final_body()
+        projected = canonical_episode_projection(
+            {**V2_METADATA, "schema_version": 2},
+            body,
+            self.projection,
+        )
+        self.assertEqual(2, projected["episode_schema_version"])
+
+        mismatches = (
+            (V1_METADATA, body),
+            ({**V1_METADATA, "schema_version": 2}, V1_BODY),
+        )
+        for metadata, mismatched_body in mismatches:
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(
+                EpisodeSchemaError,
+                "schema_version|Episode data",
+            ):
+                canonical_episode_projection(
+                    metadata,
+                    mismatched_body,
+                    self.projection,
+                )
+
+    def test_explicit_schema_version_must_be_exact_integer_two(self):
+        body = self._v2_final_body()
+        for value in (True, 1, "2", 3, None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                EpisodeSchemaError,
+                "schema_version",
+            ):
+                canonical_episode_projection(
+                    {**V1_METADATA, "schema_version": value},
+                    body,
+                    self.projection,
+                )
+
+    def test_v2_draft_rejects_episode_block(self):
+        with self.assertRaisesRegex(EpisodeSchemaError, "draft"):
+            canonical_episode_projection(
+                {
+                    **V2_METADATA,
+                    "schema_version": 2,
+                    "status": "draft",
+                },
+                self._v2_final_body(),
+                self.projection,
+            )
 
     def test_v1_projection_rejects_additive_workflow_generation_metadata(self):
         metadata = {
@@ -318,6 +416,7 @@ class EpisodeV2Tests(unittest.TestCase):
         body = V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
         metadata = {
             **V1_METADATA,
+            "schema_version": 2,
             "workflow_variant": "maintenance-basic",
             "revision": "fedcba9876543210",
             "timestamp": "2026-08-02T00:00:00Z",
@@ -343,7 +442,11 @@ class EpisodeV2Tests(unittest.TestCase):
         body = V1_BODY.rstrip() + "\n\n" + render_episode_block(episode)
         explicit = "reviewed.gen+candidate@2"
         projected = canonical_episode_projection(
-            {**V1_METADATA, "workflow_generation": explicit},
+            {
+                **V1_METADATA,
+                "schema_version": 2,
+                "workflow_generation": explicit,
+            },
             body,
             self.projection,
         )
@@ -370,7 +473,11 @@ class EpisodeV2Tests(unittest.TestCase):
                 "workflow_generation",
             ):
                 canonical_episode_projection(
-                    {**V1_METADATA, "workflow_generation": value},
+                    {
+                        **V1_METADATA,
+                        "schema_version": 2,
+                        "workflow_generation": value,
+                    },
                     body,
                     self.projection,
                 )
