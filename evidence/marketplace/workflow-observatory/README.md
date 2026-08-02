@@ -19,6 +19,38 @@ Observation data stays local by default under
 transcripts, credentials, or secrets, and never changes a workflow
 automatically.
 
+## Workflow Evolution Foundation v0.2
+
+The v0.2 foundation design and implementation plan were approved on
+2026-08-02. Implementation has not started, and these capabilities are not part
+of the current released plugin.
+
+The bounded milestone will extend the existing observation layer through this
+evidence path:
+
+```text
+Episode v2
+    -> canonical adapter snapshot-input
+    -> Data Trust Gate
+    -> immutable, content-addressed Learning Snapshot
+    -> deterministic observational candidates
+```
+
+The milestone preserves the local-first privacy boundary and separates outcome
+analysis from lifecycle health. It also defines stable-read checks, explicit
+workflow generations, versioned analysis policies, per-metric missingness, and
+Episode-level Decision Event support. Its 11 reviewable implementation tasks
+end in a 15-case non-model acceptance matrix against isolated fake stores.
+
+Evolution Proposal artifacts, experiment execution, formal acceptance,
+post-hoc evaluation inputs, and automatic workflow mutation remain deferred.
+A future proposal must cite both `snapshot_id` and `candidate_id`, and no live
+data baseline will run without separate approval.
+
+Review the approved
+[design](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
+and [implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+
 ## Install from GitHub
 
 ```bash
