@@ -30,7 +30,9 @@ are documented in
 
 Status: design and implementation plan approved as of 2026-08-02.
 Implementation started on 2026-08-02; Tasks 1 through 5 are complete on the
-design branch and are not included in the current release.
+design branch, including the externally reviewed Task 4 readback and Task 5
+adapter-report/invalidation-evidence corrections. These changes are not
+included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -80,7 +82,7 @@ data baseline is a separate approval gate after the fake-store acceptance suite.
 See the approved
 [v0.2 design](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
 and
-[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+[amended implementation plan](https://github.com/chouchunming/workflow-observatory/blob/53780705ec878af9ad6cde14358121f8ebcb1205/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
 
 ## Next — concurrency and operability
 

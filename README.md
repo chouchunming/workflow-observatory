@@ -24,7 +24,8 @@ automatically.
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
 Implementation started on 2026-08-02; Tasks 1 through 5 are complete on the
-design branch.
+design branch, including the externally reviewed Task 4 readback and Task 5
+adapter-report/invalidation-evidence corrections.
 These capabilities are not part of the current released plugin.
 
 The bounded milestone will extend the existing observation layer through this
@@ -52,7 +53,7 @@ data baseline will run without separate approval.
 Review the approved
 [design](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
 and
-[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/eaa09257e4c1a774aa627286f3dcd6b1928c7dbe/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+[amended implementation plan](https://github.com/chouchunming/workflow-observatory/blob/53780705ec878af9ad6cde14358121f8ebcb1205/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
 
 ## Install from GitHub
 
