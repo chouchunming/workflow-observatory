@@ -658,8 +658,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command in {"validate", "integrity"}:
                 paths = ObservationPaths.from_root(config.root)
                 return _run_read_only(args.command, paths, semantics)
-            if args.command == "report":
-                return _delegate(args, config)
             if args.command == "start" and args.episode_schema_version == 1:
                 return _delegate(args, config)
             if args.command == "finish":

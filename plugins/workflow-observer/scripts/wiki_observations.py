@@ -7,7 +7,7 @@ CLI adapter lives in ``wiki_cli.py`` and calls these interfaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -201,6 +201,13 @@ class ReferenceEvidence:
 
 
 @dataclass(frozen=True)
+class InvalidationEvidence:
+    run_id: str
+    timestamp: str
+    source_sha256: str
+
+
+@dataclass(frozen=True)
 class RecordDocument:
     run_id: str
     metadata: dict
@@ -212,8 +219,18 @@ class RecordDocument:
 @dataclass(frozen=True)
 class ObservationCollection:
     records: tuple[RecordDocument, ...]
-    invalidated: frozenset[str]
-    invalidation_sha256: tuple[tuple[str, str], ...]
+    invalidations: tuple[InvalidationEvidence, ...]
+
+    @property
+    def invalidated(self) -> frozenset[str]:
+        return frozenset(evidence.run_id for evidence in self.invalidations)
+
+    @property
+    def invalidation_sha256(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (evidence.run_id, evidence.source_sha256)
+            for evidence in self.invalidations
+        )
 
 
 class ReferenceResolver:
@@ -2317,7 +2334,15 @@ def _metrics_from_record(body: str, status: object) -> dict[str, object]:
     }
 
 
-def _read_invalidation_target(content: str, filename: str) -> str:
+def _read_invalidation_evidence(
+    content_bytes: bytes, filename: str
+) -> InvalidationEvidence:
+    try:
+        content = content_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ObservationError(
+            "io", f"could not read invalidation tombstone: {error}"
+        ) from error
     metadata, body = _parse_frontmatter(content)
     required = {
         "type",
@@ -2351,11 +2376,17 @@ def _read_invalidation_target(content: str, filename: str) -> str:
         raise _validation("invalidation tombstone has invalid tags")
     if metadata.get("sources") != []:
         raise _validation("invalidation tombstone sources must be empty")
-    _aware_datetime(metadata.get("timestamp"), "invalidation timestamp")
+    timestamp = _aware_datetime(
+        metadata.get("timestamp"), "invalidation timestamp"
+    ).astimezone(timezone.utc).replace(microsecond=0)
     _validate_scalar(metadata.get("reason"), "invalidation reason")
     if body:
         raise _validation("invalidation tombstone must not contain a body")
-    return target
+    return InvalidationEvidence(
+        target,
+        timestamp.isoformat().replace("+00:00", "Z"),
+        hashlib.sha256(content_bytes).hexdigest(),
+    )
 
 
 def collect_record_documents(
@@ -2372,14 +2403,13 @@ def collect_record_documents(
     observations_fd: int | None = None
     invalidations_fd: int | None = None
     documents: list[RecordDocument] = []
-    invalidated: set[str] = set()
-    invalidation_sha256: list[tuple[str, str]] = []
+    invalidations: list[InvalidationEvidence] = []
     try:
         wiki_fd = _open_report_child_directory(
             root_fd, "wiki", "wiki directory", missing_ok=True
         )
         if wiki_fd is None:
-            return ObservationCollection((), frozenset(), ())
+            return ObservationCollection((), ())
         observations_fd = _open_report_child_directory(
             wiki_fd,
             "observations",
@@ -2387,7 +2417,7 @@ def collect_record_documents(
             missing_ok=True,
         )
         if observations_fd is None:
-            return ObservationCollection((), frozenset(), ())
+            return ObservationCollection((), ())
 
         invalidations_entry = None
         for name in _report_entry_names(observations_fd, "observation records"):
@@ -2448,7 +2478,7 @@ def collect_record_documents(
         )
         by_id = {document.run_id: document for document in documents}
         if invalidations_entry is None:
-            return ObservationCollection(tuple(documents), frozenset(), ())
+            return ObservationCollection(tuple(documents), ())
         invalidations_fd = _open_report_child_directory(
             observations_fd,
             "invalidations",
@@ -2470,26 +2500,17 @@ def collect_record_documents(
                 entry,
                 f"invalidation tombstone {Path(name).stem}",
             )
-            try:
-                content = content_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as error:
-                raise ObservationError(
-                    "io", f"could not read invalidation tombstone: {error}"
-                ) from error
-            target = _read_invalidation_target(content, name)
-            target_record = by_id.get(target)
+            evidence = _read_invalidation_evidence(content_bytes, name)
+            target_record = by_id.get(evidence.run_id)
             if target_record is None:
                 raise _validation("invalidation points to no observation record")
             if target_record.metadata.get("status") == "draft":
                 raise _validation("invalidation must reference a final observation")
-            invalidated.add(target)
-            invalidation_sha256.append(
-                (target, hashlib.sha256(content_bytes).hexdigest())
-            )
+            invalidations.append(evidence)
+        invalidations.sort(key=lambda evidence: evidence.run_id.encode("utf-8"))
         return ObservationCollection(
             tuple(documents),
-            frozenset(invalidated),
-            tuple(invalidation_sha256),
+            tuple(invalidations),
         )
     finally:
         for descriptor in (invalidations_fd, observations_fd, wiki_fd, root_fd):

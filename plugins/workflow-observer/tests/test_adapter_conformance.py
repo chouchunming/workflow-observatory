@@ -286,6 +286,59 @@ class AdapterConformanceTests(unittest.TestCase):
             (validation.returncode, validation.stdout, validation.stderr),
         )
 
+    def test_invalidation_evidence_binds_timestamp_and_exact_tombstone_bytes(self):
+        from wiki_observations import ObservationPaths, collect_record_documents
+
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "portable", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        portable_root = self.homes["portable"] / "store"
+        tombstone_bytes = (
+            "---\n"
+            "type: observation-invalidation\n"
+            f"title: Invalidate {run_id}\n"
+            "tags: [\"observation\",\"invalidation\"]\n"
+            "timestamp: 2026-08-02T23:17:45+08:00\n"
+            f"target_run_id: {run_id}\n"
+            "reason: duplicate observation\n"
+            "sources: []\n"
+            "---\n"
+        ).encode("utf-8")
+        tombstone = (
+            portable_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        tombstone.write_bytes(tombstone_bytes)
+
+        collection = collect_record_documents(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        )
+
+        self.assertTrue(
+            hasattr(collection, "invalidations"),
+            "collection must expose immutable invalidation evidence rows",
+        )
+        from wiki_observations import InvalidationEvidence
+
+        expected_sha256 = hashlib.sha256(tombstone_bytes).hexdigest()
+        self.assertEqual(
+            (InvalidationEvidence(
+                run_id,
+                "2026-08-02T15:17:45Z",
+                expected_sha256,
+            ),),
+            collection.invalidations,
+        )
+        self.assertEqual(frozenset({run_id}), collection.invalidated)
+        self.assertEqual(
+            ((run_id, expected_sha256),),
+            collection.invalidation_sha256,
+        )
+
     def test_llmwiki_obsolete_task_layout_fails_closed(self):
         portable_root = self.homes["portable"] / "store"
         portable_task = portable_root / "wiki/tasks/example.md"
@@ -309,7 +362,7 @@ class AdapterConformanceTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertIn("task_ref points to no task record", result.stderr)
 
-    def test_llmwiki_schema_v1_lifecycle_and_report_remain_delegated(self):
+    def test_llmwiki_schema_v1_lifecycle_remains_delegated_and_report_is_bundled(self):
         started = self.start("llmwiki")
         self.assertEqual(0, started.returncode, started.stderr)
         run_id = started.stdout.strip()
@@ -325,14 +378,15 @@ class AdapterConformanceTests(unittest.TestCase):
         self.assertEqual(0, finished.returncode, finished.stderr)
         self.assertEqual(0, another_start.returncode, another_start.stderr)
         self.assertEqual("obs-20260802-120000-abcdef\n", another_start.stdout)
-        self.assertEqual((0, "delegated report\n", ""),
-                         (report.returncode, report.stdout, report.stderr))
+        self.assertEqual((0, ""), (report.returncode, report.stderr))
+        self.assertIn("maintenance-basic", report.stdout)
+        self.assertIn("draft=1", report.stdout)
         calls = marker.read_text(encoding="utf-8")
         self.assertIn(f"finish {run_id}", calls)
         self.assertIn(" start ", f" {calls}")
-        self.assertIn(" report", calls)
+        self.assertNotIn(" report", calls)
 
-    def test_llmwiki_schema_v2_lifecycle_uses_bundled_core(self):
+    def test_llmwiki_report_v2_lifecycle_uses_bundled_core(self):
         marker = self._select_delegate_probe(exit_code=91)
 
         started = self.start("llmwiki", title="LLMWiki v2", schema_version=2)
@@ -346,12 +400,62 @@ class AdapterConformanceTests(unittest.TestCase):
             "--episode-from-file", str(self.episode),
         )
         self.assertEqual(0, finished.returncode, finished.stderr)
-        self.assertFalse(marker.exists())
+        validation = self.run_cli("llmwiki", "validate")
+        integrity = self.run_cli("llmwiki", "integrity")
+        report = self.run_cli("llmwiki", "report")
+
+        self.assertEqual(
+            (0, 0, 0),
+            (validation.returncode, integrity.returncode, report.returncode),
+            (validation.stderr, integrity.stderr, report.stderr),
+        )
+        self.assertEqual("valid records=1 invalidated=0\n", validation.stdout)
+        self.assertEqual("healthy records=1 invalidated=0\n", integrity.stdout)
+        self.assertIn("maintenance-basic", report.stdout)
+        self.assertIn("success=1", report.stdout)
+        self.assertFalse(marker.exists(), "report invoked the configured delegate")
         record = (self.llm_root / "wiki/observations" / f"{run_id}.md").read_text(
             encoding="utf-8"
         )
         self.assertIn("schema_version: 2\n", record)
         self.assertIn("## Episode data\n", record)
+
+    def test_llmwiki_report_current_task_layout_uses_selected_semantics(self):
+        portable_root = self.homes["portable"] / "store"
+        portable_task = portable_root / "wiki/tasks/example.md"
+        portable_task.parent.mkdir(parents=True)
+        portable_task.write_text(TASK_TEXT, encoding="utf-8")
+        llmwiki_task = self.llm_root / "wiki/tasks/records/example.md"
+        llmwiki_task.parent.mkdir(parents=True)
+        llmwiki_task.write_text(TASK_TEXT, encoding="utf-8")
+        self.assertFalse((self.llm_root / "wiki/tasks/example.md").exists())
+
+        started = self.start("portable", task="example")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "portable", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        source = portable_root / "wiki/observations" / f"{run_id}.md"
+        (self.llm_root / "wiki/observations" / f"{run_id}.md").write_bytes(
+            source.read_bytes()
+        )
+        marker = self._select_delegate_probe(exit_code=91)
+
+        validation = self.run_cli("llmwiki", "validate")
+        report = self.run_cli("llmwiki", "report")
+
+        self.assertEqual(
+            (0, 0),
+            (validation.returncode, report.returncode),
+            (validation.stderr, report.stderr),
+        )
+        self.assertEqual("valid records=1 invalidated=0\n", validation.stdout)
+        self.assertIn("maintenance-basic", report.stdout)
+        self.assertIn("success=1", report.stdout)
+        self.assertFalse(marker.exists(), "report invoked the configured delegate")
 
     def test_shared_adapter_conformance_matrix(self):
         results = {}
