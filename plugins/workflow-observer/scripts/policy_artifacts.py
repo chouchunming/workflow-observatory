@@ -9,6 +9,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import stat
+from types import MappingProxyType
 
 from canonical_json import (
     CanonicalizationError,
@@ -103,6 +104,32 @@ _POLICY_FILES = {
         },
     ),
 }
+_APPROVED_POLICY_SHA256 = {
+    "candidate_emission_policy": (
+        "c2dd169d22fc0421e7e28219858dc29db08cd7087971da1a40e2a5a6c2ad6f3c"
+    ),
+    "decision_support_policy": (
+        "e07032aecd4057ebc5c205ff917ee0173884fa6dff3cfbc899ab502de1289a8d"
+    ),
+    "episode_projection": (
+        "d7a4468d81aaa948789c11c0af9327951ca0174cebff9a8eafeca234e8521a9b"
+    ),
+    "lifecycle_health_policy": (
+        "515a058f1bcba42fdc0a8a2652b6a28e8ec26de8085593da953f44550034ac15"
+    ),
+    "metric_semantics": (
+        "8f3529e67bfe2cef19d1144254468dba264192708225db48ff1f7578cebbca1c"
+    ),
+    "producer_capabilities": (
+        "793eb6a7ec55900ccaa0f4f6a8bb154835c23fb0f20eef07229d7f63f93b10ac"
+    ),
+    "quantile_policy": (
+        "5e617e8b09cdeff922a22e6dd00df40eb7bf04804cad0f58808927dcfa024ef2"
+    ),
+    "workflow_generation_mapping": (
+        "6859145347b9a8a89f49b9f31510e0f684773cdec225838ac6aed03e027b9f46"
+    ),
+}
 _METRIC_KEYS = {
     "semantics_id",
     "value_type",
@@ -138,14 +165,48 @@ class RegularFileEvidence:
     inode: int
 
 
-@dataclass(frozen=True)
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _deep_freeze(item) for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, init=False)
 class PolicySet:
-    documents: Mapping[str, Mapping[str, object]]
-    identities: Mapping[str, Mapping[str, str]]
+    _documents: Mapping[str, Mapping[str, object]]
+    _identities: Mapping[str, Mapping[str, str]]
+
+    def __init__(
+        self,
+        documents: Mapping[str, Mapping[str, object]],
+        identities: Mapping[str, Mapping[str, str]],
+    ) -> None:
+        object.__setattr__(self, "_documents", _deep_freeze(documents))
+        object.__setattr__(self, "_identities", _deep_freeze(identities))
+
+    @property
+    def documents(self) -> dict[str, dict[str, object]]:
+        return _deep_thaw(self._documents)
+
+    @property
+    def identities(self) -> dict[str, dict[str, str]]:
+        return _deep_thaw(self._identities)
 
     def core_identity(self) -> dict[str, dict[str, str]]:
         return {
-            name: dict(self.identities[name]) for name in sorted(self.identities)
+            name: dict(self._identities[name]) for name in sorted(self._identities)
         }
 
 
@@ -645,10 +706,12 @@ def load_policy_set(
         except CanonicalizationError as error:
             raise _policy_error(f"{name}: {error}", error)
         document = _require_exact_keys(parsed, allowed_keys, name)
-        if document["schema_version"] != 1:
+        if type(document["schema_version"]) is not int or document["schema_version"] != 1:
             raise PolicyError(f"{name} schema_version is not supported")
         if document["version"] != expected_version:
             raise PolicyError(f"{name} version is not supported")
+        if hashlib.sha256(canonicalize(document)).hexdigest() != _APPROVED_POLICY_SHA256[name]:
+            raise PolicyError(f"{name} version does not match its approved policy bytes")
         documents[name] = document
 
     _validate_policy_documents(documents)

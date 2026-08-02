@@ -158,7 +158,10 @@ class PolicyArtifactTests(unittest.TestCase):
         self.policy_root = self.root / "policies"
         self.policy_root.mkdir()
         self.documents = policy_documents()
-        for name, document in self.documents.items():
+        self.write_policy_documents(self.documents)
+
+    def write_policy_documents(self, documents):
+        for name, document in documents.items():
             (self.policy_root / f"{name}.json").write_text(
                 json.dumps(document, ensure_ascii=False, separators=(",", ":"))
                 + "\n",
@@ -448,6 +451,108 @@ class PolicyArtifactTests(unittest.TestCase):
             self.assertEqual({"version", "sha256"}, set(row))
             self.assertRegex(row["sha256"], r"^sha256:[0-9a-f]{64}$")
 
+    def test_policy_set_documents_are_defensive_copies(self):
+        policies = self.load_policy_set()
+        documents = policies.documents
+        documents["lifecycle_health_policy"]["draft_stale_after_seconds"] = 1
+        self.assertEqual(
+            86400,
+            policies.documents["lifecycle_health_policy"]
+            ["draft_stale_after_seconds"],
+        )
+
+    def test_policy_set_identities_are_defensive_copies(self):
+        policies = self.load_policy_set()
+        before = policies.core_identity()
+        identities = policies.identities
+        identities["analyzer_artifact"]["version"] = "tampered"
+        self.assertEqual(before, policies.core_identity())
+        self.assertEqual(
+            "workflow-learning-analyzer@0.2.0",
+            policies.identities["analyzer_artifact"]["version"],
+        )
+
+    def test_policy_set_internal_documents_are_deeply_immutable(self):
+        policies = self.load_policy_set()
+        with self.assertRaises(TypeError):
+            policies._documents["lifecycle_health_policy"] \
+                ["draft_stale_after_seconds"] = 1
+        self.assertEqual(
+            86400,
+            policies.documents["lifecycle_health_policy"]
+            ["draft_stale_after_seconds"],
+        )
+
+    def test_policy_set_internal_identities_are_deeply_immutable(self):
+        policies = self.load_policy_set()
+        before = policies.core_identity()
+        with self.assertRaises(TypeError):
+            policies._identities["analyzer_artifact"]["version"] = "tampered"
+        self.assertEqual(before, policies.core_identity())
+
+    def test_same_version_policy_mutations_are_rejected_for_all_families(self):
+        def mutate_projection(documents):
+            documents["episode_projection"]["max_decisions"] = 13
+
+        def mutate_producer(documents):
+            documents["producer_capabilities"]["entries"] = [
+                {"producer": "future-producer"}
+            ]
+
+        def mutate_mapping(documents):
+            documents["workflow_generation_mapping"]["mapping"] = {
+                "legacy": "generation@1"
+            }
+
+        def mutate_metrics(documents):
+            documents["metric_semantics"]["metrics"]["elapsed_seconds"] \
+                ["semantics_id"] = "different-elapsed@1"
+
+        def mutate_quantiles(documents):
+            documents["quantile_policy"]["quantiles"] = [
+                "0.20", "0.50", "0.75"
+            ]
+
+        def mutate_decision(documents):
+            documents["decision_support_policy"] \
+                ["decision_min_episode_support"] = 4
+
+        def mutate_lifecycle(documents):
+            documents["lifecycle_health_policy"] \
+                ["draft_stale_after_seconds"] = 172800
+
+        def mutate_candidate(documents):
+            documents["candidate_emission_policy"]["rules"][0] \
+                ["predicate"] = "different-predicate"
+
+        mutations = {
+            "episode_projection": mutate_projection,
+            "producer_capabilities": mutate_producer,
+            "workflow_generation_mapping": mutate_mapping,
+            "metric_semantics": mutate_metrics,
+            "quantile_policy": mutate_quantiles,
+            "decision_support_policy": mutate_decision,
+            "lifecycle_health_policy": mutate_lifecycle,
+            "candidate_emission_policy": mutate_candidate,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(policy=name):
+                documents = policy_documents()
+                mutate(documents)
+                self.write_policy_documents(documents)
+                with self.assertRaises(PolicyError):
+                    self.load_policy_set()
+
+    def test_schema_version_requires_exact_json_integer_one(self):
+        for schema_version in (True, False, 1.0, "1", None):
+            with self.subTest(schema_version=schema_version):
+                documents = policy_documents()
+                documents["lifecycle_health_policy"] \
+                    ["schema_version"] = schema_version
+                self.write_policy_documents(documents)
+                with self.assertRaises(PolicyError):
+                    self.load_policy_set()
+
     def test_policy_set_is_frozen_and_core_identity_returns_copies(self):
         policies = self.load_policy_set()
         with self.assertRaises((AttributeError, TypeError)):
@@ -457,20 +562,6 @@ class PolicyArtifactTests(unittest.TestCase):
         self.assertEqual(
             "workflow-learning-analyzer@0.2.0",
             policies.core_identity()["analyzer_artifact"]["version"],
-        )
-
-    def test_policy_change_changes_identity(self):
-        before = self.load_policy_set().core_identity()
-        document = self.documents["lifecycle_health_policy"]
-        document["draft_stale_after_seconds"] = 172800
-        (self.policy_root / "lifecycle_health_policy.json").write_text(
-            json.dumps(document, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        after = self.load_policy_set().core_identity()
-        self.assertNotEqual(
-            before["lifecycle_health_policy"],
-            after["lifecycle_health_policy"],
         )
 
 
