@@ -53,6 +53,7 @@ _EXECUTION_KEYS = {
     "cost_currency",
     "measurement_source",
 }
+_EPISODE_EXECUTION_KEYS = {*_EXECUTION_KEYS, "elapsed_seconds"}
 _SUPPLEMENT_QUALITY_KEYS = {"test_failures", "timeout_count"}
 _LIFECYCLE_QUALITY_KEYS = {
     "verification",
@@ -61,7 +62,6 @@ _LIFECYCLE_QUALITY_KEYS = {
     "rework_count",
 }
 _EPISODE_QUALITY_KEYS = {
-    "elapsed_seconds",
     *_LIFECYCLE_QUALITY_KEYS,
     *_SUPPLEMENT_QUALITY_KEYS,
 }
@@ -383,10 +383,12 @@ def build_episode_v2(
     lifecycle_quality = _validated_completion_metrics(completion_metrics)
     return {
         "schema_version": 2,
-        "execution": dict(execution),
+        "execution": {
+            **dict(execution),
+            "elapsed_seconds": elapsed,
+        },
         "quality": {
             **dict(supplement_quality),
-            "elapsed_seconds": elapsed,
             **lifecycle_quality,
         },
         "decisions": [dict(decision) for decision in supplement.decisions],
@@ -408,20 +410,26 @@ def _validate_episode_v2(
     episode = _exact_mapping(value, _SUPPLEMENT_KEYS, "Episode data")
     if type(episode["schema_version"]) is not int or episode["schema_version"] != 2:
         raise EpisodeSchemaError("Episode data schema_version must be 2")
-    execution = _validate_execution(episode["execution"], projection_document)
+    episode_execution = _exact_mapping(
+        episode["execution"],
+        _EPISODE_EXECUTION_KEYS,
+        "Episode execution",
+    )
+    execution = _validate_execution(
+        {key: episode_execution[key] for key in _EXECUTION_KEYS},
+        projection_document,
+    )
+    execution["elapsed_seconds"] = _safe_nonnegative_integer(
+        episode_execution["elapsed_seconds"], "elapsed_seconds"
+    )
     quality = _exact_mapping(
         episode["quality"],
         _EPISODE_QUALITY_KEYS,
         "Episode quality",
     )
-    validated_quality: dict[str, object] = {
-        "elapsed_seconds": _safe_nonnegative_integer(
-            quality["elapsed_seconds"], "elapsed_seconds"
-        ),
-    }
-    validated_quality.update(_validated_completion_metrics({
+    validated_quality = _validated_completion_metrics({
         key: quality[key] for key in _LIFECYCLE_QUALITY_KEYS
-    }))
+    })
     validated_quality.update(_validate_supplement_quality({
         key: quality[key] for key in _SUPPLEMENT_QUALITY_KEYS
     }))
@@ -623,7 +631,16 @@ def canonical_episode_projection(
         }
 
     if episode is not None:
-        for name, value in lifecycle_values.items():
+        if (
+            episode["execution"]["elapsed_seconds"]
+            != lifecycle_values["elapsed_seconds"]
+        ):
+            raise EpisodeSchemaError(
+                "Episode elapsed_seconds does not match authoritative "
+                "lifecycle completion"
+            )
+        for name in _LIFECYCLE_QUALITY_KEYS:
+            value = lifecycle_values[name]
             if episode["quality"][name] != value:
                 raise EpisodeSchemaError(
                     f"Episode {name} does not match authoritative lifecycle completion"

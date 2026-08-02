@@ -13,7 +13,7 @@ SCRIPTS = PLUGIN_ROOT / "scripts"
 TESTS = PLUGIN_ROOT / "tests"
 EXPECTED_FIXTURE_SHA256 = {
     "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
-    "v2": "7b909fe173fbd8425ea3e136c72f5a0892072c164484d6733903fcdc72a809e1",
+    "v2": "62e0951e3ba1a08730d200c31a547d3fffaf42cd8a0090f955642eb9899c6b10",
 }
 for module_root in (SCRIPTS, TESTS):
     if str(module_root) not in sys.path:
@@ -115,6 +115,20 @@ class EpisodeV2Tests(unittest.TestCase):
             },
             supplement=supplement,
         )
+        self.assertEqual(
+            {
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cost_amount",
+                "cost_currency",
+                "measurement_source",
+                "elapsed_seconds",
+            },
+            set(episode["execution"]),
+        )
+        self.assertEqual(120, episode["execution"]["elapsed_seconds"])
+        self.assertNotIn("elapsed_seconds", episode["quality"])
         block = render_episode_block(episode)
         human_body, parsed = parse_episode_block(
             "human\n\n" + block,
@@ -429,6 +443,10 @@ class EpisodeV2Tests(unittest.TestCase):
         self.assertEqual(
             {"availability": "observed", "value": "1.25", "unit": "USD"},
             projected["metrics"]["cost_amount"],
+        )
+        self.assertEqual(
+            {"availability": "observed", "value": 120, "unit": None},
+            projected["metrics"]["elapsed_seconds"],
         )
         self.assertEqual(
             {"availability": "not_recorded", "value": None, "unit": None},

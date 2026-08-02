@@ -17,7 +17,7 @@ POLICY_ROOT = PLUGIN_ROOT / "policies"
 PRIVACY_SENTINEL = "PRIVATE-EVIDENCE-6f92d978b81f"
 _EXPECTED_RAW_SHA256 = {
     "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
-    "v2": "7b909fe173fbd8425ea3e136c72f5a0892072c164484d6733903fcdc72a809e1",
+    "v2": "62e0951e3ba1a08730d200c31a547d3fffaf42cd8a0090f955642eb9899c6b10",
 }
 EXPECTED_CANONICAL_EPISODE_KEYS = {
     "run_id",
@@ -199,9 +199,11 @@ def _v2_body() -> str:
     supplement = json.loads(V2_SUPPLEMENT)
     episode = {
         "schema_version": 2,
-        "execution": supplement["execution"],
-        "quality": {
+        "execution": {
+            **supplement["execution"],
             "elapsed_seconds": 120,
+        },
+        "quality": {
             "verification": "pass",
             "review_rounds": 1,
             "defects_found": 0,
