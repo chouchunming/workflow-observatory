@@ -1,7 +1,8 @@
 # Workflow Evolution Foundation v0.2 Implementation Plan
 
-Status: Revised after external review; external re-approval required before
-Task 1. The underlying design remains approved.
+Status: Revised after the second external review; focused external re-approval
+of the five remaining execution-contract amendments is required before Task 1.
+The underlying design remains approved.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` (recommended) or `executing-plans` to implement
@@ -73,7 +74,9 @@ and CodeGraph 1.5.0 as advisory impact analysis.
   artifact manifest format. They never hash tar/zip bytes or depend on
   traversal order.
 - The effective-boundary discriminated union is strict. Exactly one of
-  `started_at` or `producer_generation` is legal.
+  `started_at` or `producer_generation` is legal. A producer-generation
+  boundary uses exact identity equality only; lexical, numeric-suffix, and
+  semantic-version ordering are forbidden.
 - Any future Evolution Proposal must cite both `snapshot_id` and
   `candidate_id`; this plan updates the contract but does not implement proposal
   creation.
@@ -441,6 +444,7 @@ git commit -m "feat: add canonical workflow artifact hashing"
 - Consumes: `canonical_json.canonicalize` and `hash_canonical` from Task 1.
 - Produces: `PolicyError(ValueError)`.
 - Produces: `validate_effective_boundary(value: object) -> dict[str, str]`
+- Produces: `effective_boundary_applies(boundary: Mapping, *, started_at: str, producer_generation: str | None) -> bool`.
 - Produces: `RegularFileEvidence(content: bytes, sha256: str, executable: bool, device: int, inode: int)`.
 - Produces: `read_regular_file_evidence(root: Path, relative_posix_path: str, *, max_bytes: int) -> RegularFileEvidence`.
 - Produces: `build_code_manifest(root: Path, relative_paths: Sequence[str]) -> dict`
@@ -467,6 +471,29 @@ def test_effective_boundary_is_exactly_one_variant(self):
     for value in invalid:
         with self.subTest(value=value), self.assertRaises(PolicyError):
             validate_effective_boundary(value)
+
+
+def test_producer_generation_boundary_is_valid_and_uses_exact_identity(self):
+    boundary = validate_effective_boundary({
+        "type": "producer_generation",
+        "from": "producer@3",
+    })
+    self.assertEqual(
+        {"type": "producer_generation", "from": "producer@3"},
+        boundary,
+    )
+    self.assertTrue(effective_boundary_applies(
+        boundary,
+        started_at="2026-08-03T00:00:00Z",
+        producer_generation="producer@3",
+    ))
+    for generation in (None, "producer@2", "producer@10"):
+        with self.subTest(generation=generation):
+            self.assertFalse(effective_boundary_applies(
+                boundary,
+                started_at="2026-08-03T00:00:00Z",
+                producer_generation=generation,
+            ))
 
 
 def test_code_manifest_is_order_independent_and_binds_mode(self):
@@ -518,6 +545,23 @@ def test_duplicate_key_rejected_in_policy(self):
     )
     with self.assertRaisesRegex(PolicyError, "duplicate JSON key"):
         self.load_policy_set()
+
+
+def test_metric_and_candidate_policy_schemas_are_closed(self):
+    policies = self.load_policy_set()
+    metrics = policies.documents["metric_semantics"]["metrics"]
+    self.assertEqual("category-counts", metrics["verification"]["aggregation"])
+    self.assertEqual("missingness-only", metrics["cost_amount"]["aggregation"])
+    self.assertIsNone(metrics["cost_amount"]["candidate_type"])
+    rules = policies.documents["candidate_emission_policy"]["rules"]
+    self.assertEqual(
+        sorted(rules, key=lambda row: row["candidate_type"].encode("utf-8")),
+        rules,
+    )
+    self.assertEqual(
+        {"single-event", "contiguous-adjacent-pair"},
+        set(policies.documents["decision_support_policy"]["pattern_kinds"]),
+    )
 ```
 
 - [ ] **Step 2: Run the focused test and verify RED**
@@ -532,8 +576,8 @@ caffeinate -i -m python3 -m unittest \
 Expected: import failure for `policy_artifacts`.
 Then add only the named classes/functions with `NotImplementedError` bodies and
 rerun. RED-B is valid only when boundary, unsafe-path, swap-race, duplicate-key,
-and manifest assertions execute and fail for their intended semantics rather
-than import or fixture errors.
+manifest, metric-type, and candidate-rule assertions execute and fail for their
+intended semantics rather than import or fixture errors.
 
 - [ ] **Step 3: Add exact immutable policy documents**
 
@@ -594,14 +638,104 @@ The remaining policy documents use these exact values:
 ```
 
 Store each value only in its owning policy file rather than duplicating this
-combined explanatory shape. `metric_semantics.json` assigns
-`wall-clock-elapsed@1`, `verification-result@1`, `formal-review-cycle@1`,
-`confirmed-defect@1`, `confirmed-rework@1`, `measured-token-count@1`,
-`measured-cost@1`, `confirmed-test-failure@1`, and `confirmed-timeout@1` to the
-corresponding fields. Its v0.2 `not_applicable_rules` object is empty, so the
-`not_applicable_n` bucket is deterministically zero for every v0.2 metric; a
-future non-empty rule requires new policy bytes/version and changes the
-snapshot identity.
+combined explanatory shape.
+
+`metric_semantics.json` has exact top-level keys `schema_version`, `version`,
+`metrics`, and `not_applicable_rules`. Its `metrics` object contains exactly
+these entries; every entry has the exact keys shown:
+
+```json
+{
+  "elapsed_seconds": {"semantics_id":"wall-clock-elapsed@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"elapsed-time-distribution"},
+  "verification": {"semantics_id":"verification-result@1","value_type":"enum","aggregation":"category-counts","candidate_type":"verification-non-pass"},
+  "review_rounds": {"semantics_id":"formal-review-cycle@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"review-round-distribution"},
+  "defects_found": {"semantics_id":"confirmed-defect@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"defect-observed"},
+  "rework_count": {"semantics_id":"confirmed-rework@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"rework-observed"},
+  "input_tokens": {"semantics_id":"measured-token-count@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"input-token-distribution"},
+  "output_tokens": {"semantics_id":"measured-token-count@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"output-token-distribution"},
+  "cache_read_tokens": {"semantics_id":"measured-token-count@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"cache-read-token-distribution"},
+  "cost_amount": {"semantics_id":"measured-cost@1","value_type":"normalized-decimal-string","aggregation":"missingness-only","candidate_type":null},
+  "test_failures": {"semantics_id":"confirmed-test-failure@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"test-failure-observed"},
+  "timeout_count": {"semantics_id":"confirmed-timeout@1","value_type":"nonnegative-integer","aggregation":"integer-quantiles","candidate_type":"timeout-observed"}
+}
+```
+
+`verification` categories are exactly `pass`, `fail`, `not-run`, and
+`unknown`; they produce category counts and never numeric quantiles.
+`cost_currency` is the required three-letter companion of an observed
+`cost_amount`, not a cohort key or independently aggregated metric. v0.2
+reports only the cost missingness partition: it never converts a decimal cost
+to float, combines currencies, produces a cost distribution, or emits a cost
+candidate. `not_applicable_rules` is empty, so `not_applicable_n` is
+deterministically zero for every v0.2 metric; changing that requires new policy
+bytes/version and changes snapshot identity.
+
+`decision_support_policy.json` additionally fixes pattern kinds to
+`single-event` and `contiguous-adjacent-pair`, the analyzable event-key fields
+to `phase`, `actor_role`, `decision_type`, `reason_code`, and `result`, minimum
+distinct-Episode support to `3`, and minimum support ratio to `0.40`.
+
+`candidate_emission_policy.json` contains exact-key rule rows with
+`candidate_type`, `class`, `source_kind`, `source`, `predicate`,
+`minimum_denominator`, `cardinality`, `evidence_fields`, and
+`policy_identity_keys`. It fixes these rules:
+
+| Candidate type | Class | Trigger | Cardinality |
+|---|---|---|---|
+| `stale-drafts` | `lifecycle-health` | `stale_draft_n > 0` | one per cohort |
+| `schema-adoption-gap` | `lifecycle-health` | metric `unsupported_by_schema_n > 0` | one per cohort/metric |
+| `metric-missingness` | `lifecycle-health` | metric `not_recorded_n > 0` | one per cohort/metric |
+| `invalidated-episodes` | `lifecycle-health` | `invalidated_episode_n > 0` | one per cohort |
+| `generation-unavailable` | `lifecycle-health` | unavailable-generation Episode count `> 0` | one per descriptive legacy collection |
+| `non-success-outcomes` | `outcome-reliability` | failed + partial + rolled-back `> 0` | one per cohort |
+| `verification-non-pass` | `quality` | any observed verification category other than `pass` | one per cohort/metric |
+| `defect-observed` | `quality` | any observed value `> 0` | one per cohort/metric |
+| `rework-observed` | `quality` | any observed value `> 0` | one per cohort/metric |
+| `test-failure-observed` | `quality` | any observed value `> 0` | one per cohort/metric |
+| `timeout-observed` | `outcome-reliability` | any observed value `> 0` | one per cohort/metric |
+| `elapsed-time-distribution` | `efficiency` | `observed_n > 0` | one per cohort/metric |
+| `review-round-distribution` | `efficiency` | `observed_n > 0` | one per cohort/metric |
+| `input-token-distribution` | `efficiency` | `observed_n > 0` | one per cohort/metric |
+| `output-token-distribution` | `efficiency` | `observed_n > 0` | one per cohort/metric |
+| `cache-read-token-distribution` | `efficiency` | `observed_n > 0` | one per cohort/metric |
+| `decision-single-event` | `decision-pattern` | decision support policy satisfied | one per cohort/pattern |
+| `decision-adjacent-pair` | `decision-pattern` | decision support policy satisfied | one per cohort/pattern |
+
+The table is explanatory; the normative machine-readable document has exact
+top-level keys `schema_version`, `version`, `candidate_classes`,
+`candidate_order`, `candidate_ranking`, and `rules`. `rules` is sorted by
+`candidate_type` UTF-8 bytes and contains exactly these rows:
+
+```json
+[
+  {"candidate_type":"cache-read-token-distribution","class":"efficiency","source_kind":"metric","source":"cache_read_tokens","predicate":"observed-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"decision-adjacent-pair","class":"decision-pattern","source_kind":"decision","source":"contiguous-adjacent-pair","predicate":"decision-support-satisfied","minimum_denominator":"decision-pattern-support@1","cardinality":"one-per-cohort-pattern","evidence_fields":["counts","pattern"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","decision_support_policy"]},
+  {"candidate_type":"decision-single-event","class":"decision-pattern","source_kind":"decision","source":"single-event","predicate":"decision-support-satisfied","minimum_denominator":"decision-pattern-support@1","cardinality":"one-per-cohort-pattern","evidence_fields":["counts","pattern"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","decision_support_policy"]},
+  {"candidate_type":"defect-observed","class":"quality","source_kind":"metric","source":"defects_found","predicate":"positive-observed-value","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"elapsed-time-distribution","class":"efficiency","source_kind":"metric","source":"elapsed_seconds","predicate":"observed-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"generation-unavailable","class":"lifecycle-health","source_kind":"lifecycle","source":"generation_unavailable_episode_n","predicate":"positive-count","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-legacy-collection","evidence_fields":["counts"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","producer_capability_registry","workflow_generation_mapping"]},
+  {"candidate_type":"input-token-distribution","class":"efficiency","source_kind":"metric","source":"input_tokens","predicate":"observed-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"invalidated-episodes","class":"lifecycle-health","source_kind":"lifecycle","source":"invalidated_episode_n","predicate":"positive-count","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort","evidence_fields":["counts"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract"]},
+  {"candidate_type":"metric-missingness","class":"lifecycle-health","source_kind":"metric","source":"any-metric","predicate":"not-recorded-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry"]},
+  {"candidate_type":"non-success-outcomes","class":"outcome-reliability","source_kind":"outcome","source":"non_success_outcome_n","predicate":"positive-count","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort","evidence_fields":["counts"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract"]},
+  {"candidate_type":"output-token-distribution","class":"efficiency","source_kind":"metric","source":"output_tokens","predicate":"observed-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"review-round-distribution","class":"efficiency","source_kind":"metric","source":"review_rounds","predicate":"observed-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"rework-observed","class":"quality","source_kind":"metric","source":"rework_count","predicate":"positive-observed-value","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"schema-adoption-gap","class":"lifecycle-health","source_kind":"metric","source":"any-metric","predicate":"unsupported-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry"]},
+  {"candidate_type":"stale-drafts","class":"lifecycle-health","source_kind":"lifecycle","source":"stale_draft_n","predicate":"positive-count","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort","evidence_fields":["counts"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","lifecycle_health_policy"]},
+  {"candidate_type":"test-failure-observed","class":"quality","source_kind":"metric","source":"test_failures","predicate":"positive-observed-value","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"timeout-observed","class":"outcome-reliability","source_kind":"metric","source":"timeout_count","predicate":"positive-observed-value","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["missingness","observed_values","quantiles"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry","quantile_policy"]},
+  {"candidate_type":"verification-non-pass","class":"quality","source_kind":"metric","source":"verification","predicate":"non-pass-count-positive","minimum_denominator":"one-observed-episode@1","cardinality":"one-per-cohort-metric","evidence_fields":["category_counts","missingness"],"policy_identity_keys":["candidate_emission_policy","canonical_projection_contract","metric_semantics_registry"]}
+]
+```
+
+`minimum_denominator` is `one-observed-episode@1` for non-Decision rules and
+`decision-pattern-support@1` for Decision rules. Rule rows name the exact evidence fields
+defined in Task 8. Zero-only defect, rework, test-failure, and timeout values do
+not emit candidates. All non-Decision candidates are `descriptive` in v0.2;
+only a Decision pattern satisfying its independent support policy is
+`recurring`. Adding a rule, changing a predicate, or changing evidence fields
+requires new candidate-policy bytes/version.
 
 - [ ] **Step 4: Implement manifest validation and policy loading**
 
@@ -640,6 +774,19 @@ def build_code_manifest(root: Path, relative_paths: Sequence[str]) -> dict:
 `validate_relative_posix_artifact_path` rejects empty strings, NUL, backslash,
 POSIX absolute paths, drive-qualified or UNC paths, empty components, `.`, and
 `..`; the normalized UTF-8 POSIX spelling must equal the caller's input.
+
+`validate_effective_boundary` accepts exactly the two shapes shown in the
+approved design. `started_at.from` must be a canonical second-precision UTC
+`Z` instant. `producer_generation.from` must match
+`[a-z0-9][a-z0-9._:@+-]{0,199}` and may not be `unknown` or `unavailable`.
+`effective_boundary_applies` compares a started-at boundary by parsed UTC
+instant and compares a producer-generation boundary by exact string equality.
+It returns false when the caller has no explicit producer generation and never
+infers ordering from lexical form, numeric suffix, SemVer, Git revision, or
+wall clock. The initial v0.2 producer registry remains empty. A future
+non-empty producer-generation declaration may be activated only by a producer
+path that supplies its own validated explicit identity to this function; old
+Episodes without that provenance are never retroactively assigned one.
 
 `read_regular_file_evidence` uses descriptor-relative traversal. Open the root
 directory and every directory component with `O_DIRECTORY | O_NOFOLLOW |
@@ -747,6 +894,8 @@ git commit -m "feat: close workflow analysis policy identities"
 - Produces: `parse_episode_block(body: str, projection: Mapping) -> tuple[str, dict | None]`
 - Produces: `canonical_episode_projection(metadata: Mapping, body: str, projection: Mapping) -> dict`
 - Test fixtures produce: `DECISION`, `V2_SUPPLEMENT`, `V1_METADATA`, `V1_BODY`,
+  `EXPECTED_CANONICAL_EPISODE_KEYS`, `PRIVACY_SENTINEL`,
+  `v1_body_with_privacy_sentinel()`,
   `load_projection_policy()`, `temporary_timezone(name)`, and
   `FakeObservationStore` with explicit portable/LLMWiki layout selection.
 
@@ -777,6 +926,25 @@ def test_v1_projection_does_not_fabricate_v2_fields(self):
     self.assertEqual(1, projected["episode_schema_version"])
     self.assertEqual("unsupported_by_schema", projected["metrics"]["test_failures"]["availability"])
     self.assertEqual([], projected["decisions"])
+
+
+def test_projection_has_exact_privacy_safe_keys(self):
+    metadata = {
+        **V1_METADATA,
+        "title": PRIVACY_SENTINEL,
+        "task_ref": "[[private-task]]",
+        "sources": ["raw/private-source.md"],
+    }
+    projected = canonical_episode_projection(
+        metadata,
+        v1_body_with_privacy_sentinel(),
+        self.projection,
+    )
+    self.assertEqual(EXPECTED_CANONICAL_EPISODE_KEYS, set(projected))
+    encoded = canonicalize(projected)
+    self.assertNotIn(PRIVACY_SENTINEL.encode("utf-8"), encoded)
+    self.assertNotIn(b"private-task", encoded)
+    self.assertNotIn(b"private-source", encoded)
 
 
 def test_duplicate_key_rejected_in_episode_supplement(self):
@@ -892,6 +1060,57 @@ duplicate, reordered, non-canonical, or trailing content is invalid.
 `parse_episode_block` sends the extracted original JSON bytes through
 `strict_json_loads` before comparing their canonical bytes; duplicate keys are
 therefore rejected before object construction can collapse them.
+
+`canonical_episode_projection` returns exactly these top-level keys and no
+others:
+
+```json
+{
+  "run_id": "obs-...",
+  "episode_schema_version": 2,
+  "started_at": "2026-08-02T00:00:00Z",
+  "finished_at": "2026-08-02T00:02:00Z",
+  "project": "workflow-observatory",
+  "workspace": "workflow-observatory",
+  "workspace_id": "0123456789ab",
+  "revision": "0123456789abcdef",
+  "working_tree": "clean",
+  "agent_surface": "codex",
+  "task_type": "maintenance",
+  "workflow_variant": "implementation-with-review",
+  "workflow_generation": {"availability": "observed", "value": "implementation-with-review@2"},
+  "status": "success",
+  "metrics": {},
+  "runtime_provenance": null,
+  "decisions": []
+}
+```
+
+Every projected metric named in `metric_semantics.json` is present exactly
+once. Its value object has exact keys `availability`, `value`, and `unit`.
+`availability` is one of `observed`, `not_recorded`,
+`unsupported_by_schema`, or `not_applicable`; `unit` is JSON null except that
+an observed `cost_amount` uses its validated three-letter currency. A metric
+that is not observed has JSON-null `value` and `unit`. Verification retains its
+bounded enum string; integer metrics retain safe non-negative integers; cost
+retains its normalized decimal string without conversion. `runtime_provenance`
+is JSON null in projection version `episode-projection@2` because neither v1
+nor the bounded v2 supplement records a versioned model/runtime identity; it
+is never inferred.
+
+Each Decision object has exactly `sequence`, `phase`, `actor_role`,
+`decision_type`, `reason_code`, `result`, and `summary`. `summary` remains
+bounded evidence but never enters a cohort, count, candidate trigger, pattern
+key, or candidate ID.
+
+The projection explicitly excludes `title`, `start_mode`, `task_ref`,
+`sources`, `superseded_by`, Scope, Execution evidence, Outcome and observation,
+Follow-up, `rework_reason`, and all other human body text. Reference identities
+and hashes belong only to Task 6 `reference_manifest`; reference file bodies
+never enter either representation. `PRIVACY_SENTINEL` is a fixed unique string,
+and `v1_body_with_privacy_sentinel()` places it in otherwise valid Scope,
+Outcome, Follow-up, and `rework_reason` fields so the test proves exclusion
+rather than parser rejection.
 
 - [ ] **Step 5: Run focused and existing record tests**
 
@@ -1214,6 +1433,7 @@ git commit -m "fix: unify selected adapter reference semantics"
   exact project/workspace/workspace-ID/task-type filters.
 - Produces: `canonical_interval(since: date, until_inclusive: date, timezone_name: str) -> dict`.
 - Produces: `acquire_snapshot_input(paths, semantics, query, policy_set) -> SnapshotInput`.
+- Produces: `canonical_reference_manifest(evidence: Iterable[ReferenceEvidence]) -> list[dict[str, str]]`.
 - Produces: `derive_store_identity(paths, semantics) -> str | None` using the
   path-free device/inode rule consumed later by Task 9.
 - CLI adds: `snapshot-input --since YYYY-MM-DD --until YYYY-MM-DD --timezone IANA_NAME [filters] [--as-of UTC_Z]`.
@@ -1286,6 +1506,25 @@ def test_adapter_provenance_cites_analyzer_artifact(self):
         acquired.adapter["implementation_sha256"],
     )
     self.assertNotIn("adapter", acquired.semantic_bundle)
+
+
+def test_snapshot_input_excludes_human_text_and_reference_bodies(self):
+    self.store.write_valid_record_with_privacy_sentinel(PRIVACY_SENTINEL)
+    acquired = self.acquire()
+    self.assertNotIn(PRIVACY_SENTINEL.encode("utf-8"), acquired.manifest_bytes)
+
+
+def test_reference_manifest_collapses_identical_rows_and_rejects_conflicts(self):
+    same = ReferenceEvidence("task", "example", "a" * 64)
+    self.assertEqual(
+        [{"kind": "task", "identity": "example", "sha256": "a" * 64}],
+        canonical_reference_manifest([same, same]),
+    )
+    with self.assertRaisesRegex(SnapshotInputError, "conflicting reference identity"):
+        canonical_reference_manifest([
+            same,
+            ReferenceEvidence("task", "example", "b" * 64),
+        ])
 ```
 
 - [ ] **Step 2: Run the focused tests and verify RED**
@@ -1307,7 +1546,10 @@ gate, and adapter parity assertions before acquisition behavior is implemented.
 
 Use `zoneinfo.ZoneInfo`. Convert local midnight at `since` and local midnight
 after `until_inclusive` to UTC `Z` instants once. Reject an unknown IANA zone or
-an end date before the start. Historical queries set
+an end date before the start. Round-trip each localized midnight through UTC
+and back to the requested zone; if its local date or `00:00:00` wall time does
+not survive exactly, fail closed rather than silently normalizing a skipped or
+ambiguous civil boundary. Historical queries set
 `lifecycle_as_of = until_exclusive`. A live query accepts only an explicit
 second-precision UTC `--as-of` value that is greater than or equal to
 `until_exclusive`; it never calls `datetime.now()` inside analysis semantics.
@@ -1352,6 +1594,11 @@ target `run_id`, exact tombstone hash, and timestamp. Reference rows contain a
 bounded kind, opaque relative identity, and exact content hash; they never
 contain an absolute path or file body. Sort Episode and invalidation rows by
 `run_id`, and reference rows by `(kind, identity)` UTF-8 bytes.
+Treat `(kind, identity)` as the unique reference-manifest key. Identical
+`(kind, identity, sha256)` evidence reused by multiple Episodes collapses to
+one row. The same `(kind, identity)` observed with different hashes is a Data
+Trust Gate failure; a snapshot can never claim that one reference identity
+simultaneously denotes multiple byte sequences.
 Resolve invalidations before analysis selection: any valid tombstone targeting
 a selected Episode is included and applied regardless of the tombstone's own
 timestamp. A tombstone for an unselected Episode does not enter the
@@ -1445,6 +1692,10 @@ as_of="2026-08-02T16:00:00Z")` returns a validated `SnapshotInput`, and
 `self.metric_partition(v1_absent, v2_null, v2_values)` calls
 `build_snapshot_core` then selects the named `test_failures` metric. These
 helpers do not reproduce production grouping or classification logic.
+`self.metric_output(name, values)` and `self.cost_metric_output(values)` build
+validated Episode projections through shared fixtures, call
+`build_snapshot_core`, and select the requested public metric result; they do
+not implement aggregation inside the test harness.
 
 ```python
 def test_outcome_and_lifecycle_denominators_are_separate(self):
@@ -1480,6 +1731,30 @@ def test_historical_staleness_uses_bound_as_of(self):
     later = build_snapshot_core(self.bundle(as_of="2026-08-03T16:00:00Z"), self.policies)
     self.assertEqual(left, right)
     self.assertNotEqual(left, later)
+
+
+def test_verification_uses_category_counts_not_quantiles(self):
+    metric = self.metric_output("verification", ["pass", "fail", "pass"])
+    self.assertEqual(
+        {"fail": 1, "not-run": 0, "pass": 2, "unknown": 0},
+        metric["category_counts"],
+    )
+    self.assertIsNone(metric["observed_values"])
+    self.assertIsNone(metric["quantiles"])
+
+
+def test_cost_is_missingness_only_and_never_combines_currencies(self):
+    metric = self.cost_metric_output([
+        ("1.25", "USD"),
+        ("2.5", "EUR"),
+        (None, None),
+    ])
+    self.assertEqual("missingness-only", metric["aggregation"])
+    self.assertEqual(2, metric["missingness"]["observed_n"])
+    self.assertEqual(1, metric["missingness"]["not_recorded_n"])
+    self.assertIsNone(metric["observed_values"])
+    self.assertIsNone(metric["category_counts"])
+    self.assertIsNone(metric["quantiles"])
 ```
 
 - [ ] **Step 2: Run focused tests and verify RED**
@@ -1561,11 +1836,28 @@ eligible Episode into exactly one of `observed`, `not_recorded`,
 `unsupported_by_schema`, or `not_applicable`. Assert the four counts sum to the
 eligible denominator. Invalid values must already have failed acquisition.
 
+Every metric result has the exact keys `metric`, `semantics_id`, `value_type`,
+`aggregation`, `missingness`, `observed_values`, `category_counts`, and
+`quantiles`. For `integer-quantiles`, `observed_values` is the sorted integer
+array, `category_counts` is null, and `quantiles` has exact keys `p25`, `p50`,
+and `p75`. For `category-counts`, `observed_values` and `quantiles` are null and
+`category_counts` contains every allowed enum category, including zero counts,
+sorted by UTF-8 key bytes. For `missingness-only`, all three result fields are
+null: values contribute only to the four-bucket missingness partition and are
+not reproduced in the analysis output.
+
 For p25/p50/p75, sort integers, use index
 `(n - 1) * numerator / denominator`, interpolate with `fractions.Fraction`, and
 render an exact normalized non-exponent decimal string. Because the approved
 quartile denominators divide powers of two, any non-terminating decimal is a
 policy/configuration error, not a rounded float.
+
+Never call the quantile function for `verification` or `cost_amount`.
+`verification` produces only the four fixed category counts. `cost_amount`
+produces missingness only, retains no decimal values in aggregates, never
+converts through binary float, and never groups or combines currencies. A
+mixed-currency cohort is therefore valid for cost missingness but has no cost
+distribution or candidate.
 
 - [ ] **Step 5: Run focused tests and deterministic repeat checks**
 
@@ -1638,6 +1930,32 @@ def test_candidates_are_unranked_and_byte_sorted(self):
         self.assertNotIn("priority", candidate)
         self.assertNotIn("confidence", candidate)
         self.assertNotIn("actionability", candidate)
+
+
+def test_decision_sequences_are_only_single_events_and_adjacent_pairs(self):
+    second = {**DECISION, "sequence": 2, "reason_code": "dependency"}
+    third = {**DECISION, "sequence": 3, "reason_code": "timeout"}
+    core = self.core_with_decisions({
+        "a": [DECISION, second, third],
+        "b": [], "c": [], "d": [], "e": [],
+    })
+    patterns = {
+        (row["pattern_kind"], tuple(item["reason_code"] for item in row["pattern"]))
+        for row in core["decision_patterns"]
+    }
+    self.assertIn(("single-event", ("complexity-threshold",)), patterns)
+    self.assertIn(("contiguous-adjacent-pair", ("complexity-threshold", "dependency")), patterns)
+    self.assertIn(("contiguous-adjacent-pair", ("dependency", "timeout")), patterns)
+    self.assertNotIn(("contiguous-adjacent-pair", ("complexity-threshold", "timeout")), patterns)
+    self.assertFalse(any(len(pattern) > 2 for _kind, pattern in patterns))
+
+
+def test_zero_only_adverse_metrics_emit_no_quality_or_timeout_candidate(self):
+    core = self.core_with_zero_quality_and_timeout_metrics()
+    types = {candidate["candidate_type"] for candidate in core["candidates"]}
+    self.assertTrue({
+        "defect-observed", "rework-observed", "test-failure-observed", "timeout-observed"
+    }.isdisjoint(types))
 ```
 
 - [ ] **Step 2: Run named tests and verify RED**
@@ -1653,18 +1971,62 @@ Expected: Decision pattern and candidates are absent.
 
 - [ ] **Step 3: Implement distinct-Episode support**
 
-Group only versioned low-cardinality Decision fields. `summary` never enters a
-key, count, metric label, or ID. Report `event_count`, distinct
-`episode_count_with_event`, and `eligible_episode_n`; sequence support is also
-the count of distinct Episodes containing the sequence. Apply the fixed support
-policy independently from the five-outcome cohort threshold.
+Decision analysis uses only non-invalidated v2 outcome Episodes in the cohort;
+that full set, including Episodes with zero Decisions, is
+`eligible_episode_n`. Order each Episode's validated events by `sequence` and
+generate exactly two pattern kinds: each single event and each contiguous
+adjacent pair. Do not generate arbitrary-length sequences, non-contiguous
+subsequences, or combinations.
+
+Each event key contains exactly the five versioned low-cardinality fields
+`phase`, `actor_role`, `decision_type`, `reason_code`, and `result`.
+`summary` and `sequence` never enter a pattern key, group, count, metric label,
+candidate trigger, or candidate ID. A pattern row has exact keys
+`pattern_kind`, `pattern`, `event_count`, `episode_count_with_event`,
+`eligible_episode_n`, `support_fraction`, and `evidence_strength`. `pattern` is
+a one- or two-element array of exact event-key objects. `event_count` counts all
+occurrences, but the same pattern repeated within one Episode contributes only
+one to `episode_count_with_event`. `support_fraction` has exact integer keys
+`numerator` and `denominator`; compare it to the policy's normalized decimal
+threshold through `fractions.Fraction`, never float or rounded decimal output.
+Below the independent `3 Episodes + 0.40` policy the row is `descriptive`; at
+or above both thresholds it is `recurring` and may emit a Decision candidate.
+Pattern rows remain sorted by JCS bytes of
+`(pattern_kind, pattern)`.
 
 - [ ] **Step 4: Emit deterministic unranked candidates**
 
-Build candidate evidence from only deterministic fields: class, cohort,
-metric/pattern semantics, applicable policy/registry versions and hashes,
-denominators, observed values, and `evidence_strength`. For lifecycle
-candidates include the exact staleness policy and `as_of`. Compute:
+Evaluate only the exact ordered rule rows in `candidate_emission_policy.json`;
+no code-default or LLM judgment may create an additional candidate. Each rule
+produces at most the cardinality declared in Task 2. A candidate evidence
+object has exactly these top-level keys:
+
+```json
+{
+  "candidate_type": "...",
+  "class": "...",
+  "cohort": {},
+  "source": {},
+  "policy_identities": {},
+  "denominators": {},
+  "evidence": {},
+  "evidence_strength": "descriptive"
+}
+```
+
+`cohort` contains the exact six cohort-key fields. `source` has exact keys
+`kind`, `identity`, and `semantics_id`. `denominators` always has exact keys
+`eligible_episode_n`, `outcome_episode_n`, and `supporting_episode_n`, using
+JSON null when a denominator is not applicable. `evidence` always has exact
+keys `counts`, `missingness`, `observed_values`, `category_counts`, `quantiles`,
+and `pattern`, using JSON null for fields not named by the rule's
+`evidence_fields`. `policy_identities` contains exactly the version/hash rows
+named by that rule's `policy_identity_keys`; no mutable label is substituted.
+For lifecycle candidates it includes the exact staleness policy and `as_of` in
+evidence. Non-Decision candidates remain `descriptive` in v0.2. A Decision
+candidate is emitted only for a `recurring` pattern row.
+
+Build all values from deterministic snapshot fields only. Compute:
 
 ```python
 candidate_id = hash_canonical(
@@ -1713,6 +2075,8 @@ git commit -m "feat: emit stable workflow learning candidates"
 - Produces: `PublishedSnapshot(snapshot_id: str, path: Path, artifact: Mapping, created: bool)`.
 - Produces: `SnapshotPublicationError(ObservationError)` and
   `validate_learning_artifact(artifact: Mapping) -> None`.
+- Produces: `validate_learning_artifact_bytes(raw: bytes, *, expected_snapshot_id: str | None = None) -> Mapping`.
+- Produces: `read_learning_artifact(snapshot_dir: Path, expected_snapshot_id: str) -> Mapping`.
 - CLI adds: `snapshot` with the same bounded query flags as `snapshot-input`.
 - Publishes: one file whose name is the computed 64-character lowercase
   `snapshot_id` plus `.json` beneath
@@ -1772,6 +2136,40 @@ def test_duplicate_key_rejected_in_snapshot_artifact(self):
         validate_learning_artifact_bytes(ambiguous)
 
 
+def test_artifact_readback_recomputes_snapshot_identity(self):
+    artifact = strict_json_loads(self.publish().path.read_bytes())
+    artifact["core"]["analyzer_version"] = "tampered"
+    raw = artifact_bytes_with_recomputed_file_digest(artifact)
+    with self.assertRaisesRegex(SnapshotPublicationError, "snapshot identity mismatch"):
+        validate_learning_artifact_bytes(raw)
+
+
+def test_artifact_readback_recomputes_file_digest(self):
+    artifact = strict_json_loads(self.publish().path.read_bytes())
+    artifact["artifact_sha256"] = "0" * 64
+    with self.assertRaisesRegex(SnapshotPublicationError, "artifact digest mismatch"):
+        validate_learning_artifact_bytes(canonicalize(artifact))
+
+
+def test_artifact_readback_rejects_noncanonical_bytes(self):
+    raw = self.publish().path.read_bytes()
+    with self.assertRaisesRegex(SnapshotPublicationError, "not canonical JCS"):
+        validate_learning_artifact_bytes(b" " + raw)
+
+
+def test_artifact_readback_rejects_symlink_and_filename_identity_mismatch(self):
+    published = self.publish()
+    with self.assertRaisesRegex(SnapshotPublicationError, "snapshot filename mismatch"):
+        validate_learning_artifact_bytes(
+            published.path.read_bytes(),
+            expected_snapshot_id="0" * 64,
+        )
+    link = published.path.parent / ("f" * 64 + ".json")
+    link.symlink_to(published.path.name)
+    with self.assertRaisesRegex(SnapshotPublicationError, "unsafe snapshot target"):
+        read_learning_artifact(published.path.parent, "f" * 64)
+
+
 def test_snapshot_rejects_narrative_and_annotation_fields(self):
     artifact = strict_json_loads(self.publish().path.read_bytes())
     for field in ("narrative", "annotation", "summary_markdown"):
@@ -1787,7 +2185,7 @@ def test_concurrent_publishers_never_overwrite(self):
     self.assertEqual([False, True], sorted(result.created for result in results))
     self.assertEqual(1, len({result.snapshot_id for result in results}))
     final_path = results[0].path
-    validate_learning_artifact_bytes(final_path.read_bytes())
+    read_learning_artifact(final_path.parent, results[0].snapshot_id)
     self.assertEqual([], list(final_path.parent.glob(".snapshot-*.tmp")))
 ```
 
@@ -1837,9 +2235,22 @@ as `hashlib.sha256(canonicalize(artifact_without_artifact_sha256)).hexdigest()`.
 It has no semantic domain separator because it is a byte-integrity digest of
 the already typed complete artifact, not a reusable semantic identifier.
 `validate_learning_artifact_bytes` parses persisted bytes only through Task 1
-`strict_json_loads`, requires the exact artifact keys, and then calls
-`validate_learning_artifact`; unknown narrative or annotation fields, duplicate
-keys, and non-I-JSON input fail before any existing artifact can be reused.
+`strict_json_loads`. Persisted files contain exactly JCS bytes without a
+trailing newline; require `raw == canonicalize(parsed_artifact)` before any
+identity is trusted. Require the exact artifact keys, then call
+`validate_learning_artifact`. Recompute `snapshot_id` from `core` with the
+snapshot-core domain separator and compare it to the claimed value. Remove
+`artifact_sha256`, recompute SHA-256 over JCS of the remaining complete
+artifact, and compare it to the claimed digest. When
+`expected_snapshot_id` is supplied, require it to equal the recomputed ID so
+the filename cannot disagree with content. Unknown narrative or annotation
+fields, duplicate keys, non-I-JSON input, stale IDs, stale file digests, and
+non-canonical bytes fail before an artifact can be reused.
+
+`artifact_bytes_with_recomputed_file_digest` is a test-only helper that removes
+and recomputes only `artifact_sha256`; it intentionally leaves a stale
+`snapshot_id` so the focused test proves the semantic identity check rather
+than failing first on generic file integrity.
 
 - [ ] **Step 4: Reacquire B and publish only after exact manifest equality**
 
@@ -1854,13 +2265,19 @@ publish with this exact no-clobber sequence:
 3. Call `os.link(temp, target)` without a preceding existence check.
 4. On success, this publisher alone returns `created=true`. On `EEXIST`, never
    overwrite: securely read the existing target through
+   `read_learning_artifact(snapshot_dir, snapshot_id)`. That function validates
+   the 64-lowercase-hex ID, opens the snapshots directory, then reuses Task 2
+   descriptor-relative `read_regular_file_evidence` (or an exactly equivalent
+   same-descriptor/no-follow bounded read) for `<snapshot_id>.json`; a symlink,
+   non-regular file, component swap, read mutation, or oversized artifact fails
+   closed. Pass the exact filename ID into
    `validate_learning_artifact_bytes`.
 5. If the existing artifact has the same `snapshot_id` and byte-identical
    canonical core, return that existing artifact as `created=false`; otherwise
    fail closed as an identity collision.
 6. `fsync` the snapshots directory after successful publication, unlink the
-   private temporary file in every exit path, and never call `os.replace()` for
-   the final target.
+   private temporary file in every exit path, then `fsync` the directory again
+   so temp removal is durable. Never call `os.replace()` for the final target.
 
 The temporary file and target must be on the same filesystem. If hard-link
 no-clobber publication or equivalent guarantees are unavailable, fail closed;
@@ -2059,7 +2476,7 @@ begins.
 
 | Test method | Required fixture and assertion |
 |---|---|
-| `test_01_identical_inputs_produce_identical_core_and_snapshot_id` | Publish twice from the same fake bundle and fixed `generated_at`; assert equal JCS core bytes and IDs. |
+| `test_01_identical_inputs_produce_identical_core_and_snapshot_id` | Publish twice from the same fake bundle and fixed `generated_at`; securely read back both results, recompute both identities, and assert equal JCS core bytes and IDs. |
 | `test_02_machine_timezone_does_not_change_manifest` | Acquire the same Taipei date query under `TZ=UTC` and `TZ=America/Los_Angeles`; assert equal manifest bytes. |
 | `test_03_store_change_aborts_without_snapshot` | Finalize a selected draft between acquisition A and B; assert normalized state error and an empty snapshots directory. |
 | `test_04_adapter_fixtures_project_identically` | Build equivalent portable and current-layout LLMWiki roots; assert equal semantic bundle bytes. |
@@ -2073,7 +2490,7 @@ begins.
 | `test_12_no_approval_causes_no_external_mutation` | Snapshot a fake Git subject and workflow file before/after learning; assert byte equality and mock `subprocess.run` rejects `git branch`, `gh pr`, or workflow-edit calls. |
 | `test_13_lifecycle_as_of_is_frozen_in_identity` | Rebuild at later wall clock with same bound `as_of`; assert same ID, then change explicit `as_of` and assert a different ID. |
 | `test_14_shared_jcs_vector_and_lone_surrogate` | Use emoji, non-ASCII keys, control characters, quote, and backslash vector; assert fixed bytes/hash and lone-surrogate failure. |
-| `test_15_policy_hash_and_effective_boundary_are_closed` | Change one policy byte and assert identity/core change; assert a `started_at` declaration applies only on/after its instant and all invalid union shapes fail. |
+| `test_15_policy_hash_and_effective_boundary_are_closed` | Change one policy byte and assert identity/core change; assert a `started_at` declaration applies only on/after its instant, a `producer_generation` declaration matches only the exact explicit identity, and all invalid union shapes fail. |
 
 Test 12 never points at the source checkout as a mutation target.
 Test 08 does not create a second physical source record; the Task 6 focused

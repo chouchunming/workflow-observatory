@@ -22,7 +22,8 @@ automatically.
 ## Workflow Evolution Foundation v0.2
 
 The v0.2 foundation design is approved. Its implementation plan was revised on
-2026-08-02 after external review and is awaiting external re-approval.
+2026-08-02 after a second external review and is awaiting focused re-approval
+of five execution-contract amendments.
 Implementation has not started, and these capabilities are not part of the
 current released plugin.
 
