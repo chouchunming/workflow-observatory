@@ -14,6 +14,12 @@ from canonical_json import (
     strict_json_loads,
 )
 
+_NONCHARACTER_CODE_POINTS = tuple(range(0xFDD0, 0xFDF0)) + tuple(
+    (plane << 16) | suffix
+    for plane in range(17)
+    for suffix in (0xFFFE, 0xFFFF)
+)
+
 
 class CanonicalJsonTests(unittest.TestCase):
     def test_shared_unicode_and_escape_vector(self):
@@ -65,3 +71,25 @@ class CanonicalJsonTests(unittest.TestCase):
             with self.subTest(payload=repr(payload)):
                 with self.assertRaises(CanonicalizationError):
                     strict_json_loads(payload)
+
+    def test_rejects_all_unicode_noncharacters_in_values_and_keys(self):
+        self.assertEqual(66, len(_NONCHARACTER_CODE_POINTS))
+        for code_point in _NONCHARACTER_CODE_POINTS:
+            character = chr(code_point)
+            with self.assertRaises(CanonicalizationError):
+                canonicalize({"x": character})
+            with self.assertRaises(CanonicalizationError):
+                canonicalize({character: "x"})
+
+    def test_strict_json_rejects_escaped_noncharacter(self):
+        with self.assertRaises(CanonicalizationError):
+            strict_json_loads('{"x":"\\ufdd0"}')
+
+    def test_strict_json_rejects_literal_noncharacter(self):
+        payload = '{"x":"' + chr(0xFDD0) + '"}'
+        with self.assertRaises(CanonicalizationError):
+            strict_json_loads(payload)
+
+    def test_rejects_top_level_noncharacter(self):
+        with self.assertRaises(CanonicalizationError):
+            canonicalize(chr(0x10FFFF))

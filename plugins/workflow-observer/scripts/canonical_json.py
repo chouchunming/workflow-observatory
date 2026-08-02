@@ -11,9 +11,18 @@ class CanonicalizationError(ValueError):
     pass
 
 
+def _is_noncharacter(code_point: int) -> bool:
+    return 0xFDD0 <= code_point <= 0xFDEF or (code_point & 0xFFFF) in (
+        0xFFFE,
+        0xFFFF,
+    )
+
+
 def _validate_string(value: str) -> None:
     if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
         raise CanonicalizationError("lone surrogate is not valid I-JSON")
+    if any(_is_noncharacter(ord(character)) for character in value):
+        raise CanonicalizationError("Unicode noncharacter is not valid I-JSON")
 
 
 def _string_bytes(value: str) -> bytes:
