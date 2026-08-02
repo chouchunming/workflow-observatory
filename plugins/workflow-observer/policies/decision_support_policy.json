@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "version": "decision-pattern-support@1",
+  "pattern_kinds": ["single-event", "contiguous-adjacent-pair"],
+  "event_key_fields": ["phase", "actor_role", "decision_type", "reason_code", "result"],
+  "decision_min_episode_support": 3,
+  "decision_min_support_ratio": "0.40",
+  "decision_recurring_minimum_outcome_episodes": 5
+}

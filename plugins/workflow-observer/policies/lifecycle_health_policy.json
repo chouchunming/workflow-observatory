@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "version": "draft-staleness@1",
+  "draft_stale_after_seconds": 86400
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "version": "metric-semantics@1",
+  "metrics": {
+    "elapsed_seconds": {"semantics_id": "wall-clock-elapsed@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "elapsed-time-distribution"},
+    "verification": {"semantics_id": "verification-result@1", "value_type": "enum", "aggregation": "category-counts", "candidate_type": "verification-non-pass"},
+    "review_rounds": {"semantics_id": "formal-review-cycle@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "review-round-distribution"},
+    "defects_found": {"semantics_id": "confirmed-defect@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "defect-observed"},
+    "rework_count": {"semantics_id": "confirmed-rework@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "rework-observed"},
+    "input_tokens": {"semantics_id": "measured-token-count@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "input-token-distribution"},
+    "output_tokens": {"semantics_id": "measured-token-count@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "output-token-distribution"},
+    "cache_read_tokens": {"semantics_id": "measured-token-count@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "cache-read-token-distribution"},
+    "cost_amount": {"semantics_id": "measured-cost@1", "value_type": "normalized-decimal-string", "aggregation": "missingness-only", "candidate_type": null},
+    "test_failures": {"semantics_id": "confirmed-test-failure@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "test-failure-observed"},
+    "timeout_count": {"semantics_id": "confirmed-timeout@1", "value_type": "nonnegative-integer", "aggregation": "integer-quantiles", "candidate_type": "timeout-observed"}
+  },
+  "not_applicable_rules": []
+}

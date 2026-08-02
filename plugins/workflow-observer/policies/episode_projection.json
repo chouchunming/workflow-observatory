@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "version": "episode-projection@2",
+  "max_decisions": 12,
+  "max_scalar_codepoints": 200,
+  "enumerations": {
+    "measurement_source": ["agent-reported", "tool-derived", "unavailable"],
+    "phase": ["implementation", "planning", "recovery", "review", "verification"],
+    "actor_role": ["coordinator", "implementer", "planner", "reviewer", "tester"],
+    "decision_type": ["change-scope", "reject", "resume", "retry", "rollback", "split-task", "stop"],
+    "reason_code": ["api-design", "complexity-threshold", "dependency", "integrity-risk", "test-failure", "timeout", "user-direction", "verification-failure"],
+    "result": ["inconclusive", "rejected", "superseded", "supported"]
+  },
+  "schema_capabilities": {
+    "1": {
+      "metrics": {
+        "elapsed_seconds": true,
+        "verification": true,
+        "review_rounds": true,
+        "defects_found": true,
+        "rework_count": true,
+        "input_tokens": false,
+        "output_tokens": false,
+        "cache_read_tokens": false,
+        "cost_amount": false,
+        "test_failures": false,
+        "timeout_count": false
+      },
+      "decisions": false
+    },
+    "2": {
+      "metrics": {
+        "elapsed_seconds": true,
+        "verification": true,
+        "review_rounds": true,
+        "defects_found": true,
+        "rework_count": true,
+        "input_tokens": true,
+        "output_tokens": true,
+        "cache_read_tokens": true,
+        "cost_amount": true,
+        "test_failures": true,
+        "timeout_count": true
+      },
+      "decisions": true
+    }
+  }
+}

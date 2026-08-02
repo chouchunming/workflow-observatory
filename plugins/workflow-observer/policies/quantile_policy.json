@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "version": "linear-rational-quantile@1",
+  "quantiles": ["0.25", "0.50", "0.75"]
+}
