@@ -1,8 +1,8 @@
 # Workflow Evolution Foundation v0.2 Design
 
-Date: 2026-08-02  
-Status: Draft for external review  
-Review mode: Architecture, then adversarial  
+Date: 2026-08-02
+Status: Draft for external review
+Review mode: Architecture, then adversarial
 
 ## Section status
 
