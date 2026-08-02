@@ -23,7 +23,7 @@ automatically.
 
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 4 are complete on the
+Implementation started on 2026-08-02; Tasks 1 through 5 are complete on the
 design branch.
 These capabilities are not part of the current released plugin.
 
