@@ -8,8 +8,8 @@ Review mode: Architecture, then adversarial
 
 - Section 1 — Product boundary and components: Approved
 - Section 2 — Episode v2 and Decision Events: Approved baseline
-- Section 2 additive amendment — Workflow generation: Draft for approval
-- Section 3 — Learning Snapshot, comparability, and improvement candidates: Revised draft
+- Section 2 additive amendment — Workflow generation: Revised draft for approval
+- Section 3 — Learning Snapshot, comparability, and improvement candidates: Revised draft for approval
 - Error behavior, experiment lifecycle, and verification design: Not yet designed
 
 This document is not implementation-ready. Sections marked Approved are the
@@ -228,13 +228,29 @@ workflow_generation: wf-sha256-8b28c2f6d53e6d7aab326852acc038915e834c6b530e868f2
 
 The field becomes required for new v2 Episodes once their producing workflow
 declares explicit versioning support in the versioned producer-capability
-registry. Omission after that declaration is a gate failure. For v1 history
-and v2 producers without an explicit version, canonical projection represents
-generation availability as `unavailable` with a null value. `unknown` is not a
-generation, and records without an auditable generation mapping are
-descriptive-only for workflow comparison. A fixed, reviewed migration mapping
-may supply a generation in a derived view; it does not edit the Episode or
-create another sample.
+registry. Every declaration has an immutable machine-readable effective
+boundary:
+
+```json
+{
+  "workflow_variant": "implementation-with-review",
+  "generation_required_from": "2026-08-03T00:00:00Z"
+}
+```
+
+The boundary may instead name an exact producer generation when that identity
+is available. The analyzer compares the Episode's canonical `started_at` or
+producer generation to the declared boundary; adding a declaration cannot
+retroactively invalidate an earlier Episode. A policy change creates a new
+registry version and hash rather than rewriting the old registry in place.
+
+Omission on or after the applicable declaration boundary is a gate failure.
+For v1 history and v2 producers without an applicable declaration, canonical
+projection represents generation availability as `unavailable` with a null
+value. `unknown` is not a generation, and records without an auditable
+generation mapping are descriptive-only for workflow comparison. A fixed,
+reviewed migration mapping may supply a generation in a derived view; it does
+not edit the Episode or create another sample.
 
 ## Section 3 — Learning Snapshot, comparability, and improvement candidates
 
@@ -327,6 +343,33 @@ canonical window is:
 The timezone name must be a validated IANA identifier. The canonical UTC
 instants, not the machine timezone, determine the input manifest.
 
+### Lifecycle health time policy
+
+Lifecycle health never reads an unstored system clock. The canonical core
+contains the versioned policy and exact UTC evaluation instant:
+
+```json
+{
+  "lifecycle_health_policy": {
+    "policy_id": "draft-staleness@1",
+    "as_of": "2026-08-02T16:00:00Z",
+    "stale_after_seconds": 86400
+  }
+}
+```
+
+For a bounded historical snapshot, `as_of` equals the analysis interval's
+`until_exclusive`. For a live lifecycle-health snapshot, the caller supplies
+one explicit UTC instant before acquisition; the analyzer stores that instant
+in the core. A draft is stale only when `as_of - started_at` is strictly
+greater than `stale_after_seconds`.
+
+The policy ID, policy artifact hash, `as_of`, and threshold participate in the
+snapshot identity. Lifecycle-health candidate identities also include the
+applicable policy identity and hash. Re-running identical inputs at a later
+wall-clock time therefore cannot change stale counts unless the caller chooses
+a different explicit `as_of`, which produces a different snapshot core.
+
 ### Snapshot envelope and canonical core
 
 The artifact separates local or volatile provenance from the semantic core:
@@ -351,32 +394,119 @@ Learning Snapshot envelope
 semantic core, so relocating identical valid data does not change the semantic
 snapshot identity. `generated_at` is also excluded from that identity.
 
-The canonical core uses UTF-8 JSON with lexicographically sorted object keys,
-no insignificant whitespace, UTC timestamps ending in `Z`, integers for
-counts, explicit JSON nulls, and normalized non-exponent decimal strings for
-derived numeric values. Floating-point JSON numbers are prohibited. The
-quantile policy is identified by a versioned semantics ID and computes exact
-rational interpolation before rendering a normalized decimal string.
+Adapter implementation identity is envelope provenance. The adapter-neutral
+canonical projection contract version is part of the semantic core. Portable
+and LLMWiki adapters that pass parity and produce identical projections can
+therefore produce the same semantic `snapshot_id` even though their
+implementation identities differ.
+
+Canonical serialization conforms to
+[RFC 8785 JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785.html)
+and its I-JSON input constraints. This fixes recursive property ordering by
+unsigned UTF-16 code units, JSON string and control-character escaping,
+preservation of non-ASCII Unicode without normalization, rejection of
+duplicate properties and lone surrogates, omission of insignificant
+whitespace, and final UTF-8 encoding.
+
+The snapshot schemas impose additional restrictions: counts are JSON integers,
+derived non-integral values are normalized non-exponent decimal strings,
+explicit absence is JSON null, UTC timestamps end in `Z`, and floating-point
+JSON numbers are prohibited. Integer values remain within the interoperable
+range from `-(2^53)+1` through `(2^53)-1`; count fields are additionally
+non-negative. The quantile policy computes exact rational interpolation before
+rendering a normalized decimal string.
+
+One versioned canonicalizer implementation and one shared conformance-vector
+suite must be used for input-manifest hashes, `snapshot_id`,
+`artifact_sha256`, policy and registry hashes, and `candidate_id`. A
+canonicalization or I-JSON failure aborts the Data Trust Gate.
 
 The identifier is:
 
 ```text
 snapshot_id = SHA-256(
   UTF-8("workflow-observatory:learning-snapshot-core:v1\0")
-  + canonical-json(snapshot-core-without-snapshot-id)
+  + JCS(snapshot-core)
 )
 ```
 
+`snapshot_id` exists only in the envelope, so the canonical core has no
+self-reference or placeholder.
+
 `artifact_sha256` separately covers the canonical complete artifact with the
-`artifact_sha256` field omitted. Human-readable Markdown is a deterministic
-rendering of the canonical core and is not a second authority. Any LLM-written
-narrative is a separate annotation that cites `snapshot_id`; it is not part of
-the snapshot core and cannot reuse the snapshot identity as its own identity.
+`artifact_sha256` field omitted, using the same JCS implementation.
+Human-readable Markdown is a deterministic rendering of the canonical core and
+is not a second authority. Any LLM-written narrative is a separate annotation
+that cites `snapshot_id`; it is not part of the snapshot core and cannot reuse
+the snapshot identity as its own identity.
 
 The Learning Snapshot schema fixes `artifact_type` to `learning-snapshot` and
 `authoritative` to `false`. Changing that boolean changes the artifact hash but
 still cannot create formal acceptance: formal results use a distinct artifact
 type, schema, and publication capability that the learning path cannot claim.
+
+### Reproducibility policy closure
+
+Every registry or policy that can change validation, projection, eligibility,
+aggregation, lifecycle classification, or candidate emission is an immutable
+input to the semantic core. A label such as `analyzer_version: 0.2.0` is not
+sufficient by itself.
+
+The core contains an analysis policy set with an exact version and lowercase
+SHA-256 for each artifact:
+
+```json
+{
+  "analysis_policy_set": {
+    "analyzer_artifact": {
+      "version": "workflow-learning-analyzer@0.2.0",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "canonicalizer_artifact": {
+      "version": "rfc8785-jcs@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "canonical_projection_contract": {
+      "version": "episode-projection@2",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "producer_capability_registry": {
+      "version": "producer-capabilities@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "workflow_generation_mapping": {
+      "version": "workflow-generation-mapping@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "metric_semantics_registry": {
+      "version": "metric-semantics@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "quantile_policy": {
+      "version": "linear-rational-quantile@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "decision_support_policy": {
+      "version": "decision-pattern-support@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "lifecycle_health_policy": {
+      "version": "draft-staleness@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    },
+    "candidate_emission_policy": {
+      "version": "candidate-emission@1",
+      "sha256": "sha256:<64-lowercase-hex>"
+    }
+  }
+}
+```
+
+The mapping artifact is present even when it contains an empty mapping. Policy
+and registry hashes use the same JCS canonicalizer as snapshot identities.
+Changing artifact bytes requires a new immutable artifact and hash; an existing
+version label must never be reused for different bytes. The input manifest A,
+manifest B verification, and snapshot core all bind the same policy set.
 
 ### Workflow generation and base cohorts
 
@@ -440,6 +570,12 @@ Every cohort reports explicit counts such as:
   "invalidated_episode_n": 0
 }
 ```
+
+Lifecycle counts are overlapping predicates, not a partition. For example, an
+Episode may be both superseded and invalidated and appear in both lifecycle
+counts. Each field states its own denominator, and lifecycle counts must not be
+summed to infer total records. Outcome membership remains mutually exclusive
+by final status after invalidated records are excluded.
 
 Fewer than five comparable outcome Episodes permits descriptive counts only.
 At five or more, deterministic evidence may support a cautious recurring-
@@ -573,9 +709,11 @@ candidate from a cited snapshot.
 
 Each `candidate_id` is the lowercase hexadecimal SHA-256 of the UTF-8 domain
 separator `workflow-observatory:learning-candidate:v1\0` followed by the
-canonical JSON bytes of that candidate's class, cohort identity, metric or
-pattern semantics ID, denominators, observed values, and evidence strength.
-Human narrative and envelope provenance do not enter this identity.
+JCS bytes of that candidate's class, cohort identity, applicable policy and
+registry identities and hashes, metric or pattern semantics ID, denominators,
+observed values, and evidence strength. Lifecycle candidates therefore bind
+the exact staleness policy and `as_of`. Human narrative and envelope provenance
+do not enter this identity.
 
 ### Post-hoc evaluation artifacts
 
@@ -618,6 +756,16 @@ descriptive output. These names identify analysis candidates, not conclusions.
     identity without its own annotation identity.
 12. Without explicit user approval, the workflow does not edit a workflow or
     skill, create a branch or pull request, or execute an experiment.
+13. Re-running a historical snapshot at a later wall-clock time preserves
+    lifecycle counts because the core binds an explicit `as_of`; changing
+    `as_of` changes the snapshot identity.
+14. One shared JCS conformance vector containing emoji, non-ASCII property
+    names, control characters, escaped quotation marks, and backslashes
+    produces identical bytes and hashes across every supported runtime; a lone
+    surrogate fails closed.
+15. Changing any policy or registry bytes changes its hash and snapshot core;
+    a producer capability declaration affects only Episodes on or after its
+    immutable effective boundary.
 
 ## Resolved Section 3 questions
 
@@ -628,6 +776,10 @@ descriptive output. These names identify analysis candidates, not conclusions.
 - Confidence intervals are excluded from v0.2.
 - Evaluation artifacts are excluded from v0.2 snapshots.
 - Candidates are stable but unranked in v0.2.
+- Lifecycle health binds a stored UTC `as_of` and versioned staleness policy.
+- RFC 8785 JCS is the only canonicalizer for all content-derived identities.
+- Every result-affecting registry and policy is closed by immutable version and
+  hash in the semantic core.
 
 ## External review request
 
@@ -644,7 +796,7 @@ architecture mode, then adversarial mode. Check:
 - Trust Gate Diagnostic isolation;
 - v1/v2 derived-view deduplication;
 - privacy, cardinality, and approval-gate bypasses;
-- coverage of the twelve acceptance-test requirements.
+- coverage of the fifteen acceptance-test requirements.
 
 Return one of:
 
