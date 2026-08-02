@@ -1,3 +1,4 @@
+import hashlib
 import io
 from pathlib import Path
 import runpy
@@ -502,27 +503,25 @@ class ParallelMarketplaceEvalRunnerTests(unittest.TestCase):
                     text,
                 )
 
-    def test_canonical_and_packaged_runner_and_test_mirrors_are_identical(self):
+    def test_frozen_runner_and_test_evidence_matches_reviewed_hashes(self):
         _runner, _namespace, runtime_globals = _load_runner()
         repository = runtime_globals["REPOSITORY_ROOT"].parent
-        canonical = (
-            repository / "plugins/workflow-observer/tests"
-        )
         packaged = repository / (
             "evidence/marketplace/workflow-observatory/"
             "plugins/workflow-observer/tests"
         )
 
-        for name in (
-            "run_marketplace_eval.py",
-            "test_parallel_eval_runner.py",
-            "test_eval_runner_hygiene.py",
-            "test_package_archive.py",
-        ):
+        frozen_sha256 = {
+            "run_marketplace_eval.py": "eb8f2629fe4636d601a3d440c767432fb6633b3b0b8d725bc41cd927a5c1f643",
+            "test_parallel_eval_runner.py": "e564b619919883de9bdd09a7a6ed2d9e6e5c27f0ae3b3d23c5e3090f032928e2",
+            "test_eval_runner_hygiene.py": "7433345055680b0b3e2414b420e06834ef57c8c4d9d8e158116e9fcaeacc8a6f",
+            "test_package_archive.py": "7b4f16c9b84b931457fc825bf8b0cb99666462f854ad85e6a17ffb38052a671a",
+        }
+        for name, expected in frozen_sha256.items():
             with self.subTest(name=name):
                 self.assertEqual(
-                    (canonical / name).read_bytes(),
-                    (packaged / name).read_bytes(),
+                    expected,
+                    hashlib.sha256((packaged / name).read_bytes()).hexdigest(),
                 )
 
 

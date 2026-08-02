@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import os
 import subprocess
 import sys
@@ -89,7 +90,7 @@ class MarketplaceEvalRunnerHygieneTests(unittest.TestCase):
                 self.assertNotIn(forbidden, result.stdout)
                 self.assertNotIn(forbidden, text)
 
-    def test_parallel_public_document_mirrors_preserve_evidence_boundary(self):
+    def test_parallel_public_documents_preserve_current_and_frozen_boundaries(self):
         marketplace_tests = Path(__file__).resolve().parent
         marketplace = marketplace_tests.parents[2]
         source_repository = marketplace.parents[1]
@@ -103,7 +104,7 @@ class MarketplaceEvalRunnerHygieneTests(unittest.TestCase):
         )
         repository = evidence.parent
         packaged = evidence / "marketplace/workflow-observatory"
-        pairs = (
+        documents = (
             ("README.md", "README.md"),
             ("ROADMAP.md", "ROADMAP.md"),
             ("TODO.md", "TODO.md"),
@@ -116,13 +117,24 @@ class MarketplaceEvalRunnerHygieneTests(unittest.TestCase):
                 "plugins/workflow-observer/README.md",
             ),
         )
-        contents = {}
-        for source_name, packaged_name in pairs:
-            with self.subTest(source_name=source_name):
-                source = repository / source_name
-                mirror = packaged / packaged_name
-                self.assertEqual(source.read_bytes(), mirror.read_bytes())
-                contents[source_name] = source.read_text(encoding="utf-8")
+        contents = {
+            source_name: (repository / source_name).read_text(encoding="utf-8")
+            for source_name, _ in documents
+        }
+        frozen_sha256 = {
+            "README.md": "0b2ed4d2a4b0e24ef06541c8ac04767802113de1b037e2bd95861c4d4ccda43f",
+            "ROADMAP.md": "7eeb4457e26d134c6d50e442077860244d5d48766b2cb136bf9a8794efce813d",
+            "TODO.md": "20dd328f2a1fb42682a706a251388bd3af2631409175491931eaf090b304defe",
+            "docs/parallel-evaluation-plan.md": "90192cdd4b835a81de7c07fc7ead37102140a57424108069e925e10c55bd7901",
+            "plugins/workflow-observer/README.md": "40e60592ff217924324a996471eb1f2d499b5b79cf5dd0d5a8e2ef0859ce200b",
+        }
+        for _, packaged_name in documents:
+            with self.subTest(packaged_name=packaged_name):
+                frozen = packaged / packaged_name
+                self.assertEqual(
+                    frozen_sha256[packaged_name],
+                    hashlib.sha256(frozen.read_bytes()).hexdigest(),
+                )
 
         readme = " ".join(contents["README.md"].split())
         roadmap = " ".join(contents["ROADMAP.md"].split())
