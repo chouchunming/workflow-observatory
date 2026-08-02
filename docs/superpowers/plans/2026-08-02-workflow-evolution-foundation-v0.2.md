@@ -1,5 +1,8 @@
 # Workflow Evolution Foundation v0.2 Implementation Plan
 
+Status: Revised after external review; external re-approval required before
+Task 1. The underlying design remains approved.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` (recommended) or `executing-plans` to implement
 > this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -27,16 +30,23 @@ and CodeGraph 1.5.0 as advisory impact analysis.
 - The approved design is
   `docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md`.
 - Use an isolated linked worktree backed by the durable canonical clone.
-- Before each task, run `npx --yes @colbymchenry/codegraph@1.5.0 sync .`, then
-  query the exact symbols being changed with `codegraph explore`; after the
-  change, pipe changed paths to `codegraph affected --stdin`. CodeGraph is
-  advisory only; explicit tests below remain authoritative.
+- Complete Task 0 once in every newly created linked worktree. Before each
+  later task, run `npx --yes @colbymchenry/codegraph@1.5.0 sync .`, query the
+  exact symbols being changed with `codegraph explore`, and pipe changed paths
+  to `codegraph affected --stdin` after the change. CodeGraph is advisory only;
+  unavailable, stale, or unsupported-language results never replace the
+  explicit tests below.
 - Run every test/build/evaluation command as a direct child of
   `caffeinate -i -m`. Keep one tracked orchestration-scoped `caffeinate -i`
   assertion while workers or multi-step orchestration are active, and release
   it before hand-off.
 - Use TDD. Every task must demonstrate the named focused test failing for the
   intended missing behavior before production changes, then passing afterward.
+- For trust-critical Tasks 2, 3, 5, 6, and 9, an initial import/interface
+  failure is only RED-A. Add the smallest interface skeleton without product
+  behavior, rerun, and capture RED-B where the intended semantic assertion
+  fails. Implement GREEN only after RED-B proves the test exercises the trust
+  boundary rather than merely a missing module.
 - Commit each task after its focused verification. Push the WIP branch at every
   review, pause, hand-off, or context-compaction boundary.
 - Python 3.11 is the minimum runtime. The v0.2 acceptance matrix covers CPython
@@ -69,13 +79,38 @@ and CodeGraph 1.5.0 as advisory impact analysis.
   creation.
 - Do not edit historical packaged evidence under `evidence/marketplace/`, the
   top-level `SHA256SUMS.json`, release version `0.1.0`, or GitHub release state.
+  Current top-level README/ROADMAP/TODO may evolve independently; never restore
+  obsolete byte-equality by copying them into the frozen 0.1 evidence tree.
+
+## Task 0: Per-Worktree Execution Preflight
+
+This is an execution preflight, not a twelfth implementation unit. Run it once
+after creating each linked worktree and before Task 1:
+
+```bash
+npx --yes @colbymchenry/codegraph@1.5.0 --version
+if [ ! -d .codegraph ]; then
+  npx --yes @colbymchenry/codegraph@1.5.0 init
+else
+  npx --yes @colbymchenry/codegraph@1.5.0 sync .
+fi
+npx --yes @colbymchenry/codegraph@1.5.0 status
+git check-ignore -q .codegraph
+```
+
+Expected: CodeGraph reports version `1.5.0`, the worktree has its own complete
+index, and `.codegraph/` is ignored by a local Git exclude or repository ignore
+rule. If the ignore check fails, add `.codegraph/` to the worktree's local Git
+exclude before continuing; do not commit the index. If CodeGraph cannot index
+the worktree, record that advisory limitation and continue with explicit
+searches and tests rather than treating a partial graph as authoritative.
 
 ## File and Responsibility Map
 
 **Create:**
 
 - `plugins/workflow-observer/scripts/canonical_json.py` — the sole JCS
-  serializer and domain-separated hash helper.
+  serializer, strict JSON ingress parser, and domain-separated hash helper.
 - `plugins/workflow-observer/scripts/policy_artifacts.py` — policy validation,
   effective-boundary union, deterministic source manifest, and policy-set
   identity.
@@ -145,6 +180,7 @@ and CodeGraph 1.5.0 as advisory impact analysis.
 **Interfaces:**
 
 - Produces: `canonicalize(value: object) -> bytes`
+- Produces: `strict_json_loads(data: str | bytes) -> object`
 - Produces: `hash_canonical(domain: bytes, value: object) -> str`
 - Produces: `CanonicalizationError(ValueError)`
 - Consumes: Python JSON-domain values only; floats and non-string mapping keys
@@ -177,7 +213,12 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 VECTOR = Path(__file__).resolve().parent / "fixtures/jcs_conformance_vectors.json"
 sys.path.insert(0, str(SCRIPTS))
 
-from canonical_json import CanonicalizationError, canonicalize, hash_canonical
+from canonical_json import (
+    CanonicalizationError,
+    canonicalize,
+    hash_canonical,
+    strict_json_loads,
+)
 
 
 class CanonicalJsonTests(unittest.TestCase):
@@ -216,6 +257,20 @@ class CanonicalJsonTests(unittest.TestCase):
             hash_canonical(b"a\0", value),
             hash_canonical(b"b\0", value),
         )
+
+    def test_strict_json_rejects_ambiguous_or_non_i_json_input(self):
+        invalid = (
+            '{"x":1,"x":2}',
+            '{"x":NaN}',
+            '{"x":Infinity}',
+            '{"x":-Infinity}',
+            '{"x":"\\ud800"}',
+            b'{"x":"\xff"}',
+        )
+        for payload in invalid:
+            with self.subTest(payload=repr(payload)):
+                with self.assertRaises(CanonicalizationError):
+                    strict_json_loads(payload)
 ```
 
 - [ ] **Step 2: Run the focused test and verify RED**
@@ -293,11 +348,53 @@ def canonicalize(value: object) -> bytes:
     return _encode(value)
 
 
+def strict_json_loads(data: str | bytes) -> object:
+    if isinstance(data, bytes):
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise CanonicalizationError("JSON input is not valid UTF-8") from error
+    elif isinstance(data, str):
+        text = data
+    else:
+        raise CanonicalizationError("JSON input must be text or UTF-8 bytes")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise CanonicalizationError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(token):
+        raise CanonicalizationError(f"non-finite JSON number: {token}")
+
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (CanonicalizationError, json.JSONDecodeError) as error:
+        if isinstance(error, CanonicalizationError):
+            raise
+        raise CanonicalizationError("invalid JSON input") from error
+    canonicalize(value)
+    return value
+
+
 def hash_canonical(domain: bytes, value: object) -> str:
     if not isinstance(domain, bytes) or not domain.endswith(b"\0"):
         raise CanonicalizationError("hash domain must be NUL-terminated bytes")
     return hashlib.sha256(domain + canonicalize(value)).hexdigest()
 ```
+
+`strict_json_loads` is the only production JSON ingress for v0.2 policy and
+registry files, Episode v2 supplements, embedded Episode blocks, persisted
+Learning Snapshot readback, and any persisted code/source manifest JSON. A
+caller may not use ordinary `json.loads()` before handing an already-collapsed
+object to the canonicalizer.
 
 - [ ] **Step 4: Run the focused test and existing plugin tests**
 
@@ -344,6 +441,8 @@ git commit -m "feat: add canonical workflow artifact hashing"
 - Consumes: `canonical_json.canonicalize` and `hash_canonical` from Task 1.
 - Produces: `PolicyError(ValueError)`.
 - Produces: `validate_effective_boundary(value: object) -> dict[str, str]`
+- Produces: `RegularFileEvidence(content: bytes, sha256: str, executable: bool, device: int, inode: int)`.
+- Produces: `read_regular_file_evidence(root: Path, relative_posix_path: str, *, max_bytes: int) -> RegularFileEvidence`.
 - Produces: `build_code_manifest(root: Path, relative_paths: Sequence[str]) -> dict`
 - Produces: `load_policy_set(policy_root: Path, analyzer_files: Sequence[str], canonicalizer_files: Sequence[str]) -> PolicySet`
 - Produces: immutable `PolicySet.core_identity() -> dict[str, dict[str, str]]`.
@@ -386,9 +485,39 @@ def test_code_manifest_binds_exact_file_bytes(self):
 
 
 def test_code_manifest_rejects_unsafe_members(self):
-    for member in ("/absolute.py", "../escape.py", "a/../b.py"):
+    for member in (
+        "", ".", "/absolute.py", "../escape.py", "a/../b.py",
+        "a\\b.py", "C:/drive.py", "//server/share.py", "nul\0name.py",
+    ):
         with self.subTest(member=member), self.assertRaises(PolicyError):
             build_code_manifest(self.root, [member])
+
+
+def test_code_manifest_rejects_swap_before_final_open(self):
+    replacement = self.root / "replacement.py"
+    replacement.write_text("replacement\n", encoding="utf-8")
+    real_open = os.open
+    swapped = False
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "a.py" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            os.replace(replacement, self.root / "a.py")
+        return real_open(path, flags, *args, **kwargs)
+
+    with mock.patch("policy_artifacts.os.open", side_effect=swap_then_open):
+        with self.assertRaisesRegex(PolicyError, "changed during read"):
+            build_code_manifest(self.root, ["a.py"])
+
+
+def test_duplicate_key_rejected_in_policy(self):
+    (self.policy_root / "quantile_policy.json").write_text(
+        '{"schema_version":1,"schema_version":1}',
+        encoding="utf-8",
+    )
+    with self.assertRaisesRegex(PolicyError, "duplicate JSON key"):
+        self.load_policy_set()
 ```
 
 - [ ] **Step 2: Run the focused test and verify RED**
@@ -401,6 +530,10 @@ caffeinate -i -m python3 -m unittest \
 ```
 
 Expected: import failure for `policy_artifacts`.
+Then add only the named classes/functions with `NotImplementedError` bodies and
+rerun. RED-B is valid only when boundary, unsafe-path, swap-race, duplicate-key,
+and manifest assertions execute and fail for their intended semantics rather
+than import or fixture errors.
 
 - [ ] **Step 3: Add exact immutable policy documents**
 
@@ -486,35 +619,44 @@ def build_code_manifest(root: Path, relative_paths: Sequence[str]) -> dict:
     rows = []
     seen = set()
     for raw in relative_paths:
-        relative = PurePosixPath(raw)
-        if relative.is_absolute() or not relative.parts or any(
-            part in {"", ".", ".."} for part in relative.parts
-        ):
-            raise PolicyError("artifact member must be a normalized relative path")
-        normalized = relative.as_posix()
-        normalized.encode("utf-8")
+        normalized = validate_relative_posix_artifact_path(raw)
         if normalized in seen:
             raise PolicyError("artifact member path is duplicated")
         seen.add(normalized)
-        path = root
-        for component in relative.parts:
-            path = path / component
-            component_details = path.lstat()
-            if stat.S_ISLNK(component_details.st_mode):
-                raise PolicyError("artifact member path must not contain symlinks")
-        details = path.lstat()
-        if not stat.S_ISREG(details.st_mode):
-            raise PolicyError("artifact member must be a regular non-symlink file")
+        evidence = read_regular_file_evidence(
+            root,
+            normalized,
+            max_bytes=1_048_576,
+        )
         rows.append({
             "path": normalized,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "executable": bool(details.st_mode & 0o111),
+            "sha256": evidence.sha256,
+            "executable": evidence.executable,
         })
     rows.sort(key=lambda row: row["path"].encode("utf-8"))
     return {"schema_version": 1, "files": rows}
 ```
 
-`load_policy_set` must parse each JSON document with duplicate-key rejection,
+`validate_relative_posix_artifact_path` rejects empty strings, NUL, backslash,
+POSIX absolute paths, drive-qualified or UNC paths, empty components, `.`, and
+`..`; the normalized UTF-8 POSIX spelling must equal the caller's input.
+
+`read_regular_file_evidence` uses descriptor-relative traversal. Open the root
+directory and every directory component with `O_DIRECTORY | O_NOFOLLOW |
+O_CLOEXEC`, then inspect and open the final component with `dir_fd` and
+`O_NOFOLLOW`. Compare pre-open `stat(..., follow_symlinks=False)`, opened
+`fstat`, and post-read `fstat` device/inode/type/size plus modification identity.
+Read bounded bytes exactly once from that final descriptor; derive `content`,
+SHA-256, and executable mode from those descriptor-bound bytes and metadata.
+Never call `Path.read_bytes()` after validation. A component swap, final-file
+swap, in-place mutation during the read, oversized file, short read, symlink,
+or non-regular file fails closed. If the platform cannot provide equivalent
+`dir_fd` and no-follow guarantees, this capability fails closed rather than
+falling back to path-based reads. Device and inode are returned as local
+evidence but are not serialized into the portable code manifest identity.
+
+`load_policy_set` must parse each JSON document with Task 1
+`strict_json_loads`,
 validate its exact allowed keys and version, hash its JCS form, build the two
 source manifests, and return these core keys:
 
@@ -551,6 +693,7 @@ scripts/episode_schema.py
 scripts/learning_snapshot.py
 scripts/policy_artifacts.py
 scripts/snapshot_input.py
+scripts/store_config.py
 scripts/wiki_observations.py
 ```
 
@@ -594,7 +737,8 @@ git commit -m "feat: close workflow analysis policy identities"
 
 **Interfaces:**
 
-- Consumes: Task 1 canonicalizer and Task 2 projection/policy documents.
+- Consumes: Task 1 canonicalizer/strict parser and Task 2 projection/policy
+  documents.
 - Produces: `EpisodeSchemaError(ValueError)`.
 - Produces: `EpisodeV2Supplement`
 - Produces: `parse_v2_supplement(text: str, projection: Mapping) -> EpisodeV2Supplement`
@@ -635,6 +779,26 @@ def test_v1_projection_does_not_fabricate_v2_fields(self):
     self.assertEqual([], projected["decisions"])
 
 
+def test_duplicate_key_rejected_in_episode_supplement(self):
+    payload = V2_SUPPLEMENT.replace(
+        '"schema_version": 2,',
+        '"schema_version": 2, "schema_version": 2,',
+        1,
+    )
+    with self.assertRaisesRegex(EpisodeSchemaError, "duplicate JSON key"):
+        parse_v2_supplement(payload, self.projection)
+
+
+def test_duplicate_key_rejected_in_episode_block(self):
+    body = (
+        'human\n\n## Episode data\n\n```json\n'
+        '{"schema_version":2,"schema_version":2}'
+        '\n```\n'
+    )
+    with self.assertRaisesRegex(EpisodeSchemaError, "duplicate JSON key"):
+        parse_episode_block(body, self.projection)
+
+
 def test_decisions_are_bounded_and_reject_sensitive_shapes(self):
     payload = json.loads(V2_SUPPLEMENT)
     payload["decisions"] = payload["decisions"] * 13
@@ -663,8 +827,15 @@ caffeinate -i -m python3 -m unittest \
 ```
 
 Expected: import failure for `episode_schema`.
+Then add only the importable Episode interfaces and rerun. RED-B must reach the
+v1/v2, strict-ingress, privacy, and bounded-Decision assertions and fail for
+missing semantics rather than parser import or fixture errors.
 
 - [ ] **Step 3: Implement the exact v2 supplement input contract**
+
+`parse_v2_supplement` must call Task 1 `strict_json_loads` on the original
+UTF-8 text before schema validation. It may not accept a pre-parsed mapping or
+use ordinary `json.loads()` at this ingress.
 
 The mode-0600 supplement file has this exact shape; fields not known are JSON
 null and no extra keys are accepted:
@@ -718,6 +889,9 @@ values from the supplement. `render_episode_block` appends exactly:
 The real JSON line is `canonicalize(data).decode("utf-8")`. A v1 body has no
 Episode block. A v2 body has exactly one final Episode block after Metrics;
 duplicate, reordered, non-canonical, or trailing content is invalid.
+`parse_episode_block` sends the extracted original JSON bytes through
+`strict_json_loads` before comparing their canonical bytes; duplicate keys are
+therefore rejected before object construction can collapse them.
 
 - [ ] **Step 5: Run focused and existing record tests**
 
@@ -922,6 +1096,11 @@ LLMWiki, create byte-equivalent observations referencing `[[example]]`, and
 assert both validate under their selected semantics. Also assert LLMWiki fails
 closed when only the obsolete `wiki/tasks/example.md` path exists.
 
+In `test_store_config.py`, add
+`test_duplicate_key_rejected_in_store_config`: write a config with duplicate
+`adapter` keys and require `ConfigError` before adapter selection. This keeps
+configuration ingress on the same Task 1 strict parser as the analysis inputs.
+
 - [ ] **Step 2: Run the adapter test and verify RED**
 
 Run:
@@ -952,6 +1131,9 @@ def adapter_semantics(config: StoreConfig) -> AdapterSemantics:
 
 No environment probe or fallback may change the selected semantics after
 configuration is loaded.
+`load_store_config` reads original UTF-8 bytes through `strict_json_loads` and
+translates `CanonicalizationError` to `ConfigError`; it never calls ordinary
+`json.loads()` on configuration bytes.
 
 - [ ] **Step 4: Thread semantics through every reference check used by snapshots**
 
@@ -1049,8 +1231,8 @@ string.
 In `SnapshotInputTests.setUp`, create one policy set and two equivalent
 `FakeObservationStore` instances. Define `self.acquire(adapter="portable")` as
 a thin call to the public `acquire_snapshot_input`; define
-`self.write_original_and_migration_view_same_run_id()` to add the reviewed
-mapping fixture and a second representation sharing the same `run_id`.
+`self.add_reviewed_generation_mapping()` to add a reviewed logical mapping for
+the one existing physical Episode without creating a second source record.
 
 ```python
 def test_taipei_dates_become_fixed_utc_half_open_interval(self):
@@ -1075,8 +1257,18 @@ def test_runtime_timezone_does_not_change_bundle(self):
 
 
 def test_derived_view_does_not_duplicate_run_id(self):
-    self.write_original_and_migration_view_same_run_id()
-    with self.assertRaisesRegex(SnapshotInputError, "one Episode"):
+    self.add_reviewed_generation_mapping()
+    acquired = self.acquire()
+    self.assertEqual(1, len(acquired.semantic_bundle["episodes"]))
+    self.assertEqual(
+        1,
+        acquired.semantic_bundle["record_counts"]["selected_episode_n"],
+    )
+
+
+def test_duplicate_physical_sources_for_run_id_fail_gate(self):
+    self.store.write_second_physical_record_for_existing_run_id()
+    with self.assertRaisesRegex(SnapshotInputError, "duplicate physical Episode"):
         self.acquire()
 
 
@@ -1084,6 +1276,16 @@ def test_portable_and_llmwiki_equivalent_fixtures_project_identically(self):
     portable = self.acquire(adapter="portable")
     llmwiki = self.acquire(adapter="llmwiki")
     self.assertEqual(portable.semantic_bundle, llmwiki.semantic_bundle)
+
+
+def test_adapter_provenance_cites_analyzer_artifact(self):
+    acquired = self.acquire()
+    analyzer = acquired.semantic_bundle["policy_set"]["analyzer_artifact"]
+    self.assertEqual(
+        analyzer["sha256"].removeprefix("sha256:"),
+        acquired.adapter["implementation_sha256"],
+    )
+    self.assertNotIn("adapter", acquired.semantic_bundle)
 ```
 
 - [ ] **Step 2: Run the focused tests and verify RED**
@@ -1097,6 +1299,9 @@ caffeinate -i -m python3 -m unittest \
 ```
 
 Expected: `snapshot_input` import or CLI-command failure.
+Then add only the importable acquisition interfaces and CLI parser entry and
+rerun. RED-B must reach the UTC interval, logical-view count, duplicate-source
+gate, and adapter parity assertions before acquisition behavior is implemented.
 
 - [ ] **Step 3: Implement absolute interval and explicit lifecycle `as_of`**
 
@@ -1115,9 +1320,13 @@ until_exclusive`; never select by finish or invalidation timestamp.
 canonical CLI representation has exactly `adapter`, `store_identity`, and
 `semantic_bundle` top-level fields. `adapter` contains selected adapter name
 and fixes `implementation_version` to
-`workflow-observer-snapshot-adapter@1`; it is never copied into semantic
-identity. Equivalent portable and LLMWiki fixtures therefore differ in
-envelope adapter name but not semantic bundle bytes.
+`workflow-observer-snapshot-adapter@1`. It also contains
+`implementation_sha256`, the raw 64-character digest copied from the selected
+policy set's `analyzer_artifact.sha256` after removing its `sha256:` prefix.
+The adapter fields are envelope provenance and are never copied into semantic
+identity; the analyzer artifact identity is already closed independently in
+the semantic policy set. Equivalent portable and LLMWiki fixtures therefore
+differ in envelope adapter name but not semantic bundle bytes.
 
 The nested semantic bundle shape is:
 
@@ -1147,6 +1356,13 @@ Resolve invalidations before analysis selection: any valid tombstone targeting
 a selected Episode is included and applied regardless of the tombstone's own
 timestamp. A tombstone for an unselected Episode does not enter the
 selection-relevant manifest.
+
+One physical Episode record plus a reviewed generation mapping still projects
+to exactly one Episode sample for its `run_id`; the mapping enriches that
+projection and is not another representation in `episodes`. Two physical
+observation records with the same `run_id`, or conflicting canonical
+projections for one `run_id`, are a Data Trust Gate failure rather than a
+deduplication opportunity.
 
 `schema_capabilities` is copied from the hashed projection policy and reports
 the exact v1/v2 supported-field sets. `record_counts` contains non-negative
@@ -1539,11 +1755,46 @@ def test_identical_core_reuses_existing_immutable_artifact(self):
 
 
 def test_authoritative_tamper_cannot_become_acceptance(self):
-    artifact = json.loads(self.publish().path.read_text())
+    artifact = strict_json_loads(self.publish().path.read_bytes())
     artifact["authoritative"] = True
     with self.assertRaises(SnapshotPublicationError):
         validate_learning_artifact(artifact)
+
+
+def test_duplicate_key_rejected_in_snapshot_artifact(self):
+    artifact = self.publish().path.read_bytes()
+    ambiguous = artifact.replace(
+        b'{"artifact_type":',
+        b'{"artifact_type":"learning-snapshot","artifact_type":',
+        1,
+    )
+    with self.assertRaisesRegex(SnapshotPublicationError, "duplicate JSON key"):
+        validate_learning_artifact_bytes(ambiguous)
+
+
+def test_snapshot_rejects_narrative_and_annotation_fields(self):
+    artifact = strict_json_loads(self.publish().path.read_bytes())
+    for field in ("narrative", "annotation", "summary_markdown"):
+        with self.subTest(field=field):
+            tampered = {**artifact, field: "different text"}
+            with self.assertRaises(SnapshotPublicationError):
+                validate_learning_artifact(tampered)
+    self.assertEqual([], list((self.home / "learning/annotations").glob("*")))
+
+
+def test_concurrent_publishers_never_overwrite(self):
+    results = self.publish_from_two_processes_released_by_one_barrier()
+    self.assertEqual([False, True], sorted(result.created for result in results))
+    self.assertEqual(1, len({result.snapshot_id for result in results}))
+    final_path = results[0].path
+    validate_learning_artifact_bytes(final_path.read_bytes())
+    self.assertEqual([], list(final_path.parent.glob(".snapshot-*.tmp")))
 ```
+
+The concurrency fixture launches two independent Python processes against the
+same fake store and snapshots directory, waits until both are ready, then
+releases one barrier. A sequential double call is retained as the idempotence
+test but is not accepted as evidence for the concurrent publisher contract.
 
 - [ ] **Step 2: Run publication tests and verify RED**
 
@@ -1555,6 +1806,9 @@ caffeinate -i -m python3 -m unittest \
 ```
 
 Expected: import failure for `snapshot_store`.
+Then add only the importable publisher interfaces and rerun. RED-B must reach
+stable-read, strict artifact validation, no-narrative, idempotence, and true
+concurrent-publisher assertions before publication behavior is implemented.
 
 - [ ] **Step 3: Build the semantic core, envelope, and identities in memory**
 
@@ -1582,17 +1836,35 @@ null and never infers an identity from an absolute path. Compute `artifact_sha25
 as `hashlib.sha256(canonicalize(artifact_without_artifact_sha256)).hexdigest()`.
 It has no semantic domain separator because it is a byte-integrity digest of
 the already typed complete artifact, not a reusable semantic identifier.
+`validate_learning_artifact_bytes` parses persisted bytes only through Task 1
+`strict_json_loads`, requires the exact artifact keys, and then calls
+`validate_learning_artifact`; unknown narrative or annotation fields, duplicate
+keys, and non-I-JSON input fail before any existing artifact can be reused.
 
 - [ ] **Step 4: Reacquire B and publish only after exact manifest equality**
 
 Call the same `acquire()` with the same selected adapter, query, and policy set.
 Require exact canonical manifest bytes A == B. On mismatch, delete any private
 temporary analysis file and return a normalized state error. After equality,
-write one mode-0600 temporary file inside the mode-0700 snapshots directory,
-fsync it, atomically link/replace only an absent target, fsync the directory,
-and clean the temporary file in every exit path. Never overwrite an existing
-snapshot ID. If an existing artifact is byte-valid and its core matches, return
-it as `created=false`; otherwise fail closed as an identity collision.
+publish with this exact no-clobber sequence:
+
+1. Create one unique mode-0600 temporary file inside the same mode-0700
+   snapshots directory.
+2. Write the complete canonical artifact bytes and `fsync` its open descriptor.
+3. Call `os.link(temp, target)` without a preceding existence check.
+4. On success, this publisher alone returns `created=true`. On `EEXIST`, never
+   overwrite: securely read the existing target through
+   `validate_learning_artifact_bytes`.
+5. If the existing artifact has the same `snapshot_id` and byte-identical
+   canonical core, return that existing artifact as `created=false`; otherwise
+   fail closed as an identity collision.
+6. `fsync` the snapshots directory after successful publication, unlink the
+   private temporary file in every exit path, and never call `os.replace()` for
+   the final target.
+
+The temporary file and target must be on the same filesystem. If hard-link
+no-clobber publication or equivalent guarantees are unavailable, fail closed;
+do not degrade to check-then-replace or direct target writes.
 
 - [ ] **Step 5: Add the bounded `snapshot` CLI operation**
 
@@ -1794,16 +2066,21 @@ begins.
 | `test_05_v1_absence_is_not_zero_or_v2_missing` | Mix four v1, two v2-null, and two v2-observed values; assert the exact 4/2/2/0 missingness partition. |
 | `test_06_lifecycle_records_do_not_enter_outcome_denominator` | Mix four outcomes, drafts, superseded, and invalidated records; assert outcome `n=4` and separate overlapping lifecycle counts. |
 | `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. |
-| `test_08_derived_view_does_not_duplicate_episode` | Present an original and derived view with one `run_id`; assert gate rejection or one projected sample according to the reviewed mapping fixture, never two. |
+| `test_08_reviewed_mapping_derived_view_counts_once` | Present one physical Episode plus its reviewed workflow-generation mapping; assert exactly one canonical projected Episode for that `run_id`. |
 | `test_09_gate_failure_produces_no_snapshot_or_proposal` | Break a task reference; assert no snapshot directory member and no proposal artifact anywhere in the fake home. |
 | `test_10_authoritative_tamper_is_not_acceptance` | Change learning artifact `authoritative` to true; assert schema rejection even after recomputing a generic file digest. |
-| `test_11_narrative_is_outside_semantic_identity` | Attach two different annotation strings outside the core; assert core bytes/ID unchanged and annotation bytes absent from the core. |
+| `test_11_snapshot_rejects_narrative_and_annotation_fields` | Add each of `narrative`, `annotation`, and `summary_markdown` to an otherwise valid artifact; assert validation failure and no annotation artifact or directory member. |
 | `test_12_no_approval_causes_no_external_mutation` | Snapshot a fake Git subject and workflow file before/after learning; assert byte equality and mock `subprocess.run` rejects `git branch`, `gh pr`, or workflow-edit calls. |
 | `test_13_lifecycle_as_of_is_frozen_in_identity` | Rebuild at later wall clock with same bound `as_of`; assert same ID, then change explicit `as_of` and assert a different ID. |
 | `test_14_shared_jcs_vector_and_lone_surrogate` | Use emoji, non-ASCII keys, control characters, quote, and backslash vector; assert fixed bytes/hash and lone-surrogate failure. |
 | `test_15_policy_hash_and_effective_boundary_are_closed` | Change one policy byte and assert identity/core change; assert a `started_at` declaration applies only on/after its instant and all invalid union shapes fail. |
 
 Test 12 never points at the source checkout as a mutation target.
+Test 08 does not create a second physical source record; the Task 6 focused
+conflict test separately proves that duplicate physical sources for one
+`run_id` fail the gate. v0.2 publishes no annotation artifact. A later approved
+annotation schema must define its own artifact identity, cite `snapshot_id`,
+and may not reuse `snapshot_id` as the annotation's artifact identity.
 
 - [ ] **Step 2: Run only the acceptance class and verify any missing coverage is RED**
 
@@ -1837,6 +2114,10 @@ file's final bytes. Update
 `LLMWIKI_SOURCE_ROOT` byte-equality skip. Adapter conformance fixtures now prove
 the supported v1 contract against LLMWiki semantics. Do not modify the
 historical evidence copy or top-level release inventory.
+Load `core_source.json` through Task 1 `strict_json_loads` in the parity test
+and add a duplicate-key fixture that fails before hash comparison. Any later
+production reader of this or another persisted code/source manifest must use
+the same strict ingress rather than ordinary `json.loads()`.
 
 - [ ] **Step 5: Run a fake-root bounded baseline twice**
 
@@ -1855,27 +2136,34 @@ Run:
 git diff --name-only origin/main...HEAD | \
   npx --yes @colbymchenry/codegraph@1.5.0 affected --stdin
 caffeinate -i -m uv python install 3.11 3.12 3.13 3.14
-caffeinate -i -m uv run --no-project --python 3.11 python -m unittest \
-  plugins/workflow-observer/tests/test_canonical_json.py -v
-caffeinate -i -m uv run --no-project --python 3.12 python -m unittest \
-  plugins/workflow-observer/tests/test_canonical_json.py -v
-caffeinate -i -m uv run --no-project --python 3.13 python -m unittest \
-  plugins/workflow-observer/tests/test_canonical_json.py -v
-caffeinate -i -m uv run --no-project --python 3.14 python -m unittest \
-  plugins/workflow-observer/tests/test_canonical_json.py -v
-caffeinate -i -m python3 -m unittest \
-  plugins/workflow-observer/tests/test_workflow_evolution_acceptance.py -v
+for py in 3.11 3.12 3.13 3.14; do
+  caffeinate -i -m uv run --no-project --python "$py" \
+    python -m unittest \
+      plugins/workflow-observer/tests/test_canonical_json.py \
+      plugins/workflow-observer/tests/test_workflow_evolution_acceptance.py -v
+done
 caffeinate -i -m python3 -m unittest discover \
   -s plugins/workflow-observer/tests -p 'test_*.py'
-caffeinate -i -m python3 -m unittest discover \
-  -s evidence/tests -p 'test_*.py'
+: "${WORKFLOW_OBSERVATORY_EVAL_ARCHIVE:?set an absolute trusted archive path}"
+: "${WORKFLOW_OBSERVATORY_EVAL_ARCHIVE_SHA256:?set its independently trusted SHA-256}"
+(
+  cd evidence
+  caffeinate -i -m python3 -m unittest discover -s tests -p 'test_*.py'
+)
 git diff --check origin/main...HEAD
 ```
 
+The loop is the support claim: both JCS conformance and the complete 15-case
+v0.2 acceptance class run on every listed CPython. Full plugin and evidence
+regression discovery runs once on the primary `python3` runtime. Evidence tests
+that execute archived evaluator code require the two pre-set environment
+variables above; obtain the digest from an independent trusted release
+descriptor or channel, never by trusting the archive's own inventory or by
+computing both sides inside this gate.
+
 Expected:
 
-- all fifteen acceptance tests pass;
-- the shared JCS vector produces the fixed bytes/hash under CPython
+- the shared JCS vector and all fifteen acceptance cases pass under CPython
   3.11–3.14;
 - all plugin tests pass with only explicitly documented optional skips;
 - all evidence/repository non-model tests pass;

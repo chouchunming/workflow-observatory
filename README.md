@@ -21,9 +21,10 @@ automatically.
 
 ## Workflow Evolution Foundation v0.2
 
-The v0.2 foundation design and implementation plan were approved on
-2026-08-02. Implementation has not started, and these capabilities are not part
-of the current released plugin.
+The v0.2 foundation design is approved. Its implementation plan was revised on
+2026-08-02 after external review and is awaiting external re-approval.
+Implementation has not started, and these capabilities are not part of the
+current released plugin.
 
 The bounded milestone will extend the existing observation layer through this
 evidence path:
@@ -49,7 +50,10 @@ data baseline will run without separate approval.
 
 Review the approved
 [design](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
-and [implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+and revised
+[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+These links intentionally follow the review branch; pin them to the immutable
+external-approval commit before Task 1 begins.
 
 ## Install from GitHub
 

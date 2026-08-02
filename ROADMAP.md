@@ -28,8 +28,9 @@ are documented in
 
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
-Status: design and implementation plan approved on 2026-08-02; implementation
-has not started and is not included in the current release.
+Status: design approved; implementation plan revised after external review and
+awaiting external re-approval as of 2026-08-02. Implementation has not started
+and is not included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -78,7 +79,10 @@ data baseline is a separate approval gate after the fake-store acceptance suite.
 
 See the approved
 [v0.2 design](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md)
-and [implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+and revised
+[implementation plan](https://github.com/chouchunming/workflow-observatory/blob/design/workflow-evolution-foundation-v0.2/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
+These links intentionally follow the review branch and must be pinned to the
+immutable external-approval commit before Task 1 starts.
 
 ## Next — concurrency and operability
 
@@ -97,8 +101,11 @@ and [implementation plan](https://github.com/chouchunming/workflow-observatory/b
 
 ## Later — learning and ecosystem expansion
 
-- Add reviewed telemetry-to-learning summaries once at least five comparable
-  finalized records exist; keep observation facts separate from quality scores.
+- Add reviewed human-readable narrative and annotation artifacts over Learning
+  Snapshots only after their independent identity and provenance contract is
+  approved.
+- Add post-hoc evaluator inputs only after evaluator identity, `run_id` join,
+  duplicate/conflict, and metric-denominator rules are designed.
 - Add approval-gated improvement experiments with explicit hypotheses,
   rollback criteria, and before/after evidence.
 - Evaluate W3C Trace Context-compatible opaque parent identifiers for
