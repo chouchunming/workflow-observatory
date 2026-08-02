@@ -259,6 +259,33 @@ class AdapterConformanceTests(unittest.TestCase):
         self.assertEqual([run_id], [row["run_id"] for row in records])
         self.assertEqual(set(), invalidated)
 
+    def test_portable_observation_can_be_invalidated_after_reader_refactor(self):
+        from wiki_observations import ObservationPaths, invalidate_observation
+
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "portable", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        portable_root = self.homes["portable"] / "store"
+
+        invalidate_observation(
+            ObservationPaths.from_root(portable_root),
+            run_id,
+            "duplicate observation",
+        )
+
+        tombstone = portable_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        self.assertTrue(tombstone.is_file())
+        validation = self.run_cli("portable", "validate")
+        self.assertEqual(
+            (0, "valid records=1 invalidated=1\n", ""),
+            (validation.returncode, validation.stdout, validation.stderr),
+        )
+
     def test_llmwiki_obsolete_task_layout_fails_closed(self):
         portable_root = self.homes["portable"] / "store"
         portable_task = portable_root / "wiki/tasks/example.md"

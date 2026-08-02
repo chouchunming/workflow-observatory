@@ -1959,6 +1959,7 @@ def invalidate_observation(
     run_id: str,
     reason: str,
     now: datetime | None = None,
+    semantics: AdapterSemantics = PORTABLE_SEMANTICS,
 ) -> None:
     """Atomically create an immutable tombstone without editing the final record."""
 
@@ -1975,7 +1976,7 @@ def invalidate_observation(
         run_lock.verify()
         observations_fd = _open_observation_directory(secure_paths.observations)
         metadata, _, record_stream = _read_record_from_directory(
-            secure_paths, run_id, observations_fd
+            secure_paths, run_id, observations_fd, semantics
         )
         if metadata.get("status") == "draft":
             raise ObservationError("state", f"{run_id} is still draft")
