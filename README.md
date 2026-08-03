@@ -9,10 +9,10 @@ skills:
 
 - `workflow-observer`: automatic eligibility and parent-lifecycle router.
 - `workflow-telemetry`: schemas, privacy limits, secure payloads, and adapters.
-- `workflow-learning`: descriptive analysis after at least five comparable
-  finalized records.
-- `workflow-improving`: evidence-linked proposals and experiments that require
-  explicit user approval before mutation.
+- `workflow-learning`: bounded, reproducible Learning Snapshots over validated
+  local evidence.
+- `workflow-improving`: inspection of one user-selected snapshot/candidate
+  pair, stopping before proposal design or mutation.
 
 Observation data stays local by default under
 `~/.codex/workflow-observatory/`. The plugin never records full prompts,
@@ -23,11 +23,10 @@ automatically.
 
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 6 are complete on the
-design branch, including the externally reviewed Task 4 readback, Task 5
-adapter-report/invalidation-evidence corrections, and Task 6 canonical
-`snapshot-input` acquisition with its single-view trust-boundary corrections.
-These capabilities are not part of the current released plugin.
+Implementation started on 2026-08-02; Tasks 1 through 10 are complete on the
+design branch. The remaining Task 11 acceptance matrix and bounded fake-store
+historical dry run are not complete. These capabilities are not part of the
+current released plugin.
 
 The bounded milestone will extend the existing observation layer through this
 evidence path:
@@ -45,6 +44,28 @@ analysis from lifecycle health. It also defines stable-read checks, explicit
 workflow generations, versioned analysis policies, per-metric missingness, and
 Episode-level Decision Event support. Its 11 reviewable implementation tasks
 end in a 15-case non-model acceptance matrix against isolated fake stores.
+
+`snapshot-input` is the adapter-neutral, canonical machine-readable acquisition
+boundary. `snapshot` reruns that acquisition for a stable-read check, performs
+deterministic analysis, and publishes one immutable Learning Snapshot beneath
+`$WORKFLOW_OBSERVATORY_HOME/learning/snapshots/<snapshot_id>.json` (by default,
+`~/.codex/workflow-observatory/learning/snapshots/<snapshot_id>.json`). Human
+`report` output is not learning input.
+
+Schema-v1 observations remain unchanged and readable. Episode v2 is optional
+and may be selected only with sanitized structured measurements and an
+applicable explicit workflow generation; unavailable token or cost data is
+never fabricated or converted to zero. Every result-affecting policy and
+registry, plus the canonicalizer and analyzer code identities, is closed into
+the snapshot identity. Candidate rows are deterministic, unranked,
+non-authoritative observational evidence—not causal findings or permission to
+change a workflow.
+
+All v0.2 learning and publication tests use temporary fake portable or fake LLM
+Wiki roots. They do not analyze the user's live store. The source archive
+inventory includes the immutable policy JSON files, JCS conformance fixture,
+and the exact approved v0.2 design and implementation plan as current
+marketplace documentation; it does not relabel them as historical `evidence/`.
 
 `episode-projection@2` fixes `runtime_provenance` to JSON null. v0.2 neither
 infers runtime identities nor emits runtime-heterogeneity exclusions or

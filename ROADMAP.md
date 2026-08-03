@@ -29,11 +29,10 @@ are documented in
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
 Status: design and implementation plan approved as of 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 6 are complete on the
-design branch, including the externally reviewed Task 4 readback, Task 5
-adapter-report/invalidation-evidence corrections, and Task 6 canonical
-`snapshot-input` acquisition with its single-view trust-boundary corrections.
-These changes are not included in the current release.
+Implementation started on 2026-08-02; Tasks 1 through 10 are complete on the
+design branch. Task 11's 15-case non-model acceptance matrix, bounded fake-store
+historical dry run, and supported-interpreter execution remain pending. These
+changes are not included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -68,12 +67,21 @@ Implementation is divided into 11 independently reviewable TDD units:
 11. Pass the 15-case non-model acceptance matrix across isolated fake stores
     and the supported CPython 3.11–3.14 matrix.
 
+The completed Task 10 contract routes learning through canonical
+`snapshot-input` and immutable `snapshot` publication under
+`$WORKFLOW_OBSERVATORY_HOME/learning/snapshots/`. Schema v1 remains readable;
+Episode v2 remains an explicit opt-in for attributable sanitized measurements
+and an applicable workflow generation. All result-affecting policies and code
+identities are closed into the snapshot, and source tests use only fake roots.
+Candidate evidence remains observational, unranked, and non-authoritative.
+
 The following remain outside this milestone and require later approved designs:
 
 - Evolution Proposal schema and experiment lifecycle;
 - execution of approval gates, workflow changes, branches, or pull requests;
-- post-hoc evaluation artifacts and immutable health-event streams;
+- post-hoc evaluation artifacts and immutable health-event history/streams;
 - background scheduling, network transport, and automatic live-data analysis;
+- formal acceptance execution, including the Task 11 interpreter matrix;
 - causal or cross-runtime claims without an explicit comparability policy.
 
 Any future Evolution Proposal must reference `snapshot_id + candidate_id` so

@@ -51,6 +51,29 @@ credentials, secrets, unnecessary personal data, and subject absolute paths.
 The start command needs `--subject-root` only to derive local provenance; never
 copy it into a record scalar or payload. Do not reuse raw user text.
 
+## Opt into Episode v2 only with real measurements
+
+Schema v1 remains the default. Use the optional private v2 supplement only
+when sanitized structured measurements and an applicable explicit workflow generation
+are both available for this run. Do not infer a generation
+from the workflow variant, Git revision, agent surface, or command context.
+Otherwise keep schema v1 and omit every v2 option.
+
+For an eligible v2 run, append
+`--episode-schema-version 2 --workflow-generation <generation>` to `start`.
+At finish, place the exact v2 JSON supplement in a separate unique mode-0600
+regular file and append `--episode-from-file <unique-episode-path>`. Apply the
+same private-file construction, scalar, privacy, and `finally` cleanup rules as
+the lifecycle payloads. Let the CLI validate the closed supplement schema; do
+not edit the stored Episode directly.
+
+Never fabricate token or cost measurements, estimate them from unrelated
+values, or convert absence to zero. Use only attributable tool-derived or
+agent-reported values accepted by the v2 schema; when those execution values
+are unavailable, keep them null with the schema's `unavailable` measurement
+source. A v2 Episode records evidence only. It does not authorize a workflow
+edit, branch or pull request, experiment, proposal, or learning run.
+
 Choose exactly one legal task/variant pair:
 
 - `feature`, `bugfix`, `refactor`, or `documentation`: `implementation-basic`
@@ -156,7 +179,7 @@ Follow-up must name an actual next action or task reference and cannot be
 Finish each run at most once:
 
 ```text
-python3 <resolved-cli-path> finish <run-id> --status <status> --from-file <unique-path>
+python3 <resolved-cli-path> finish <run-id> --status <status> --from-file <unique-path> [--episode-from-file <unique-episode-path>]
 ```
 
 The same platform-specific prefix chosen before the start must be used for the

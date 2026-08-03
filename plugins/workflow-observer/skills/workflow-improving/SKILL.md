@@ -1,60 +1,48 @@
 ---
 name: workflow-improving
-description: Use only when a user explicitly asks for an improvement proposal based on cited Workflow Observatory learning output.
+description: Use only when a user explicitly asks to inspect one selected Workflow Observatory learning candidate.
 ---
 
 # Workflow Improving
 
-Turn an evidence-linked learning result into a proposal for user consideration.
-This skill is explicit-request only. It does not run for each task and does not
-collect, reinterpret, or modify observation records.
+Inspect one user-selected candidate from one immutable Learning Snapshot. This
+skill is explicit-request only. It does not run for each task, perform a new
+analysis, or modify observation records.
 
-## Check the evidence boundary
+## Require one exact evidence pair
 
-1. Consume cited workflow-learning output supplied or identified by the user.
-   Do not substitute uncited memory, raw record access, or a new analysis.
-2. Confirm the learning output cites its observation groups and separates
-   observed counts from inference. If it does not, stop and request a valid
-   workflow-learning result.
-3. For every motivating group, cite observation group keys exactly: project,
-   workspace, workspace ID, task type, and workflow variant. Also cite its
-   comparable final record count and time window.
-4. Preserve the learning output's missing-data notes and uncertainty. A small
-   sample may motivate further measurement, but it is not evidence of a trend.
+Require the user to select both identifiers in this exact form:
 
-## Propose one bounded option
-
-Propose exactly one bounded change or experiment. Do not provide a menu of
-changes and do not bundle independent interventions. Use this form:
-
-```markdown
-## Evidence
-- Exact group key(s): ...
-- Comparable final record count(s): ...
-- Time window(s): ...
-- Observed counts: ...
-- Inference and uncertainty: ...
-
-## One proposed change or experiment
-- Change: one reversible, narrowly scoped intervention
-- Scope: affected workflow and excluded work
-- Measurement: baseline, metric, comparison window, and decision threshold
-- Rollback: exact condition and steps that restore the prior state
-- Uncertainty: plausible alternatives and limits of the evidence
-
-## Approval gate
-- No action has been taken. Explicit user approval is required to proceed.
+```text
+snapshot_id= followed by exactly 64 lowercase hexadecimal characters
+candidate_id= followed by exactly 64 lowercase hexadecimal characters
 ```
 
-Do not claim causality from observational evidence. Do not declare a winner or
-represent the proposal as proven. The measurement must compare like-for-like
-groups and the rollback must be practical before the experiment begins.
+Reject missing, uppercase, shortened, prefixed, or additional identifier
+values. Do not choose either identifier for the user and do not substitute a
+candidate from memory or a different snapshot.
 
-## Stop before action
+## Verify membership
 
-Stop after presenting the proposal. Require explicit user approval before any
-edit, run, experiment, or publish action, including editing a skill, changing a
-workflow, starting the proposed experiment, or publishing observation data.
-Before any edit, run, experiment, or publish action, obtain fresh explicit user approval for that specific action.
-Never apply the proposal on your own. Approval for analysis is not approval for
-mutation, execution, or publication.
+Use the sanitized Learning Snapshot returned by `workflow-learning`, or its
+immutable local artifact, and verify all of the following before responding:
+
+- the artifact's exact `snapshot_id` equals the selected `snapshot_id`;
+- one and only one entry in `core.candidates` has the selected `candidate_id`;
+- the candidate exists in that exact Learning Snapshot and its evidence,
+  denominator, missingness, policy, and cohort fields are preserved unchanged.
+
+Do not parse raw observation records, rerun learning, rank candidates, or join
+other evidence. If validation or membership fails, report the mismatch and
+stop.
+
+## Return evidence and stop
+
+Return the selected pair and the candidate's exact observational evidence with
+its uncertainty and policy boundary. State clearly: this inspection does not create an Evolution Proposal;
+proposal design and creation remain deferred.
+
+Do not claim causality. Do not declare a winner. Stop after the evidence inspection.
+Do not edit a workflow or skill. Do not create a branch or pull request or start an experiment.
+Do not publish data or apply any candidate. A v0.2 candidate grants no
+mutation, execution, proposal, experiment, or publication authority.

@@ -140,6 +140,14 @@ class SkillContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, text)
 
+    def test_telemetry_scopes_optional_episode_v2_measurements(self):
+        text = telemetry_skill()
+        self.assertIn("optional private v2 supplement", text)
+        self.assertIn("sanitized structured measurements", text)
+        self.assertIn("applicable explicit workflow generation", text)
+        self.assertIn("Never fabricate token or cost measurements", text)
+        self.assertIn("schema v1", text)
+
     def test_telemetry_classifies_durable_research_by_task_intent(self):
         text = " ".join(telemetry_skill().split())
         self.assertIn(

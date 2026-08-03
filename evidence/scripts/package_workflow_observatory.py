@@ -40,7 +40,10 @@ _USER_HOME_PATTERN = re.compile(
     rb"/" + rb"Users/" + rb"[^/\s`\"']+"
 )
 _SYNTHETIC_USER_PATHS = (
+    b"/" + b"Users/" + b"alice/repo",
     b"/" + b"Users/" + b"alice/private/repo",
+    b"/" + b"Users/" + b"alice/private-project",
+    b"/" + b"Users/" + b"alice/private/story",
     b"/" + b"Users/" + b"alice/private.txt",
 )
 PATH_NORMALIZATION_DECLARATIONS = {
@@ -113,6 +116,8 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
         "docs/parallel-evaluation-mvp-implementation-plan.md",
         "docs/parallel-evaluation-plan.md",
         "docs/release-acceptance.md",
+        "docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md",
+        "docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md",
         "plugins/workflow-observer/.codex-plugin/plugin.json",
         "plugins/workflow-observer/README.md",
     }:
@@ -126,8 +131,13 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
     if nested.startswith("skills/"):
         parts = PurePosixPath(nested).parts
         return len(parts) == 3 and parts[-1] == "SKILL.md"
+    if nested.startswith("policies/"):
+        policy = PurePosixPath(nested)
+        return len(policy.parts) == 2 and policy.suffix == ".json"
     if nested.startswith("tests/skill_evals/"):
         return nested.endswith(".json")
+    if nested == "tests/fixtures/jcs_conformance_vectors.json":
+        return True
     if nested.startswith("tests/"):
         return nested.endswith(".py")
     if nested.startswith("docs/"):

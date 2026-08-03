@@ -52,6 +52,7 @@ IMPROVING_CONTRADICTIONS = (
     r"(?im)^\s*recommend\s+(?:a\s+)?winning workflow\b",
     r"(?im)^\s*apply\s+(?:(?:a|the)\s+)?(?:change|proposal)\b",
     r"(?im)^\s*(?:edit|run|start|publish)\b.*\bwithout fresh explicit user approval\b",
+    r"(?im)^\s*(?:create|design|write)\s+(?:an?\s+)?Evolution Proposal\b",
 )
 
 
@@ -79,8 +80,8 @@ class LearningImprovingContractTests(unittest.TestCase):
         )
         self.assertEqual("workflow-improving", improving.get("name"))
         self.assertEqual(
-            "Use only when a user explicitly asks for an improvement proposal "
-            "based on cited Workflow Observatory learning output.",
+            "Use only when a user explicitly asks to inspect one selected "
+            "Workflow Observatory learning candidate.",
             improving.get("description"),
         )
 
@@ -90,69 +91,30 @@ class LearningImprovingContractTests(unittest.TestCase):
                 self.assertNotIn("about to perform", description.lower())
                 self.assertNotIn("automatically", description.lower())
 
-    def test_learning_is_read_only_validate_then_report(self):
+    def test_learning_uses_the_canonical_snapshot_contract(self):
         text = learning_skill()
         self.assertIn("on-demand, read-only", text)
-        self.assertIn("Run `validate` first", text)
-        self.assertIn("run only `report`", text)
+        self.assertIn("snapshot-input", text)
+        self.assertIn("Learning Snapshot", text)
+        self.assertNotIn("Run `validate` first", text)
+        self.assertNotIn("run only `report`", text)
+        self.assertIn("run only `snapshot`", text)
         self.assertIn("Do not start, finish, invalidate, edit, or publish", text)
 
-    def test_learning_uses_only_final_non_invalidated_records(self):
+    def test_learning_requires_an_explicit_bounded_interval_and_timezone(self):
         text = learning_skill()
-        self.assertIn("final, non-invalidated records", text)
-        self.assertIn("Exclude drafts", text)
-        self.assertIn("Exclude invalidated records", text)
-        self.assertIn("final sample", text)
-        self.assertIn(
-            "The only permitted statuses are `success`, `partial`, `failed`, "
-            "`rolled-back`, and `superseded`.",
-            text,
-        )
-        self.assertIn(
-            "Exclude drafts from every observed count, status count, sample, "
-            "comparison, rate, trend, and inference.",
-            text,
-        )
-        self.assertIn("Ignore every report draft count and draft summary", text)
-        self.assertIn(
-            "Exclude invalidated records from every observed count, status count, "
-            "sample, comparison, rate, trend, and inference.",
-            text,
-        )
+        self.assertIn("explicit `--since`, `--until`, and `--timezone`", text)
+        self.assertIn("ask the user", text)
+        self.assertIn("bounded", text)
 
-    def test_learning_groups_on_all_exact_comparability_keys(self):
+    def test_learning_reads_only_the_sanitized_snapshot_artifact(self):
         text = learning_skill()
-        for key in (
-            "project",
-            "workspace",
-            "workspace ID",
-            "task type",
-            "workflow variant",
-        ):
-            with self.subTest(key=key):
-                self.assertIn(key, text)
-        self.assertIn("exact five-part group key", text)
-        self.assertIn("Do not merge", text)
-
-    def test_learning_splits_report_workspace_labels_and_bounds_time(self):
-        text = learning_skill()
-        self.assertIn("more than one workspace label", text)
-        self.assertIn("rerun `report --workspace", text)
-        self.assertIn("bounded `--since` and `--until`", text)
-        self.assertIn("reproducible time window", text)
-
-    def test_learning_requires_five_records_and_labels_smaller_groups(self):
-        text = learning_skill()
-        self.assertIn("at least 5 comparable final records", text)
-        self.assertIn("small sample", text)
-        self.assertIn("Do not present a trend", text)
-
-    def test_learning_separates_counts_from_inference_and_avoids_causality(self):
-        text = learning_skill()
-        self.assertIn("Observed counts", text)
-        self.assertIn("Inference", text)
-        self.assertIn("Final-status counts", text)
-        self.assertIn("Final-record metric counts", text)
+        self.assertIn("sanitized artifact", text)
+        self.assertIn("snapshot_id", text)
+        self.assertIn("unranked", text)
+        self.assertIn("observational", text)
+        self.assertIn("Do not parse observation records", text)
+        self.assertIn("Do not run or parse human `report`", text)
         self.assertIn("Do not claim causality", text)
         self.assertIn("Do not name a winning workflow", text)
 
@@ -178,32 +140,27 @@ class LearningImprovingContractTests(unittest.TestCase):
                         LEARNING_CONTRADICTIONS,
                     )
 
-    def test_improving_requires_cited_learning_evidence(self):
+    def test_improving_requires_one_user_selected_snapshot_candidate_pair(self):
         text = improving_skill()
-        self.assertIn("Consume cited workflow-learning output", text)
-        self.assertIn("cite observation group keys", text)
-        self.assertIn("record count", text)
-        self.assertIn("time window", text)
-        self.assertIn("uncertainty", text)
+        self.assertIn("snapshot_id", text)
+        self.assertIn("candidate_id", text)
+        self.assertIn("both", text)
+        self.assertIn("exactly 64 lowercase hexadecimal characters", text)
+        self.assertIn("exists in that exact Learning Snapshot", text)
 
-    def test_improving_proposes_exactly_one_bounded_experiment(self):
+    def test_improving_stops_before_proposal_design_or_creation(self):
         text = improving_skill()
-        self.assertIn("exactly one bounded change or experiment", text)
-        self.assertIn("Measurement", text)
-        self.assertIn("Rollback", text)
+        self.assertIn("does not create an Evolution Proposal", text)
+        self.assertIn("proposal design and creation remain deferred", text)
         self.assertIn("Do not claim causality", text)
         self.assertIn("Do not declare a winner", text)
 
     def test_improving_stops_before_any_mutation(self):
         text = improving_skill()
-        self.assertIn("explicit user approval", text)
-        self.assertIn("Stop after presenting the proposal", text)
-        self.assertIn("edit, run, experiment, or publish", text)
-        self.assertIn(
-            "Before any edit, run, experiment, or publish action, obtain fresh "
-            "explicit user approval for that specific action.",
-            text,
-        )
+        self.assertIn("Stop after", text)
+        self.assertIn("edit a workflow", text)
+        self.assertIn("create a branch or pull request", text)
+        self.assertIn("start an experiment", text)
         self.assertNotIn("automatically apply", text.lower())
 
     def test_whole_improving_document_rejects_reviewer_counterexamples(self):
@@ -216,6 +173,7 @@ class LearningImprovingContractTests(unittest.TestCase):
             "Declare a winner from these groups.",
             "Recommend a winning workflow.",
             "Apply the proposal now.",
+            "Create an Evolution Proposal.",
             "Edit the skill without fresh explicit user approval.",
             "Run the experiment without fresh explicit user approval.",
             "Start the experiment without fresh explicit user approval.",

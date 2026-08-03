@@ -13,23 +13,13 @@ import zipfile
 
 
 _TEST_PATH = Path(__file__).resolve()
-_SOURCE_REPOSITORY = _TEST_PATH.parents[5]
-_SOURCE_MARKETPLACE = _SOURCE_REPOSITORY / "marketplace/workflow-observatory"
-if _SOURCE_MARKETPLACE.is_dir():
-    REPOSITORY_ROOT = _SOURCE_REPOSITORY
-    MARKETPLACE_ROOT = _SOURCE_MARKETPLACE
+_LAYOUT_ROOT = _TEST_PATH.parents[3]
+if (_LAYOUT_ROOT / ".agents/plugins/marketplace.json").is_file():
+    MARKETPLACE_ROOT = _LAYOUT_ROOT
+    REPOSITORY_ROOT = _LAYOUT_ROOT / "evidence"
 else:
-    _LAYOUT_ROOT = _TEST_PATH.parents[3]
-    _LAYOUT_REPOSITORY = _LAYOUT_ROOT / "evidence"
-    _LAYOUT_MARKETPLACE = (
-        _LAYOUT_REPOSITORY / "marketplace/workflow-observatory"
-    )
-    if _LAYOUT_MARKETPLACE.is_dir():
-        REPOSITORY_ROOT = _LAYOUT_REPOSITORY
-        MARKETPLACE_ROOT = _LAYOUT_MARKETPLACE
-    else:
-        MARKETPLACE_ROOT = _LAYOUT_ROOT
-        REPOSITORY_ROOT = MARKETPLACE_ROOT / "evidence"
+    REPOSITORY_ROOT = _LAYOUT_ROOT / "evidence"
+    MARKETPLACE_ROOT = REPOSITORY_ROOT / "marketplace/workflow-observatory"
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 from package_workflow_observatory import (
@@ -49,7 +39,9 @@ class ArchiveTests(unittest.TestCase):
         shutil.copytree(
             MARKETPLACE_ROOT,
             self.source,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            ignore=shutil.ignore_patterns(
+                ".git", ".codegraph", ".superpowers", "__pycache__", "*.pyc"
+            ),
         )
         self.archive = self.root / "workflow-observatory-0.1.0.zip"
         self.evidence = (
@@ -169,6 +161,44 @@ class ArchiveTests(unittest.TestCase):
             expected_normalizations,
             row["normalizations"],
         )
+
+    def test_source_archive_inventory_closes_v02_policies_and_approved_docs(self):
+        build_archive(self.source, self.archive, self.evidence)
+        inventory = self._inventory()["marketplace_files"]
+        expected_policies = {
+            path.relative_to(MARKETPLACE_ROOT).as_posix()
+            for path in (
+                MARKETPLACE_ROOT / "plugins/workflow-observer/policies"
+            ).glob("*.json")
+        }
+        self.assertTrue(expected_policies)
+        self.assertLessEqual(expected_policies, set(inventory))
+        self.assertIn(
+            "plugins/workflow-observer/tests/fixtures/"
+            "jcs_conformance_vectors.json",
+            inventory,
+        )
+        for approved_document in (
+            "docs/superpowers/specs/"
+            "2026-08-02-workflow-evolution-foundation-v0.2-design.md",
+            "docs/superpowers/plans/"
+            "2026-08-02-workflow-evolution-foundation-v0.2.md",
+        ):
+            with self.subTest(approved_document=approved_document):
+                self.assertIn(approved_document, inventory)
+
+    def test_policy_allowlist_rejects_non_json_and_nested_files(self):
+        policies = self.source / "plugins/workflow-observer/policies"
+        for relative in ("notes.md", "nested/unapproved.json"):
+            with self.subTest(relative=relative):
+                unexpected = policies / relative
+                unexpected.parent.mkdir(parents=True, exist_ok=True)
+                unexpected.write_text("{}\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    PackageError, "unexpected marketplace file"
+                ):
+                    build_archive(self.source, self.archive, self.evidence)
+                unexpected.unlink()
 
     def test_parallel_worker_sources_are_captured_reproducibly(self):
         second = self.root / "parallel-worker-second.zip"
