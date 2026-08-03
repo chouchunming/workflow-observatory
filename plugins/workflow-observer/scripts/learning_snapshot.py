@@ -14,6 +14,7 @@ from snapshot_input import SnapshotInput
 
 _ANALYZER_VERSION = "workflow-learning-analyzer@0.2.0"
 _INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
+_CANDIDATE_DOMAIN = b"workflow-observatory:learning-candidate:v1\0"
 _MAX_SAFE_INTEGER = (2**53) - 1
 _LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _POLICY_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -64,6 +65,31 @@ _BUNDLE_KEYS = {
     "input_manifest_sha256",
 }
 _VERIFICATION_CATEGORIES = ("fail", "not-run", "pass", "unknown")
+_COHORT_IDENTITY_FIELDS = (
+    "collection",
+    "legacy_collection_id",
+    "project",
+    "workspace",
+    "workspace_id",
+    "task_type",
+    "workflow_variant",
+    "workflow_generation",
+)
+_CANDIDATE_EVIDENCE_FIELDS = (
+    "counts",
+    "missingness",
+    "observed_values",
+    "category_counts",
+    "quantiles",
+    "pattern",
+)
+_DECISION_EVENT_FIELDS = (
+    "phase",
+    "actor_role",
+    "decision_type",
+    "reason_code",
+    "result",
+)
 
 
 class LearningSnapshotError(ValueError):
@@ -193,6 +219,18 @@ def linear_rational_quantile(
     return _fraction_decimal(result)
 
 
+def candidate_id(candidate_evidence: Mapping) -> str:
+    """Return the stable v0.2 identity for exact candidate evidence."""
+
+    if not isinstance(candidate_evidence, Mapping):
+        raise LearningSnapshotError("candidate evidence must be an object")
+    try:
+        return hash_canonical(_CANDIDATE_DOMAIN, candidate_evidence)
+    except CanonicalizationError as error:
+        raise _error(f"candidate evidence is not canonicalizable: {error}", error) \
+            from error
+
+
 def _validate_policy_set(policy_set: PolicySet) -> tuple[dict, dict]:
     if not isinstance(policy_set, PolicySet):
         raise LearningSnapshotError("policy_set must be an immutable PolicySet")
@@ -248,6 +286,21 @@ def _validate_policy_set(policy_set: PolicySet) -> tuple[dict, dict]:
             )
     if documents["quantile_policy"]["quantiles"] != ["0.25", "0.50", "0.75"]:
         raise LearningSnapshotError("quantile policy is not the approved quartile set")
+    decision = documents["decision_support_policy"]
+    if decision["pattern_kinds"] != [
+        "single-event", "contiguous-adjacent-pair"
+    ]:
+        raise LearningSnapshotError("decision pattern kinds are not the approved set")
+    if decision["event_key_fields"] != list(_DECISION_EVENT_FIELDS):
+        raise LearningSnapshotError("decision event key fields are not the approved set")
+    candidate_policy = documents["candidate_emission_policy"]
+    if (
+        len(candidate_policy["rules"]) != 18
+        or candidate_policy["candidate_order"]
+            != "candidate-id-ascending-byte-order"
+        or candidate_policy["candidate_ranking"] != "none"
+    ):
+        raise LearningSnapshotError("candidate emission policy is not the approved set")
     return documents, identities
 
 
@@ -559,6 +612,366 @@ def _metric_result(name: str, outcomes: list[Mapping], documents: Mapping) -> di
     }
 
 
+def _outcome_episodes(
+    episodes: Sequence[Mapping], invalidated_ids: set[str]
+) -> list[Mapping]:
+    return [
+        episode
+        for episode in episodes
+        if (
+            episode["status"] in _OUTCOME_STATUSES
+            and episode["run_id"] not in invalidated_ids
+        )
+    ]
+
+
+def _event_key(event: Mapping, fields: Sequence[str]) -> dict:
+    return {name: event[name] for name in fields}
+
+
+def _pattern_sort_key(row: Mapping) -> bytes:
+    try:
+        return canonicalize([
+            row["cohort"], row["pattern_kind"], row["pattern"]
+        ])
+    except CanonicalizationError as error:
+        raise _error(f"decision pattern is not canonicalizable: {error}", error) \
+            from error
+
+
+def _decision_patterns(
+    outcomes: Sequence[Mapping],
+    cohort: Mapping,
+    documents: Mapping,
+) -> list[dict]:
+    policy = documents["decision_support_policy"]
+    fields = policy["event_key_fields"]
+    eligible = [
+        episode for episode in outcomes
+        if episode["episode_schema_version"] == 2
+    ]
+    aggregates: dict[tuple, dict] = {}
+    for episode in eligible:
+        events = sorted(episode["decisions"], key=lambda item: item["sequence"])
+        keyed_events = [_event_key(event, fields) for event in events]
+        occurrences = [
+            ("single-event", [event]) for event in keyed_events
+        ]
+        occurrences.extend(
+            (
+                "contiguous-adjacent-pair",
+                [keyed_events[index], keyed_events[index + 1]],
+            )
+            for index in range(len(keyed_events) - 1)
+        )
+        episode_keys = set()
+        for kind, pattern in occurrences:
+            key = (
+                kind,
+                tuple(
+                    tuple(event[name] for name in fields)
+                    for event in pattern
+                ),
+            )
+            aggregate = aggregates.setdefault(key, {
+                "pattern_kind": kind,
+                "pattern": deepcopy(pattern),
+                "event_count": 0,
+                "episode_count_with_event": 0,
+            })
+            aggregate["event_count"] += 1
+            episode_keys.add(key)
+        for key in episode_keys:
+            aggregates[key]["episode_count_with_event"] += 1
+
+    eligible_n = len(eligible)
+    minimum_support = policy["decision_min_episode_support"]
+    minimum_ratio = Fraction(policy["decision_min_support_ratio"])
+    minimum_outcomes = policy[
+        "decision_recurring_minimum_outcome_episodes"
+    ]
+    rows = []
+    for aggregate in aggregates.values():
+        supporting_n = aggregate["episode_count_with_event"]
+        recurring = (
+            supporting_n >= minimum_support
+            and Fraction(supporting_n, eligible_n) >= minimum_ratio
+            and cohort["comparative_inference_eligible"]
+            and cohort["outcome_episode_n"] >= minimum_outcomes
+        )
+        rows.append({
+            "cohort": _cohort_identity(cohort),
+            "pattern_kind": aggregate["pattern_kind"],
+            "pattern": aggregate["pattern"],
+            "event_count": aggregate["event_count"],
+            "episode_count_with_event": supporting_n,
+            "eligible_episode_n": eligible_n,
+            "support_fraction": {
+                "numerator": supporting_n,
+                "denominator": eligible_n,
+            },
+            "evidence_strength": "recurring" if recurring else "descriptive",
+        })
+    rows.sort(key=_pattern_sort_key)
+    return rows
+
+
+def _cohort_identity(cohort: Mapping) -> dict:
+    return {
+        name: deepcopy(cohort[name]) for name in _COHORT_IDENTITY_FIELDS
+    }
+
+
+def _candidate_source(
+    kind: str,
+    identity: str,
+    semantics_id: str | None,
+) -> dict:
+    return {
+        "kind": kind,
+        "identity": identity,
+        "semantics_id": semantics_id,
+    }
+
+
+def _candidate_evidence(
+    rule: Mapping,
+    *,
+    cohort: Mapping,
+    source: Mapping,
+    denominators: Mapping,
+    values: Mapping,
+    evidence_strength: str,
+    identities: Mapping,
+) -> dict:
+    evidence = {name: None for name in _CANDIDATE_EVIDENCE_FIELDS}
+    for name in rule["evidence_fields"]:
+        if name not in evidence or name not in values:
+            raise LearningSnapshotError(
+                f"candidate rule {rule['candidate_type']} has unsupported evidence"
+            )
+        evidence[name] = deepcopy(values[name])
+    result = {
+        "candidate_type": rule["candidate_type"],
+        "class": rule["class"],
+        "cohort": _cohort_identity(cohort),
+        "source": deepcopy(source),
+        "policy_identities": {
+            name: deepcopy(identities[name])
+            for name in rule["policy_identity_keys"]
+        },
+        "denominators": {
+            "eligible_episode_n": denominators["eligible_episode_n"],
+            "outcome_episode_n": denominators["outcome_episode_n"],
+            "supporting_episode_n": denominators["supporting_episode_n"],
+        },
+        "evidence": evidence,
+        "evidence_strength": evidence_strength,
+    }
+    result["candidate_id"] = candidate_id(result)
+    return result
+
+
+def _metric_predicate(metric: Mapping, predicate: str) -> bool:
+    missingness = metric["missingness"]
+    if predicate == "observed-count-positive":
+        return missingness["observed_n"] > 0
+    if predicate == "positive-observed-value":
+        values = metric["observed_values"]
+        return values is not None and any(value > 0 for value in values)
+    if predicate == "not-recorded-count-positive":
+        return missingness["not_recorded_n"] > 0
+    if predicate == "unsupported-count-positive":
+        return missingness["unsupported_by_schema_n"] > 0
+    if predicate == "non-pass-count-positive":
+        counts = metric["category_counts"]
+        return counts is not None and any(
+            counts[name] > 0 for name in ("fail", "not-run", "unknown")
+        )
+    raise LearningSnapshotError(f"candidate metric predicate {predicate} is unsupported")
+
+
+def _metric_candidates(
+    rule: Mapping,
+    cohort: Mapping,
+    documents: Mapping,
+    identities: Mapping,
+) -> list[dict]:
+    metrics = {row["metric"]: row for row in cohort["metrics"]}
+    selected_names = (
+        sorted(metrics, key=_utf8)
+        if rule["source"] == "any-metric"
+        else [rule["source"]]
+    )
+    results = []
+    for name in selected_names:
+        metric = metrics[name]
+        eligible_n = metric["missingness"]["eligible_episode_n"]
+        if eligible_n < 1 or not _metric_predicate(metric, rule["predicate"]):
+            continue
+        values = {
+            "missingness": metric["missingness"],
+            "observed_values": metric["observed_values"],
+            "category_counts": metric["category_counts"],
+            "quantiles": metric["quantiles"],
+        }
+        results.append(_candidate_evidence(
+            rule,
+            cohort=cohort,
+            source=_candidate_source(
+                "metric", name, metric["semantics_id"]
+            ),
+            denominators={
+                "eligible_episode_n": eligible_n,
+                "outcome_episode_n": cohort["outcome_episode_n"],
+                "supporting_episode_n": None,
+            },
+            values=values,
+            evidence_strength="descriptive",
+            identities=identities,
+        ))
+    return results
+
+
+def _decision_candidates(
+    rule: Mapping,
+    cohort: Mapping,
+    patterns: Sequence[Mapping],
+    documents: Mapping,
+    identities: Mapping,
+) -> list[dict]:
+    if rule["predicate"] != "decision-support-satisfied":
+        raise LearningSnapshotError("candidate Decision predicate is unsupported")
+    results = []
+    for pattern in patterns:
+        if (
+            pattern["pattern_kind"] != rule["source"]
+            or pattern["evidence_strength"] != "recurring"
+        ):
+            continue
+        results.append(_candidate_evidence(
+            rule,
+            cohort=cohort,
+            source=_candidate_source(
+                "decision",
+                pattern["pattern_kind"],
+                documents["decision_support_policy"]["version"],
+            ),
+            denominators={
+                "eligible_episode_n": pattern["eligible_episode_n"],
+                "outcome_episode_n": cohort["outcome_episode_n"],
+                "supporting_episode_n": pattern[
+                    "episode_count_with_event"
+                ],
+            },
+            values={
+                "counts": {
+                    "event_count": pattern["event_count"],
+                    "episode_count_with_event": pattern[
+                        "episode_count_with_event"
+                    ],
+                },
+                "pattern": pattern["pattern"],
+            },
+            evidence_strength="recurring",
+            identities=identities,
+        ))
+    return results
+
+
+def _count_candidate(
+    rule: Mapping,
+    cohort: Mapping,
+    *,
+    collection_episode_n: int,
+    as_of: str,
+    documents: Mapping,
+    identities: Mapping,
+) -> list[dict]:
+    source = rule["source"]
+    if rule["source_kind"] == "outcome":
+        if source != "non_success_outcome_n":
+            raise LearningSnapshotError("candidate outcome source is unsupported")
+        count = sum(
+            cohort["outcome_counts"][status]
+            for status in ("failed", "partial", "rolled-back")
+        )
+        eligible_n = cohort["outcome_episode_n"]
+    elif rule["source_kind"] == "lifecycle":
+        if source not in {
+            "generation_unavailable_episode_n",
+            "invalidated_episode_n",
+            "stale_draft_n",
+        }:
+            raise LearningSnapshotError("candidate lifecycle source is unsupported")
+        count = cohort[source]
+        eligible_n = collection_episode_n
+    else:
+        raise LearningSnapshotError("candidate count source kind is unsupported")
+    if rule["predicate"] != "positive-count":
+        raise LearningSnapshotError("candidate count predicate is unsupported")
+    if eligible_n < 1 or count <= 0:
+        return []
+    counts = {source: count}
+    if source == "stale_draft_n":
+        counts.update({
+            "as_of": as_of,
+            "stale_after_seconds": documents["lifecycle_health_policy"]
+                ["draft_stale_after_seconds"],
+        })
+    return [_candidate_evidence(
+        rule,
+        cohort=cohort,
+        source=_candidate_source(rule["source_kind"], source, None),
+        denominators={
+            "eligible_episode_n": eligible_n,
+            "outcome_episode_n": cohort["outcome_episode_n"],
+            "supporting_episode_n": None,
+        },
+        values={"counts": counts},
+        evidence_strength="descriptive",
+        identities=identities,
+    )]
+
+
+def _cohort_candidates(
+    cohort: Mapping,
+    patterns: Sequence[Mapping],
+    *,
+    collection_episode_n: int,
+    as_of: str,
+    documents: Mapping,
+    identities: Mapping,
+) -> list[dict]:
+    results = []
+    for rule in documents["candidate_emission_policy"]["rules"]:
+        source_kind = rule["source_kind"]
+        if rule["minimum_denominator"] not in {
+            "one-observed-episode@1", "decision-pattern-support@1"
+        }:
+            raise LearningSnapshotError("candidate denominator policy is unsupported")
+        if source_kind == "metric":
+            results.extend(_metric_candidates(
+                rule, cohort, documents, identities
+            ))
+        elif source_kind == "decision":
+            results.extend(_decision_candidates(
+                rule, cohort, patterns, documents, identities
+            ))
+        elif source_kind in {"lifecycle", "outcome"}:
+            results.extend(_count_candidate(
+                rule,
+                cohort,
+                collection_episode_n=collection_episode_n,
+                as_of=as_of,
+                documents=documents,
+                identities=identities,
+            ))
+        else:
+            raise LearningSnapshotError("candidate source kind is unsupported")
+    return results
+
+
 def _ledger_row(run_id: str, reason: str, excluded_from: str) -> tuple[str, str, str]:
     if reason not in _EXCLUSION_REASONS:
         raise LearningSnapshotError("exclusion reason is not bounded")
@@ -583,7 +996,7 @@ def _build_cohort(
         project, workspace, workspace_id, task_type, variant, legacy_collection_id = key[1:]
         generation = None
 
-    outcomes = []
+    outcomes = _outcome_episodes(episodes, invalidated_ids)
     for episode in episodes:
         run_id = episode["run_id"]
         status = episode["status"]
@@ -593,8 +1006,6 @@ def _build_cohort(
             ledger.add(_ledger_row(run_id, "superseded", "outcome-analysis"))
         if run_id in invalidated_ids:
             ledger.add(_ledger_row(run_id, "invalidated", "outcome-analysis"))
-        if status in _OUTCOME_STATUSES and run_id not in invalidated_ids:
-            outcomes.append(episode)
 
     exclusions = []
     if generation is None:
@@ -665,7 +1076,7 @@ def _build_cohort(
 def build_snapshot_core(
     snapshot_input: SnapshotInput, policy_set: PolicySet
 ) -> dict:
-    """Build the deterministic Task 7 snapshot core from one canonical input."""
+    """Build the deterministic Task 8 snapshot core from one canonical input."""
 
     documents, identities = _validate_policy_set(policy_set)
     bundle = _validate_input_bundle(snapshot_input, documents, identities)
@@ -680,17 +1091,42 @@ def build_snapshot_core(
     for episode in episodes:
         groups.setdefault(_cohort_group(episode), []).append(episode)
     ledger: set[tuple[str, str, str]] = set()
-    cohorts = [
-        _build_cohort(
+    grouped_rows = []
+    for key in sorted(groups, key=_group_sort_key):
+        grouped_episodes = groups[key]
+        cohort = _build_cohort(
             key,
-            groups[key],
+            grouped_episodes,
             invalidated_ids,
             documents,
             as_of,
             ledger,
         )
-        for key in sorted(groups, key=_group_sort_key)
+        outcomes = _outcome_episodes(grouped_episodes, invalidated_ids)
+        patterns = _decision_patterns(outcomes, cohort, documents)
+        grouped_rows.append((cohort, patterns, len(grouped_episodes)))
+    cohorts = [row[0] for row in grouped_rows]
+    decision_patterns = [
+        pattern for _cohort, patterns, _episode_n in grouped_rows
+        for pattern in patterns
     ]
+    decision_patterns.sort(key=_pattern_sort_key)
+    candidates = [
+        candidate
+        for cohort, patterns, episode_n in grouped_rows
+        for candidate in _cohort_candidates(
+            cohort,
+            patterns,
+            collection_episode_n=episode_n,
+            as_of=bundle["lifecycle_as_of"],
+            documents=documents,
+            identities=identities,
+        )
+    ]
+    candidate_ids = [candidate["candidate_id"] for candidate in candidates]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise LearningSnapshotError("snapshot candidate IDs are duplicated")
+    candidates.sort(key=lambda item: _utf8(item["candidate_id"]))
     exclusion_ledger = [
         {
             "run_id": run_id,
@@ -729,6 +1165,6 @@ def build_snapshot_core(
         },
         "exclusion_ledger": exclusion_ledger,
         "cohorts": cohorts,
-        "decision_patterns": [],
-        "candidates": [],
+        "decision_patterns": decision_patterns,
+        "candidates": candidates,
     }

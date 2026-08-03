@@ -727,6 +727,17 @@ probabilistic confidence, actionability score, composite workflow score, or
 LLM-selected priority. `workflow-improving` acts only after a user selects one
 candidate from a cited snapshot.
 
+Every candidate carries an exact eight-field cohort identity: `collection`,
+`legacy_collection_id`, and the six outcome cohort fields. The two collection
+fields distinguish separately labeled legacy descriptive collections without
+changing the six-part outcome grouping key. Candidate IDs must be unique within
+one snapshot; an identity collision fails the snapshot closed.
+
+Decision pattern rows carry that same eight-field cohort identity before they
+are flattened into the snapshot-level array and are sorted by JCS bytes of
+`(cohort, pattern_kind, pattern)`. A Decision candidate carries exactly the
+cohort identity of its source pattern row.
+
 Each `candidate_id` is the lowercase hexadecimal SHA-256 of the UTF-8 domain
 separator `workflow-observatory:learning-candidate:v1\0` followed by the
 JCS bytes of that candidate's class, cohort identity, applicable policy and

@@ -2150,7 +2150,7 @@ subsequences, or combinations.
 Each event key contains exactly the five versioned low-cardinality fields
 `phase`, `actor_role`, `decision_type`, `reason_code`, and `result`.
 `summary` and `sequence` never enter a pattern key, group, count, metric label,
-candidate trigger, or candidate ID. A pattern row has exact keys
+candidate trigger, or candidate ID. A pattern row has exact keys `cohort`,
 `pattern_kind`, `pattern`, `event_count`, `episode_count_with_event`,
 `eligible_episode_n`, `support_fraction`, and `evidence_strength`. `pattern` is
 a one- or two-element array of exact event-key objects. `event_count` counts all
@@ -2160,8 +2160,9 @@ one to `episode_count_with_event`. `support_fraction` has exact integer keys
 threshold through `fractions.Fraction`, never float or rounded decimal output.
 Below the independent `3 Episodes + 0.40` policy the row is `descriptive`; at
 or above both thresholds it is eligible for the comparability gate described
-next. Pattern rows remain sorted by JCS bytes of
-`(pattern_kind, pattern)`.
+next. `cohort` is the exact eight-field candidate cohort identity defined in
+Step 4, so globally flattened rows retain their provenance. Pattern rows remain
+sorted by JCS bytes of `(cohort, pattern_kind, pattern)`.
 
 A Decision pattern is `recurring` if and only if all four conditions hold:
 
@@ -2204,7 +2205,11 @@ object has exactly these top-level keys:
 }
 ```
 
-`cohort` contains the exact six cohort-key fields. `source` has exact keys
+`cohort` contains exact keys `collection`, `legacy_collection_id`, `project`,
+`workspace`, `workspace_id`, `task_type`, `workflow_variant`, and
+`workflow_generation`. The first two fields preserve the identity of separately
+labeled legacy descriptive collections without changing the six-part outcome
+cohort grouping key. `source` has exact keys
 `kind`, `identity`, and `semantics_id`. `denominators` always has exact keys
 `eligible_episode_n`, `outcome_episode_n`, and `supporting_episode_n`, using
 JSON null when a denominator is not applicable. `evidence` always has exact
@@ -2252,7 +2257,9 @@ candidate_id = hash_canonical(
 
 Then add `candidate_id` and sort candidates by its ASCII bytes. Do not add LLM
 narrative, priority, probability, causal wording, actionability, or proposal
-data.
+data. Every emitted `candidate_id` in one snapshot must be unique; fail closed
+rather than return colliding candidate rows. A Decision candidate's `cohort`
+must exactly equal the `cohort` on its source pattern row.
 
 - [ ] **Step 5: Run the full learning-snapshot test module**
 
