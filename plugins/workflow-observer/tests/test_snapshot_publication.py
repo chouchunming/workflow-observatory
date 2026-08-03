@@ -19,7 +19,7 @@ for module_root in (PLUGIN_ROOT / "scripts", PLUGIN_ROOT / "tests"):
 
 from canonical_json import canonicalize, hash_canonical, strict_json_loads
 from learning_snapshot import candidate_id
-from policy_artifacts import load_policy_set
+from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
     SnapshotQuery,
@@ -184,11 +184,53 @@ class SnapshotPublicationTests(unittest.TestCase):
             generated_at=generated_at,
         )
 
-    def artifact_with_recurring_decision_patterns(self, *, include_pair=False):
+    def artifact_with_recurring_decision_patterns(
+        self,
+        *,
+        supporting_n=3,
+        eligible_n=5,
+        outcome_n=5,
+        comparative_eligible=True,
+        evidence_strength="recurring",
+        include_candidate=True,
+        include_pair=False,
+    ):
         artifact = strict_json_loads(self.publish().path.read_bytes())
         core = artifact["core"]
         single = core["decision_patterns"][0]
-        single["evidence_strength"] = "recurring"
+        cohort = next(
+            row for row in core["cohorts"]
+            if all(
+                row[name] == value
+                for name, value in single["cohort"].items()
+            )
+        )
+        cohort["comparative_inference_eligible"] = comparative_eligible
+        cohort["comparative_inference_exclusions"] = (
+            [] if comparative_eligible else ["generation-unavailable"]
+        )
+        cohort["evidence_strength"] = (
+            "recurring"
+            if comparative_eligible and outcome_n >= 5
+            else "descriptive"
+        )
+        cohort["outcome_episode_n"] = outcome_n
+        cohort["outcome_counts"] = {
+            "failed": 0,
+            "partial": 0,
+            "rolled-back": 0,
+            "success": outcome_n,
+        }
+        single.update({
+            "event_count": supporting_n,
+            "episode_count_with_event": supporting_n,
+            "eligible_episode_n": eligible_n,
+            "support_fraction": {
+                "numerator": supporting_n,
+                "denominator": eligible_n,
+            },
+            "evidence_strength": evidence_strength,
+        })
         patterns = [single]
         if include_pair:
             pair = deepcopy(single)
@@ -199,11 +241,26 @@ class SnapshotPublicationTests(unittest.TestCase):
             core["decision_patterns"].sort(key=lambda row: canonicalize([
                 row["cohort"], row["pattern_kind"], row["pattern"]
             ]))
-        core["candidates"].extend(
-            decision_candidate_for_pattern(core, pattern) for pattern in patterns
-        )
+        if include_candidate:
+            core["candidates"].extend(
+                decision_candidate_for_pattern(core, pattern)
+                for pattern in patterns
+            )
         core["candidates"].sort(key=lambda row: row["candidate_id"])
         return artifact, patterns
+
+    def policy_set_with_different_decision_identity(self):
+        documents = self.policies.documents
+        decision = documents["decision_support_policy"]
+        decision["decision_min_support_ratio"] = "0.600"
+        identities = self.policies.core_identity()
+        identities["decision_support_policy"] = {
+            "version": decision["version"],
+            "sha256": "sha256:" + hashlib.sha256(
+                canonicalize(decision)
+            ).hexdigest(),
+        }
+        return PolicySet(documents, identities)
 
     def acquire_then_mutate_selection(self):
         run_id = "obs-20260802-000000-abcdef"
@@ -444,7 +501,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         artifact = strict_json_loads(self.publish().path.read_bytes())
         artifact["authoritative"] = True
         with self.assertRaises(SnapshotPublicationError):
-            validate_learning_artifact(artifact)
+            validate_learning_artifact(artifact, self.policies)
 
     def test_adapter_tamper_cannot_inject_path_metadata(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
@@ -453,7 +510,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "adapter identity is invalid"
         ):
-            validate_learning_artifact_bytes(raw)
+            validate_learning_artifact_bytes(raw, self.policies)
 
     def test_adapter_digest_must_bind_analyzer_artifact(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
@@ -462,7 +519,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "adapter.*analyzer"
         ):
-            validate_learning_artifact_bytes(raw)
+            validate_learning_artifact_bytes(raw, self.policies)
 
     def test_recursive_core_validation_rejects_path_and_unknown_fields(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
@@ -488,7 +545,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
                     SnapshotPublicationError, "core structure is invalid"
                 ):
                     validate_learning_artifact_bytes(
-                        artifact_bytes_with_recomputed_identities(item)
+                        artifact_bytes_with_recomputed_identities(item),
+                        self.policies,
                     )
 
     def test_recursive_core_validation_rejects_embedded_sensitive_path(self):
@@ -502,7 +560,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "sensitive path or credential"
         ):
             validate_learning_artifact_bytes(
-                artifact_bytes_with_recomputed_identities(artifact)
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
             )
 
     def test_decision_pattern_kind_must_bind_pattern_length(self):
@@ -515,7 +574,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "core structure is invalid"
         ):
             validate_learning_artifact_bytes(
-                artifact_bytes_with_recomputed_identities(artifact)
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
             )
 
     def test_decision_pattern_support_must_bind_counts(self):
@@ -528,7 +588,103 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "core structure is invalid"
         ):
             validate_learning_artifact_bytes(
-                artifact_bytes_with_recomputed_identities(artifact)
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_one_of_one_self_declared_recurring_is_rejected(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns(
+            supporting_n=1,
+            eligible_n=1,
+            outcome_n=5,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "decision pattern evidence strength"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_three_of_four_with_four_outcomes_is_not_recurring(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns(
+            supporting_n=3,
+            eligible_n=4,
+            outcome_n=4,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "decision pattern evidence strength"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_three_of_five_without_comparative_eligibility_is_not_recurring(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns(
+            supporting_n=3,
+            eligible_n=5,
+            outcome_n=5,
+            comparative_eligible=False,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "decision pattern evidence strength"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_three_of_five_eligible_outcomes_accepts_one_recurring_candidate(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns(
+            supporting_n=3,
+            eligible_n=5,
+            outcome_n=5,
+            comparative_eligible=True,
+        )
+
+        validated = validate_learning_artifact_bytes(
+            artifact_bytes_with_recomputed_identities(artifact),
+            self.policies,
+        )
+
+        decision_candidates = [
+            candidate for candidate in validated["core"]["candidates"]
+            if candidate["source"]["kind"] == "decision"
+        ]
+        self.assertEqual(1, len(decision_candidates))
+        self.assertEqual("recurring", decision_candidates[0]["evidence_strength"])
+
+    def test_recurring_qualified_evidence_relabelled_descriptive_is_rejected(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns(
+            supporting_n=3,
+            eligible_n=5,
+            outcome_n=5,
+            comparative_eligible=True,
+            evidence_strength="descriptive",
+            include_candidate=False,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "decision pattern evidence strength"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_supplied_policy_set_identity_mismatch_is_rejected(self):
+        artifact, _patterns = self.artifact_with_recurring_decision_patterns()
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "analysis policy set does not match"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                policy_set=self.policy_set_with_different_decision_identity(),
             )
 
     def test_orphan_decision_candidate_is_rejected(self):
@@ -544,7 +700,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "core structure is invalid"
         ):
             validate_learning_artifact_bytes(
-                artifact_bytes_with_recomputed_identities(artifact)
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
             )
 
     def test_decision_candidate_must_bind_pattern_evidence(self):
@@ -579,7 +736,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
                     SnapshotPublicationError, "core structure is invalid"
                 ):
                     validate_learning_artifact_bytes(
-                        artifact_bytes_with_recomputed_identities(artifact)
+                        artifact_bytes_with_recomputed_identities(artifact),
+                        self.policies,
                     )
 
     def test_valid_single_event_and_adjacent_pair_patterns_are_accepted(self):
@@ -588,7 +746,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         )
 
         validated = validate_learning_artifact_bytes(
-            artifact_bytes_with_recomputed_identities(artifact)
+            artifact_bytes_with_recomputed_identities(artifact),
+            self.policies,
         )
 
         self.assertEqual(
@@ -605,7 +764,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "core structure is invalid"
         ):
             validate_learning_artifact_bytes(
-                artifact_bytes_with_recomputed_identities(artifact)
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
             )
 
     def test_valid_producer_cohort_order_is_accepted(self):
@@ -620,7 +780,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         artifact["core"]["cohorts"].append(later_workflow_cohort)
 
         validated = validate_learning_artifact_bytes(
-            artifact_bytes_with_recomputed_identities(artifact)
+            artifact_bytes_with_recomputed_identities(artifact),
+            self.policies,
         )
 
         self.assertEqual(artifact["core"], validated["core"])
@@ -635,7 +796,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "duplicate JSON key"
         ):
-            validate_learning_artifact_bytes(ambiguous)
+            validate_learning_artifact_bytes(ambiguous, self.policies)
 
     def test_artifact_readback_recomputes_snapshot_identity(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
@@ -644,7 +805,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "snapshot identity mismatch"
         ):
-            validate_learning_artifact_bytes(raw)
+            validate_learning_artifact_bytes(raw, self.policies)
 
     def test_artifact_readback_recomputes_file_digest(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
@@ -652,14 +813,16 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "artifact digest mismatch"
         ):
-            validate_learning_artifact_bytes(canonicalize(artifact))
+            validate_learning_artifact_bytes(
+                canonicalize(artifact), self.policies
+            )
 
     def test_artifact_readback_rejects_noncanonical_bytes(self):
         raw = self.publish().path.read_bytes()
         with self.assertRaisesRegex(
             SnapshotPublicationError, "not canonical JCS"
         ):
-            validate_learning_artifact_bytes(b" " + raw)
+            validate_learning_artifact_bytes(b" " + raw, self.policies)
 
     def test_artifact_readback_rejects_symlink_and_filename_identity_mismatch(self):
         published = self.publish()
@@ -668,6 +831,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         ):
             validate_learning_artifact_bytes(
                 published.path.read_bytes(),
+                self.policies,
                 expected_snapshot_id="0" * 64,
             )
         link = published.path.parent / ("f" * 64 + ".json")
@@ -675,7 +839,9 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         with self.assertRaisesRegex(
             SnapshotPublicationError, "unsafe snapshot target"
         ):
-            read_learning_artifact(published.path.parent, "f" * 64)
+            read_learning_artifact(
+                published.path.parent, "f" * 64, self.policies
+            )
 
     def test_artifact_readback_requires_mode_0600(self):
         published = self.publish()
@@ -684,7 +850,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             SnapshotPublicationError, "mode-0600"
         ):
             read_learning_artifact(
-                published.path.parent, published.snapshot_id
+                published.path.parent, published.snapshot_id, self.policies
             )
 
     def test_artifact_readback_rejects_post_open_filename_swap(self):
@@ -709,7 +875,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
                 SnapshotPublicationError, "changed during read"
             ):
                 read_learning_artifact(
-                    published.path.parent, published.snapshot_id
+                    published.path.parent, published.snapshot_id, self.policies
                 )
 
     def test_artifact_readback_fifo_swap_is_nonblocking(self):
@@ -734,7 +900,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
                 SnapshotPublicationError, "changed during read"
             ):
                 read_learning_artifact(
-                    published.path.parent, published.snapshot_id
+                    published.path.parent, published.snapshot_id, self.policies
                 )
 
     def test_snapshot_rejects_narrative_and_annotation_fields(self):
@@ -743,7 +909,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             with self.subTest(field=field):
                 tampered = {**artifact, field: "different text"}
                 with self.assertRaises(SnapshotPublicationError):
-                    validate_learning_artifact(tampered)
+                    validate_learning_artifact(tampered, self.policies)
         self.assertEqual(
             [], list((self.home / "learning/annotations").glob("*"))
         )
@@ -755,7 +921,9 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         )
         self.assertEqual(1, len({result.snapshot_id for result in results}))
         final_path = results[0].path
-        read_learning_artifact(final_path.parent, results[0].snapshot_id)
+        read_learning_artifact(
+            final_path.parent, results[0].snapshot_id, self.policies
+        )
         self.assertEqual([], list(final_path.parent.glob(".snapshot-*.tmp")))
 
 

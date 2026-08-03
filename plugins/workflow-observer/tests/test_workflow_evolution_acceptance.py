@@ -347,7 +347,9 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         published = self._publish_same_bundle_twice()
         self.assertEqual(2, len(published))
         artifacts = [
-            read_learning_artifact(result.path.parent, result.snapshot_id)
+            read_learning_artifact(
+                result.path.parent, result.snapshot_id, self.policies
+            )
             for result in published
         ]
         recomputed_ids = [
@@ -474,7 +476,7 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         snapshot_dir = self.home / "learning" / "snapshots"
         self.assertEqual(1, len(list(snapshot_dir.glob("*.json"))))
         read_learning_artifact(
-            snapshot_dir, first_snapshot["snapshot_id"]
+            snapshot_dir, first_snapshot["snapshot_id"], self.policies
         )
         self.assertEqual([], list(self.home.rglob("*proposal*")))
         self.assertEqual(b"must remain unchanged\n", outside.read_bytes())
@@ -796,12 +798,14 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(
             SnapshotPublicationError, "cannot be authoritative"
         ):
-            validate_learning_artifact_bytes(canonicalize(artifact))
+            validate_learning_artifact_bytes(
+                canonicalize(artifact), self.policies
+            )
 
     def test_11_snapshot_rejects_narrative_and_annotation_fields(self):
         published = self.publish()
         artifact = read_learning_artifact(
-            published.path.parent, published.snapshot_id
+            published.path.parent, published.snapshot_id, self.policies
         )
         for field in ("narrative", "annotation", "summary_markdown"):
             with self.subTest(field=field):
@@ -814,7 +818,9 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                     SnapshotPublicationError,
                     "learning snapshot artifact has wrong fields",
                 ):
-                    validate_learning_artifact_bytes(canonicalize(tampered))
+                    validate_learning_artifact_bytes(
+                        canonicalize(tampered), self.policies
+                    )
 
         self.assertEqual(
             [],

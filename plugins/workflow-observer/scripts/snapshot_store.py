@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
+from fractions import Fraction
 import hashlib
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ from policy_artifacts import (
     PolicyError,
     PolicySet,
     validate_relative_posix_artifact_path,
+    validate_policy_documents,
 )
 from snapshot_input import (
     SnapshotInput,
@@ -165,6 +167,16 @@ _POLICY_VERSIONS = {
     "producer_capability_registry": "producer-capabilities@1",
     "quantile_policy": "linear-rational-quantile@1",
     "workflow_generation_mapping": "workflow-generation-mapping@1",
+}
+_POLICY_DOCUMENT_IDENTITIES = {
+    "episode_projection": "canonical_projection_contract",
+    "producer_capabilities": "producer_capability_registry",
+    "workflow_generation_mapping": "workflow_generation_mapping",
+    "metric_semantics": "metric_semantics_registry",
+    "quantile_policy": "quantile_policy",
+    "decision_support_policy": "decision_support_policy",
+    "lifecycle_health_policy": "lifecycle_health_policy",
+    "candidate_emission_policy": "candidate_emission_policy",
 }
 _DECISION_ENUMERATIONS = {
     "phase": {"implementation", "planning", "recovery", "review", "verification"},
@@ -320,7 +332,9 @@ class PublishedSnapshot:
     created: bool
 
 
-def validate_learning_artifact(artifact: Mapping) -> None:
+def validate_learning_artifact(
+    artifact: Mapping, policy_set: PolicySet
+) -> None:
     if not isinstance(artifact, Mapping) or set(artifact) != _ARTIFACT_KEYS:
         raise SnapshotPublicationError(
             "validation", "learning snapshot artifact has wrong fields"
@@ -385,11 +399,14 @@ def validate_learning_artifact(artifact: Mapping) -> None:
         raise SnapshotPublicationError(
             "validation", "artifact digest mismatch"
         )
-    _validate_snapshot_core(core, adapter)
+    _validate_snapshot_core(core, adapter, policy_set)
 
 
 def validate_learning_artifact_bytes(
-    raw: bytes, *, expected_snapshot_id: str | None = None
+    raw: bytes,
+    policy_set: PolicySet,
+    *,
+    expected_snapshot_id: str | None = None,
 ) -> Mapping:
     if not isinstance(raw, bytes):
         raise SnapshotPublicationError(
@@ -412,7 +429,7 @@ def validate_learning_artifact_bytes(
         raise SnapshotPublicationError(
             "validation", "learning snapshot artifact must be an object"
         )
-    validate_learning_artifact(parsed)
+    validate_learning_artifact(parsed, policy_set)
     recomputed_snapshot_id = hash_canonical(
         _SNAPSHOT_CORE_DOMAIN, parsed["core"]
     )
@@ -979,7 +996,67 @@ def _validate_candidate(value: object, identities: Mapping) -> Mapping:
     return row
 
 
-def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
+def _validated_policy_documents(
+    policy_set: PolicySet, artifact_identities: Mapping
+) -> Mapping:
+    if not isinstance(policy_set, PolicySet):
+        raise SnapshotPublicationError(
+            "validation", "policy_set must be an immutable PolicySet"
+        )
+    try:
+        policy_identities = policy_set.core_identity()
+    except (KeyError, TypeError, ValueError) as error:
+        raise SnapshotPublicationError(
+            "validation", f"analysis policy set is invalid: {error}"
+        ) from error
+    if policy_identities != artifact_identities:
+        raise SnapshotPublicationError(
+            "validation", "analysis policy set does not match learning snapshot"
+        )
+    documents = policy_set.documents
+    try:
+        validate_policy_documents(
+            documents, allow_reviewed_generation_mapping=True
+        )
+        for document_name, identity_name in _POLICY_DOCUMENT_IDENTITIES.items():
+            document = documents[document_name]
+            expected_identity = {
+                "version": document["version"],
+                "sha256": "sha256:" + hashlib.sha256(
+                    canonicalize(document)
+                ).hexdigest(),
+            }
+            if policy_identities[identity_name] != expected_identity:
+                raise PolicyError(
+                    f"analysis policy identity does not bind {document_name}"
+                )
+    except (CanonicalizationError, KeyError, PolicyError) as error:
+        raise SnapshotPublicationError(
+            "validation", f"analysis policy set is invalid: {error}"
+        ) from error
+    return documents
+
+
+def _decision_pattern_strength(
+    pattern: Mapping, cohort: Mapping, decision_policy: Mapping
+) -> str:
+    recurring = (
+        pattern["episode_count_with_event"]
+        >= decision_policy["decision_min_episode_support"]
+        and Fraction(
+            pattern["support_fraction"]["numerator"],
+            pattern["support_fraction"]["denominator"],
+        ) >= Fraction(decision_policy["decision_min_support_ratio"])
+        and cohort["comparative_inference_eligible"]
+        and cohort["outcome_episode_n"]
+        >= decision_policy["decision_recurring_minimum_outcome_episodes"]
+    )
+    return "recurring" if recurring else "descriptive"
+
+
+def _validate_snapshot_core(
+    core: Mapping, adapter: Mapping, policy_set: PolicySet
+) -> None:
     if (
         type(core["schema_version"]) is not int
         or core["schema_version"] != 1
@@ -988,6 +1065,8 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
         _core_error("core version")
     query = _validate_query(core["query"])
     identities = _validate_policy_identities(core["analysis_policy_set"])
+    documents = _validated_policy_documents(policy_set, identities)
+    decision_policy = documents["decision_support_policy"]
     analyzer = identities["analyzer_artifact"]
     if (
         analyzer["version"] != core["analyzer_version"]
@@ -1055,6 +1134,7 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
     pattern_rows = _array(core["decision_patterns"], "decision patterns")
     pattern_keys = []
     pattern_index = {}
+    recurring_pattern_keys = set()
     for raw_pattern in pattern_rows:
         pattern = _validate_pattern(raw_pattern)
         cohort_key = canonicalize(pattern["cohort"])
@@ -1063,6 +1143,13 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
         pattern_key = canonicalize([
             pattern["cohort"], pattern["pattern_kind"], pattern["pattern"]
         ])
+        expected_strength = _decision_pattern_strength(
+            pattern, cohort_index[cohort_key], decision_policy
+        )
+        if pattern["evidence_strength"] != expected_strength:
+            _core_error("decision pattern evidence strength")
+        if expected_strength == "recurring":
+            recurring_pattern_keys.add(pattern_key)
         pattern_keys.append(pattern_key)
         pattern_index[pattern_key] = pattern
     if pattern_keys != sorted(set(pattern_keys)):
@@ -1086,7 +1173,7 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
             candidate["evidence"]["pattern"],
         ])
         pattern = pattern_index.get(pattern_key)
-        if pattern is None or pattern["evidence_strength"] != "recurring":
+        if pattern is None or pattern_key not in recurring_pattern_keys:
             _core_error("decision candidate recurring pattern binding")
         cohort = cohort_index[canonicalize(candidate["cohort"])]
         if candidate["evidence"]["counts"] != {
@@ -1101,10 +1188,6 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
         decision_candidate_counts[pattern_key] = (
             decision_candidate_counts.get(pattern_key, 0) + 1
         )
-    recurring_pattern_keys = {
-        key for key, pattern in pattern_index.items()
-        if pattern["evidence_strength"] == "recurring"
-    }
     if (
         set(decision_candidate_counts) != recurring_pattern_keys
         or any(count != 1 for count in decision_candidate_counts.values())
@@ -1113,13 +1196,15 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
 
 
 def read_learning_artifact(
-    snapshot_dir: Path, expected_snapshot_id: str
+    snapshot_dir: Path,
+    expected_snapshot_id: str,
+    policy_set: PolicySet,
 ) -> Mapping:
     _validate_snapshot_id(expected_snapshot_id)
     directory_fd = _open_directory(Path(snapshot_dir), required_mode=0o700)
     try:
         return _read_learning_artifact_from_fd(
-            directory_fd, expected_snapshot_id
+            directory_fd, expected_snapshot_id, policy_set
         )
     finally:
         os.close(directory_fd)
@@ -1150,7 +1235,9 @@ def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int]:
 
 
 def _read_learning_artifact_from_fd(
-    directory_fd: int, expected_snapshot_id: str
+    directory_fd: int,
+    expected_snapshot_id: str,
+    policy_set: PolicySet,
 ) -> Mapping:
     _validate_snapshot_id(expected_snapshot_id)
     target_name = f"{expected_snapshot_id}.json"
@@ -1236,7 +1323,9 @@ def _read_learning_artifact_from_fd(
     finally:
         os.close(file_fd)
     return validate_learning_artifact_bytes(
-        content, expected_snapshot_id=expected_snapshot_id
+        content,
+        policy_set,
+        expected_snapshot_id=expected_snapshot_id,
     )
 
 
@@ -1291,7 +1380,7 @@ def create_learning_snapshot(
             canonicalize(artifact_without_digest)
         ).hexdigest(),
     }
-    validate_learning_artifact(artifact)
+    validate_learning_artifact(artifact, policy_set)
     artifact_bytes = canonicalize(artifact)
     if len(artifact_bytes) > _MAX_ARTIFACT_BYTES:
         raise SnapshotPublicationError(
@@ -1345,11 +1434,11 @@ def create_learning_snapshot(
         temporary_name = None
         if created:
             returned_artifact = _read_learning_artifact_from_fd(
-                directory_fd, snapshot_id
+                directory_fd, snapshot_id, policy_set
             )
         else:
             returned_artifact = _reuse_existing_artifact(
-                directory_fd, snapshot_id, core
+                directory_fd, snapshot_id, core, policy_set
             )
     finally:
         try:
@@ -1366,13 +1455,16 @@ def create_learning_snapshot(
 
 
 def _reuse_existing_artifact(
-    directory_fd: int, snapshot_id: str, core: Mapping
+    directory_fd: int,
+    snapshot_id: str,
+    core: Mapping,
+    policy_set: PolicySet,
 ) -> Mapping:
     deadline = time.monotonic() + 5
     while True:
         try:
             existing = _read_learning_artifact_from_fd(
-                directory_fd, snapshot_id
+                directory_fd, snapshot_id, policy_set
             )
             break
         except _SnapshotTargetChanged:
