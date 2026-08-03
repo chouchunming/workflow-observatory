@@ -82,6 +82,62 @@ def artifact_bytes_with_recomputed_identities(artifact):
     return artifact_bytes_with_recomputed_file_digest(rebuilt)
 
 
+def decision_candidate_for_pattern(core, pattern):
+    cohort = next(
+        row for row in core["cohorts"]
+        if all(row[name] == value for name, value in pattern["cohort"].items())
+    )
+    candidate = {
+        "candidate_type": (
+            "decision-single-event"
+            if pattern["pattern_kind"] == "single-event"
+            else "decision-adjacent-pair"
+        ),
+        "class": "decision-pattern",
+        "cohort": deepcopy(pattern["cohort"]),
+        "source": {
+            "kind": "decision",
+            "identity": pattern["pattern_kind"],
+            "semantics_id": "decision-pattern-support@1",
+        },
+        "policy_identities": {
+            name: deepcopy(core["analysis_policy_set"][name])
+            for name in (
+                "candidate_emission_policy",
+                "canonical_projection_contract",
+                "decision_support_policy",
+            )
+        },
+        "denominators": {
+            "eligible_episode_n": pattern["eligible_episode_n"],
+            "outcome_episode_n": cohort["outcome_episode_n"],
+            "supporting_episode_n": pattern["episode_count_with_event"],
+        },
+        "evidence": {
+            "counts": {
+                "event_count": pattern["event_count"],
+                "episode_count_with_event": pattern[
+                    "episode_count_with_event"
+                ],
+            },
+            "missingness": None,
+            "observed_values": None,
+            "category_counts": None,
+            "quantiles": None,
+            "pattern": deepcopy(pattern["pattern"]),
+        },
+        "evidence_strength": "recurring",
+    }
+    candidate["candidate_id"] = candidate_id(candidate)
+    return candidate
+
+
+def recompute_candidate_identity(candidate):
+    evidence = deepcopy(candidate)
+    evidence.pop("candidate_id", None)
+    candidate["candidate_id"] = candidate_id(evidence)
+
+
 class SnapshotPublicationTests(unittest.TestCase):
     def setUp(self):
         self.store = FakeObservationStore("portable")
@@ -127,6 +183,27 @@ class SnapshotPublicationTests(unittest.TestCase):
             home=self.home,
             generated_at=generated_at,
         )
+
+    def artifact_with_recurring_decision_patterns(self, *, include_pair=False):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        core = artifact["core"]
+        single = core["decision_patterns"][0]
+        single["evidence_strength"] = "recurring"
+        patterns = [single]
+        if include_pair:
+            pair = deepcopy(single)
+            pair["pattern_kind"] = "contiguous-adjacent-pair"
+            pair["pattern"] = pair["pattern"] * 2
+            patterns.append(pair)
+            core["decision_patterns"].append(pair)
+            core["decision_patterns"].sort(key=lambda row: canonicalize([
+                row["cohort"], row["pattern_kind"], row["pattern"]
+            ]))
+        core["candidates"].extend(
+            decision_candidate_for_pattern(core, pattern) for pattern in patterns
+        )
+        core["candidates"].sort(key=lambda row: row["candidate_id"])
+        return artifact, patterns
 
     def acquire_then_mutate_selection(self):
         run_id = "obs-20260802-000000-abcdef"
@@ -427,6 +504,126 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             validate_learning_artifact_bytes(
                 artifact_bytes_with_recomputed_identities(artifact)
             )
+
+    def test_decision_pattern_kind_must_bind_pattern_length(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        artifact["core"]["decision_patterns"][0][
+            "pattern_kind"
+        ] = "contiguous-adjacent-pair"
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "core structure is invalid"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact)
+            )
+
+    def test_decision_pattern_support_must_bind_counts(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        artifact["core"]["decision_patterns"][0]["support_fraction"][
+            "numerator"
+        ] = 0
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "core structure is invalid"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact)
+            )
+
+    def test_orphan_decision_candidate_is_rejected(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        core = artifact["core"]
+        candidate = decision_candidate_for_pattern(
+            core, core["decision_patterns"][0]
+        )
+        core["candidates"].append(candidate)
+        core["candidates"].sort(key=lambda row: row["candidate_id"])
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "core structure is invalid"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact)
+            )
+
+    def test_decision_candidate_must_bind_pattern_evidence(self):
+        mutations = {
+            "counts": lambda candidate: candidate["evidence"]["counts"].update(
+                event_count=candidate["evidence"]["counts"]["event_count"] + 1
+            ),
+            "denominators": lambda candidate: candidate["denominators"].update(
+                eligible_episode_n=(
+                    candidate["denominators"]["eligible_episode_n"] + 1
+                )
+            ),
+            "cohort": lambda candidate: candidate["cohort"].update(
+                project="different-project"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(binding=label):
+                artifact, _patterns = (
+                    self.artifact_with_recurring_decision_patterns()
+                )
+                decision = next(
+                    row for row in artifact["core"]["candidates"]
+                    if row["class"] == "decision-pattern"
+                )
+                mutate(decision)
+                recompute_candidate_identity(decision)
+                artifact["core"]["candidates"].sort(
+                    key=lambda row: row["candidate_id"]
+                )
+                with self.assertRaisesRegex(
+                    SnapshotPublicationError, "core structure is invalid"
+                ):
+                    validate_learning_artifact_bytes(
+                        artifact_bytes_with_recomputed_identities(artifact)
+                    )
+
+    def test_valid_single_event_and_adjacent_pair_patterns_are_accepted(self):
+        artifact, patterns = self.artifact_with_recurring_decision_patterns(
+            include_pair=True
+        )
+
+        validated = validate_learning_artifact_bytes(
+            artifact_bytes_with_recomputed_identities(artifact)
+        )
+
+        self.assertEqual(
+            {"single-event", "contiguous-adjacent-pair"},
+            {pattern["pattern_kind"] for pattern in patterns},
+        )
+        self.assertEqual(artifact["core"], validated["core"])
+
+    def test_cohorts_must_have_deterministic_array_order(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        artifact["core"]["cohorts"].reverse()
+
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "core structure is invalid"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact)
+            )
+
+    def test_valid_producer_cohort_order_is_accepted(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        workflow_cohort = artifact["core"]["cohorts"][-1]
+        later_workflow_cohort = deepcopy(workflow_cohort)
+        later_workflow_cohort.update({
+            "workspace": "z-workspace",
+            "task_type": "compile",
+            "workflow_variant": "compile-with-review",
+        })
+        artifact["core"]["cohorts"].append(later_workflow_cohort)
+
+        validated = validate_learning_artifact_bytes(
+            artifact_bytes_with_recomputed_identities(artifact)
+        )
+
+        self.assertEqual(artifact["core"], validated["core"])
 
     def test_duplicate_key_rejected_in_snapshot_artifact(self):
         artifact = self.publish().path.read_bytes()

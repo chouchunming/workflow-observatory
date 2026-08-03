@@ -643,6 +643,27 @@ def _validate_cohort_identity(value: object, label: str) -> Mapping:
     return cohort
 
 
+def _cohort_order_key(cohort: Mapping) -> tuple[bytes, ...]:
+    terminal_identity = (
+        cohort["workflow_generation"]
+        if cohort["collection"] == "workflow-generation"
+        else cohort["legacy_collection_id"]
+    )
+    values = (
+        cohort["collection"],
+        cohort["project"],
+        cohort["workspace"],
+        cohort["workspace_id"],
+        cohort["task_type"],
+        cohort["workflow_variant"],
+        terminal_identity,
+    )
+    return tuple(
+        b"\x00" if value is None else b"\x01" + value.encode("utf-8")
+        for value in values
+    )
+
+
 def _validate_missingness(value: object, label: str) -> None:
     row = _exact_mapping(value, _MISSINGNESS_KEYS, label)
     for name, count in row.items():
@@ -761,7 +782,7 @@ def _validate_event(value: object, label: str) -> None:
             _core_error(f"{label} {name}")
 
 
-def _validate_pattern(value: object) -> None:
+def _validate_pattern(value: object) -> Mapping:
     row = _exact_mapping(
         value,
         {
@@ -782,25 +803,38 @@ def _validate_pattern(value: object) -> None:
     }:
         _core_error("decision pattern kind")
     events = _array(row["pattern"], "decision pattern events")
-    if len(events) not in {1, 2}:
-        _core_error("decision pattern length")
+    expected_length = (
+        1 if row["pattern_kind"] == "single-event" else 2
+    )
+    if len(events) != expected_length:
+        _core_error("decision pattern kind and length binding")
     for event in events:
         _validate_event(event, "decision pattern event")
-    for name in (
-        "event_count", "episode_count_with_event", "eligible_episode_n"
-    ):
-        _nonnegative(row[name], f"decision pattern {name}")
+    event_count = _nonnegative(
+        row["event_count"], "decision pattern event_count"
+    )
+    supporting_n = _nonnegative(
+        row["episode_count_with_event"],
+        "decision pattern episode_count_with_event",
+    )
+    eligible_n = _nonnegative(
+        row["eligible_episode_n"], "decision pattern eligible_episode_n"
+    )
+    if not 1 <= supporting_n <= event_count or supporting_n > eligible_n:
+        _core_error("decision pattern count binding")
     support = _exact_mapping(
         row["support_fraction"], {"numerator", "denominator"}, "support fraction"
     )
-    _nonnegative(support["numerator"], "support numerator")
-    if _nonnegative(support["denominator"], "support denominator") == 0:
-        _core_error("support denominator")
+    numerator = _nonnegative(support["numerator"], "support numerator")
+    denominator = _nonnegative(support["denominator"], "support denominator")
+    if numerator != supporting_n or denominator != eligible_n:
+        _core_error("decision pattern support binding")
     if row["evidence_strength"] not in {"descriptive", "recurring"}:
         _core_error("decision pattern evidence strength")
+    return row
 
 
-def _validate_candidate(value: object, identities: Mapping) -> str:
+def _validate_candidate(value: object, identities: Mapping) -> Mapping:
     row = _exact_mapping(
         value,
         {
@@ -942,7 +976,7 @@ def _validate_candidate(value: object, identities: Mapping) -> str:
         _core_error(f"candidate identity: {error}")
     if row["candidate_id"] != expected_id:
         _core_error("candidate identity mismatch")
-    return row["candidate_id"]
+    return row
 
 
 def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
@@ -1004,30 +1038,78 @@ def _validate_snapshot_core(core: Mapping, adapter: Mapping) -> None:
         _core_error("exclusion ledger order")
     cohort_rows = _array(core["cohorts"], "cohorts")
     cohort_keys = []
+    cohort_order_keys = []
+    cohort_index = {}
     for cohort in cohort_rows:
         _validate_cohort(cohort)
-        cohort_keys.append(canonicalize({
+        cohort_key = canonicalize({
             name: cohort[name] for name in _COHORT_IDENTITY_KEYS
-        }))
+        })
+        cohort_keys.append(cohort_key)
+        cohort_order_keys.append(_cohort_order_key(cohort))
+        cohort_index[cohort_key] = cohort
     if len(cohort_keys) != len(set(cohort_keys)):
         _core_error("duplicate cohort identity")
+    if cohort_order_keys != sorted(cohort_order_keys):
+        _core_error("cohort order")
     pattern_rows = _array(core["decision_patterns"], "decision patterns")
     pattern_keys = []
-    for pattern in pattern_rows:
-        _validate_pattern(pattern)
-        pattern_keys.append(canonicalize([
+    pattern_index = {}
+    for raw_pattern in pattern_rows:
+        pattern = _validate_pattern(raw_pattern)
+        cohort_key = canonicalize(pattern["cohort"])
+        if cohort_key not in cohort_index:
+            _core_error("decision pattern cohort binding")
+        pattern_key = canonicalize([
             pattern["cohort"], pattern["pattern_kind"], pattern["pattern"]
-        ]))
+        ])
+        pattern_keys.append(pattern_key)
+        pattern_index[pattern_key] = pattern
     if pattern_keys != sorted(set(pattern_keys)):
         _core_error("decision pattern order")
-    candidate_ids = [
+    candidate_rows = [
         _validate_candidate(candidate, identities)
         for candidate in _array(core["candidates"], "candidates")
     ]
+    candidate_ids = [candidate["candidate_id"] for candidate in candidate_rows]
     if len(candidate_ids) != len(set(candidate_ids)):
         _core_error("duplicate candidate identity")
     if candidate_ids != sorted(candidate_ids):
         _core_error("candidate order")
+    decision_candidate_counts = {}
+    for candidate in candidate_rows:
+        if candidate["source"]["kind"] != "decision":
+            continue
+        pattern_key = canonicalize([
+            candidate["cohort"],
+            candidate["source"]["identity"],
+            candidate["evidence"]["pattern"],
+        ])
+        pattern = pattern_index.get(pattern_key)
+        if pattern is None or pattern["evidence_strength"] != "recurring":
+            _core_error("decision candidate recurring pattern binding")
+        cohort = cohort_index[canonicalize(candidate["cohort"])]
+        if candidate["evidence"]["counts"] != {
+            "event_count": pattern["event_count"],
+            "episode_count_with_event": pattern["episode_count_with_event"],
+        } or candidate["denominators"] != {
+            "eligible_episode_n": pattern["eligible_episode_n"],
+            "outcome_episode_n": cohort["outcome_episode_n"],
+            "supporting_episode_n": pattern["episode_count_with_event"],
+        }:
+            _core_error("decision candidate evidence binding")
+        decision_candidate_counts[pattern_key] = (
+            decision_candidate_counts.get(pattern_key, 0) + 1
+        )
+    recurring_pattern_keys = {
+        key for key, pattern in pattern_index.items()
+        if pattern["evidence_strength"] == "recurring"
+    }
+    if (
+        set(decision_candidate_counts) != recurring_pattern_keys
+        or any(count != 1 for count in decision_candidate_counts.values())
+    ):
+        _core_error("decision candidate recurring pattern coverage")
 
 
 def read_learning_artifact(
