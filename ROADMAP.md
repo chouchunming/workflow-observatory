@@ -104,7 +104,10 @@ and
 
 - Define `episode-projection@3` with bounded runtime provenance, an explicit
   compatibility policy, and reviewed heterogeneous-runtime analysis before
-  making any cross-runtime exclusion, candidate, or comparison claim.
+  making any cross-runtime exclusion, candidate, or comparison claim. Require
+  separate approval of the Episode producer contract, projection policy, Task
+  3 and Task 6 boundaries, metric and comparability policies, fixtures and
+  acceptance coverage, and mixed v2/v3 behavior.
 - Add reviewed human-readable narrative and annotation artifacts over Learning
   Snapshots only after their independent identity and provenance contract is
   approved.

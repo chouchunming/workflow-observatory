@@ -48,8 +48,9 @@ end in a 15-case non-model acceptance matrix against isolated fake stores.
 
 `episode-projection@2` fixes `runtime_provenance` to JSON null. v0.2 neither
 infers runtime identities nor emits runtime-heterogeneity exclusions or
-candidates; bounded runtime provenance and heterogeneous-runtime analysis are
-deferred to a future `episode-projection@3` contract.
+candidates. Null means runtime unavailable, not a shared runtime, and does not
+split cohorts. Bounded runtime provenance and heterogeneous-runtime analysis
+are deferred to a separately approved `episode-projection@3` contract.
 
 Evolution Proposal artifacts, experiment execution, formal acceptance,
 post-hoc evaluation inputs, and automatic workflow mutation remain deferred.

@@ -3,9 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -279,7 +281,12 @@ class LearningSnapshotTests(unittest.TestCase):
             as_of=as_of,
         )
 
-    def metric_partition(self, v1_absent, v2_null, v2_values):
+    def _mixed_v1_v2_snapshot_input(
+        self,
+        v1_absent: int,
+        v2_null: int,
+        v2_values: list[int],
+    ) -> tuple[SnapshotInput, PolicySet]:
         v1_episodes = [
             self._projection(schema_version=1)
             for _ in range(v1_absent)
@@ -306,8 +313,16 @@ class LearningSnapshotTests(unittest.TestCase):
             )
             for value in v2_values
         )
+        return self._snapshot_input(episodes, policies=policies), policies
+
+    def metric_partition(self, v1_absent, v2_null, v2_values):
+        acquired, policies = self._mixed_v1_v2_snapshot_input(
+            v1_absent,
+            v2_null,
+            v2_values,
+        )
         core = build_snapshot_core(
-            self._snapshot_input(episodes, policies=policies),
+            acquired,
             policies,
         )
         return self._metric(core["cohorts"][0], "test_failures")
@@ -517,7 +532,100 @@ class LearningSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(1, cohort["generation_unavailable_episode_n"])
 
-    def test_null_runtime_is_not_inferred_and_lifecycle_exclusions_are_ledgered(self):
+    def test_episode_projection_v2_runtime_provenance_is_json_null(self):
+        episode = self._projection(schema_version=2)
+
+        self.assertEqual(
+            "episode-projection@2",
+            self.projection["episode_projection"]["version"],
+        )
+        self.assertEqual(2, episode["episode_schema_version"])
+        self.assertIsNone(episode["runtime_provenance"])
+
+    def test_null_runtime_adds_no_runtime_exclusion(self):
+        core = build_snapshot_core(
+            self._snapshot_input([self._projection(), self._projection()]),
+            self.policies,
+        )
+
+        self.assertEqual(
+            [], core["cohorts"][0]["comparative_inference_exclusions"]
+        )
+        self.assertFalse(any(
+            "runtime" in row["reason"] for row in core["exclusion_ledger"]
+        ))
+
+    def test_null_runtime_does_not_split_otherwise_equal_cohort(self):
+        first = self._projection()
+        second = self._projection()
+
+        core = build_snapshot_core(
+            self._snapshot_input([first, second]),
+            self.policies,
+        )
+
+        self.assertIsNone(first["runtime_provenance"])
+        self.assertIsNone(second["runtime_provenance"])
+        self.assertEqual(1, len(core["cohorts"]))
+        self.assertEqual(2, core["cohorts"][0]["outcome_episode_n"])
+
+    def test_runtime_is_not_inferred_from_revision_surface_cli_or_environment(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_MODEL": "environment-runtime",
+                    "OPENAI_MODEL": "other-environment-runtime",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                sys,
+                "argv",
+                ["workflow-observer", "snapshot", "--model", "cli-runtime"],
+            ),
+        ):
+            episode = self._projection(metadata_overrides={
+                "revision": "runtime-looking-revision",
+                "agent_surface": "runtime-looking-agent-surface",
+                "environment_fingerprint": "runtime-looking-fingerprint",
+                "model": "runtime-looking-extra-field",
+            })
+
+        self.assertEqual("runtime-looking-revision", episode["revision"])
+        self.assertEqual(
+            "runtime-looking-agent-surface", episode["agent_surface"]
+        )
+        self.assertIsNone(episode["runtime_provenance"])
+
+    def test_mapped_v1_v2_fixture_preserves_projection_v2_null_runtime_contract(self):
+        acquired, policies = self._mixed_v1_v2_snapshot_input(
+            v1_absent=1,
+            v2_null=1,
+            v2_values=[0],
+        )
+        episodes = acquired.semantic_bundle["episodes"]
+
+        self.assertEqual(
+            [1, 2, 2],
+            [row["episode_schema_version"] for row in episodes],
+        )
+        self.assertTrue(all(
+            row["runtime_provenance"] is None for row in episodes
+        ))
+        self.assertTrue(all(
+            row["workflow_generation"] == {
+                "availability": "observed",
+                "value": _GENERATION,
+            }
+            for row in episodes
+        ))
+
+        core = build_snapshot_core(acquired, policies)
+        self.assertEqual(1, len(core["cohorts"]))
+        self.assertEqual(3, core["cohorts"][0]["outcome_episode_n"])
+
+    def test_lifecycle_exclusions_are_sorted_and_ledgered(self):
         first = self._projection()
         second = self._projection()
         draft = self._projection(status="draft")
@@ -553,10 +661,6 @@ class LearningSnapshotTests(unittest.TestCase):
             "reason": "superseded",
             "excluded_from": "outcome-analysis",
         }, core["exclusion_ledger"])
-        self.assertTrue(all(
-            episode["runtime_provenance"] is None
-            for episode in (first, second, draft, superseded)
-        ))
 
     def test_each_cohort_dimension_splits_independently(self):
         cases = (

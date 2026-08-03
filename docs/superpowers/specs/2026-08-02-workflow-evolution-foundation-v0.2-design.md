@@ -546,11 +546,16 @@ Revision, model/runtime identity, environment fingerprint, and Episode schema
 version remain provenance rather than unbounded metric labels. Unknown
 model/runtime identity remains null and is never inferred. In
 `episode-projection@2`, `runtime_provenance` is exactly JSON null for every
-Episode. v0.2 therefore cannot detect or infer heterogeneous runtime and emits
-no runtime-heterogeneity exclusion or candidate. A future approved
-`episode-projection@3` may add bounded runtime provenance together with its
-compatibility policy and heterogeneous-runtime analysis; those semantics are
-outside v0.2.
+Episode. Null means only that runtime identity is unavailable; it is neither
+evidence that Episodes share one runtime nor evidence that runtimes differ.
+v0.2 does not infer runtime from revision, `agent_surface`, CLI arguments,
+environment state, or other fields, and runtime does not split cohorts. It
+therefore emits no runtime-heterogeneity exclusion or candidate. A future
+`episode-projection@3` requires separate approval of the Episode producer
+contract, projection policy, Task 3 and Task 6 boundaries, metric and
+comparability policies, fixtures and acceptance coverage, and mixed v2/v3
+behavior before it may add bounded runtime provenance or heterogeneous-runtime
+analysis. Those semantics are outside v0.2.
 
 ### Outcome analysis and lifecycle health
 
@@ -842,8 +847,10 @@ creation remains outside the bounded foundation implementation plan.
 
 ## Resolved Section 3 questions
 
-- Model/runtime identity is optional and never inferred. Known incompatible or
-  ungoverned heterogeneity forces descriptive-only output.
+- Under `episode-projection@2`, model/runtime identity is always null and
+  unavailable, and it is never inferred. Null supports no same-runtime or
+  heterogeneous-runtime conclusion, exclusion, cohort split, or gate in v0.2;
+  any such behavior requires a separately approved `episode-projection@3`.
 - Workflow generation is explicit under the Section 2 amendment; Git revision
   is provenance only.
 - Confidence intervals are excluded from v0.2.

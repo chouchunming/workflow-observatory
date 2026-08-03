@@ -6,8 +6,13 @@ underlying design remains approved.
 
 Task 7 review amendment: Option A was approved on 2026-08-03. The v0.2
 projection remains `episode-projection@2` with exactly null
-`runtime_provenance`; bounded runtime identity and heterogeneous-runtime
-analysis are deferred to a future `episode-projection@3` plan.
+`runtime_provenance`. Null means runtime identity is unavailable, not that
+Episodes share a runtime. No runtime identity is inferred from revision,
+`agent_surface`, CLI arguments, environment state, or other fields. Bounded
+runtime identity and heterogeneous-runtime analysis require a separately
+approved `episode-projection@3` plan covering the Episode producer contract,
+projection policy, Task 3 and Task 6 boundaries, metric and comparability
+policies, fixtures and acceptance coverage, and mixed v2/v3 behavior.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` (recommended) or `executing-plans` to implement
@@ -1907,8 +1912,11 @@ legacy Episodes remain eligible for separately labeled descriptive outcome
 counts but are excluded from comparative inference. Under
 `episode-projection@2`, `runtime_provenance` must be JSON null. Task 7 neither
 infers runtime identities nor emits a runtime-heterogeneity exclusion or
-candidate; bounded runtime provenance and its analysis require a future
-`episode-projection@3` amendment.
+candidate. Null does not split a cohort and supplies no common-runtime or
+heterogeneous-runtime conclusion. Bounded runtime provenance and its analysis
+require the separately approved `episode-projection@3` contract, policy,
+upstream-task, metric/comparability, fixture/acceptance, and mixed-version
+changes named in the Task 7 review amendment.
 
 - [ ] **Step 4: Implement metric eligibility and exact rational quartiles**
 
