@@ -83,7 +83,6 @@ class LearningSnapshotTests(unittest.TestCase):
         completion_metrics: dict[str, object] | None = None,
         supplement_execution: dict[str, object] | None = None,
         supplement_quality: dict[str, object] | None = None,
-        runtime_generation: str | None = None,
     ) -> dict:
         run_id = self._run_id()
         completion = {
@@ -146,7 +145,6 @@ class LearningSnapshotTests(unittest.TestCase):
                 "availability": "observed",
                 "value": generation,
             }
-        projected["runtime_provenance"] = runtime_generation
         projected["source_sha256"] = hashlib.sha256(
             canonicalize(projected)
         ).hexdigest()
@@ -175,14 +173,15 @@ class LearningSnapshotTests(unittest.TestCase):
             "query": {
                 "interval": {
                     "basis": "started_at",
-                    "since_inclusive": "2026-08-01T16:00:00Z",
+                    "since_inclusive": "2026-07-31T16:00:00Z",
                     "until_exclusive": "2026-08-02T16:00:00Z",
                     "requested_timezone": "Asia/Taipei",
                     "requested_dates": {
-                        "since": "2026-08-02",
+                        "since": "2026-08-01",
                         "until_inclusive": "2026-08-02",
                     },
                 },
+                "lifecycle_as_of": as_of,
                 "project": None,
                 "workspace": None,
                 "workspace_id": None,
@@ -210,7 +209,7 @@ class LearningSnapshotTests(unittest.TestCase):
             "reference_manifest": [
                 {
                     "kind": "task",
-                    "identity": "fixture-task",
+                    "identity": "[[fixture-task]]",
                     "sha256": "a" * 64,
                 }
             ],
@@ -284,6 +283,11 @@ class LearningSnapshotTests(unittest.TestCase):
     def metric_output(self, name, values):
         episodes = []
         for value in values:
+            status = (
+                "failed"
+                if name == "verification" and value == "fail"
+                else "success"
+            )
             completion = {name: value} if name in {
                 "verification",
                 "review_rounds",
@@ -300,6 +304,7 @@ class LearningSnapshotTests(unittest.TestCase):
                 "cache_read_tokens",
             } else None
             episodes.append(self._projection(
+                status=status,
                 completion_metrics=completion,
                 supplement_execution=execution,
                 supplement_quality=quality,
@@ -437,7 +442,10 @@ class LearningSnapshotTests(unittest.TestCase):
     def test_input_manifest_preserves_validated_reference_identity_bound(self):
         acquired = self.bundle(outcomes=["success"])
         bundle = deepcopy(acquired.semantic_bundle)
-        bundle["reference_manifest"][0]["identity"] = "r" * 201
+        bundle["reference_manifest"][0].update({
+            "kind": "source",
+            "identity": "raw/" + "r" * 197,
+        })
         del bundle["input_manifest_sha256"]
         bundle["input_manifest_sha256"] = hash_canonical(
             _INPUT_MANIFEST_DOMAIN, bundle
@@ -451,7 +459,7 @@ class LearningSnapshotTests(unittest.TestCase):
         core = build_snapshot_core(rebuilt, self.policies)
 
         self.assertEqual(
-            "r" * 201,
+            "raw/" + "r" * 197,
             core["input_manifest"]["reference_manifest"][0]["identity"],
         )
 
@@ -477,9 +485,9 @@ class LearningSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(1, cohort["generation_unavailable_episode_n"])
 
-    def test_heterogeneous_runtime_and_lifecycle_exclusions_are_ledgered(self):
-        first = self._projection(runtime_generation="runtime@1")
-        second = self._projection(runtime_generation="runtime@2")
+    def test_unknown_runtime_is_not_inferred_and_lifecycle_exclusions_are_ledgered(self):
+        first = self._projection()
+        second = self._projection()
         draft = self._projection(status="draft")
         superseded = self._projection(status="superseded")
         core = build_snapshot_core(
@@ -490,11 +498,8 @@ class LearningSnapshotTests(unittest.TestCase):
             self.policies,
         )
         cohort = core["cohorts"][0]
-        self.assertFalse(cohort["comparative_inference_eligible"])
-        self.assertEqual(
-            ["heterogeneous-runtime-provenance"],
-            cohort["comparative_inference_exclusions"],
-        )
+        self.assertTrue(cohort["comparative_inference_eligible"])
+        self.assertEqual([], cohort["comparative_inference_exclusions"])
         self.assertEqual("descriptive", cohort["evidence_strength"])
         self.assertEqual(
             sorted(
@@ -516,12 +521,10 @@ class LearningSnapshotTests(unittest.TestCase):
             "reason": "superseded",
             "excluded_from": "outcome-analysis",
         }, core["exclusion_ledger"])
-        for episode in (first, second):
-            self.assertIn({
-                "run_id": episode["run_id"],
-                "reason": "heterogeneous-runtime-provenance",
-                "excluded_from": "comparative-inference",
-            }, core["exclusion_ledger"])
+        self.assertFalse(any(
+            row["reason"] == "heterogeneous-runtime-provenance"
+            for row in core["exclusion_ledger"]
+        ))
 
     def test_five_comparable_outcomes_are_recurring_strength(self):
         core = build_snapshot_core(
