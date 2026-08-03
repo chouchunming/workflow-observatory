@@ -22,10 +22,12 @@ else:
     MARKETPLACE_ROOT = REPOSITORY_ROOT / "marketplace/workflow-observatory"
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
+import package_workflow_observatory as packager
 from package_workflow_observatory import (
     PackageError,
     build_archive,
     default_evidence,
+    main,
     verify_archive,
 )
 
@@ -66,6 +68,29 @@ class ArchiveTests(unittest.TestCase):
             return json.loads(
                 bundle.read("workflow-observatory/SHA256SUMS.json")
             )
+
+    def _assert_live_v02_inventory(self, archive):
+        inventory = self._inventory(archive)
+        marketplace = inventory["marketplace_files"]
+        repository_evidence = inventory["repository_evidence"]
+        expected_policies = {
+            path.relative_to(MARKETPLACE_ROOT).as_posix()
+            for path in (
+                MARKETPLACE_ROOT / "plugins/workflow-observer/policies"
+            ).glob("*.json")
+        }
+        expected = {
+            *expected_policies,
+            "plugins/workflow-observer/tests/fixtures/"
+            "jcs_conformance_vectors.json",
+            "docs/superpowers/specs/"
+            "2026-08-02-workflow-evolution-foundation-v0.2-design.md",
+            "docs/superpowers/plans/"
+            "2026-08-02-workflow-evolution-foundation-v0.2.md",
+        }
+        self.assertTrue(expected_policies)
+        self.assertLessEqual(expected, set(marketplace))
+        self.assertTrue(expected.isdisjoint(repository_evidence))
 
     def test_archive_contains_marketplace_and_repository_evidence(self):
         digest = build_archive(self.source, self.archive, self.evidence)
@@ -164,28 +189,56 @@ class ArchiveTests(unittest.TestCase):
 
     def test_source_archive_inventory_closes_v02_policies_and_approved_docs(self):
         build_archive(self.source, self.archive, self.evidence)
-        inventory = self._inventory()["marketplace_files"]
-        expected_policies = {
-            path.relative_to(MARKETPLACE_ROOT).as_posix()
-            for path in (
-                MARKETPLACE_ROOT / "plugins/workflow-observer/policies"
-            ).glob("*.json")
-        }
-        self.assertTrue(expected_policies)
-        self.assertLessEqual(expected_policies, set(inventory))
-        self.assertIn(
-            "plugins/workflow-observer/tests/fixtures/"
-            "jcs_conformance_vectors.json",
-            inventory,
-        )
-        for approved_document in (
-            "docs/superpowers/specs/"
-            "2026-08-02-workflow-evolution-foundation-v0.2-design.md",
-            "docs/superpowers/plans/"
-            "2026-08-02-workflow-evolution-foundation-v0.2.md",
-        ):
-            with self.subTest(approved_document=approved_document):
-                self.assertIn(approved_document, inventory)
+        self._assert_live_v02_inventory(self.archive)
+
+    def test_public_main_builds_from_live_v02_source_inventory(self):
+        destination = self.root / "public-main.zip"
+        real_build_archive = build_archive
+
+        def redirect_destination(source_root, _destination, evidence):
+            return real_build_archive(source_root, destination, evidence)
+
+        with mock.patch(
+            "package_workflow_observatory.build_archive",
+            side_effect=redirect_destination,
+        ), mock.patch("builtins.print") as output:
+            self.assertEqual(0, main(["--version", "review-test"]))
+        output.assert_called_once()
+
+        self._assert_live_v02_inventory(destination)
+
+    def test_live_staging_excludes_only_development_roots(self):
+        excluded = {".git", ".codegraph", ".superpowers", "evidence", "dist"}
+        for name in excluded:
+            path = self.source / name
+            path.mkdir(exist_ok=True)
+            (path / "private-state").write_text("not packaged\n", encoding="utf-8")
+        unexpected = self.source / "secret.env"
+        unexpected.write_text("TOKEN=secret\n", encoding="utf-8")
+
+        staging_parent = self.root / "staging-parent"
+        staging_parent.mkdir()
+        staged = packager._stage_live_marketplace(self.source, staging_parent)
+
+        for name in excluded:
+            with self.subTest(name=name):
+                self.assertFalse((staged / name).exists())
+        self.assertTrue((staged / "secret.env").is_file())
+        with self.assertRaisesRegex(PackageError, "unexpected marketplace file"):
+            build_archive(staged, self.archive, self.evidence)
+
+    def test_live_staging_preserves_symlinks_for_packager_rejection(self):
+        outside = self.root / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        (self.source / "linked").symlink_to(outside)
+        staging_parent = self.root / "symlink-staging-parent"
+        staging_parent.mkdir()
+
+        staged = packager._stage_live_marketplace(self.source, staging_parent)
+
+        self.assertTrue((staged / "linked").is_symlink())
+        with self.assertRaisesRegex(PackageError, "symlink"):
+            build_archive(staged, self.archive, self.evidence)
 
     def test_policy_allowlist_rejects_non_json_and_nested_files(self):
         policies = self.source / "plugins/workflow-observer/policies"

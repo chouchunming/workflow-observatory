@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import tempfile
 from typing import Iterable, Sequence
@@ -16,12 +17,19 @@ import zipfile
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-_REPOSITORY_MARKETPLACE = REPOSITORY_ROOT / "marketplace/workflow-observatory"
-_EXTRACTED_MARKETPLACE = REPOSITORY_ROOT.parent
+_LIVE_MARKETPLACE_ROOT = REPOSITORY_ROOT.parent
+_LIVE_MARKETPLACE_MANIFEST = (
+    _LIVE_MARKETPLACE_ROOT / ".agents/plugins/marketplace.json"
+)
+_FROZEN_MARKETPLACE_ROOT = REPOSITORY_ROOT / "marketplace/workflow-observatory"
 MARKETPLACE_ROOT = (
-    _REPOSITORY_MARKETPLACE
-    if _REPOSITORY_MARKETPLACE.is_dir()
-    else _EXTRACTED_MARKETPLACE
+    _LIVE_MARKETPLACE_ROOT
+    if _LIVE_MARKETPLACE_MANIFEST.is_file()
+    or _LIVE_MARKETPLACE_MANIFEST.is_symlink()
+    else _FROZEN_MARKETPLACE_ROOT
+)
+_LIVE_STAGING_EXCLUSIONS = frozenset(
+    {".git", ".codegraph", ".superpowers", "dist", "evidence"}
 )
 ARCHIVE_ROOT = "workflow-observatory"
 INVENTORY_MEMBER = f"{ARCHIVE_ROOT}/SHA256SUMS.json"
@@ -143,6 +151,34 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
     if nested.startswith("docs/"):
         return nested.endswith(".md")
     return False
+
+
+def _stage_live_marketplace(source_root: Path, staging_parent: Path) -> Path:
+    source_root = Path(source_root).absolute()
+    staging_parent = Path(staging_parent).absolute()
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise PackageError(
+            f"live marketplace root must be a real directory: {source_root}"
+        )
+    destination = staging_parent / "marketplace"
+    if destination.exists() or destination.is_symlink():
+        raise PackageError(f"live marketplace staging path exists: {destination}")
+
+    def ignore_development_roots(directory: str, names: list[str]) -> list[str]:
+        if Path(directory).absolute() != source_root:
+            return []
+        return sorted(_LIVE_STAGING_EXCLUSIONS.intersection(names))
+
+    try:
+        shutil.copytree(
+            source_root,
+            destination,
+            symlinks=True,
+            ignore=ignore_development_roots,
+        )
+    except OSError as error:
+        raise PackageError(f"could not stage live marketplace: {error}") from error
+    return destination
 
 
 def _assert_regular_no_symlink(path: Path, root: Path, label: str) -> None:
@@ -615,6 +651,17 @@ def build_archive(
         temporary.unlink(missing_ok=True)
 
 
+def _build_default_archive(destination: Path) -> str:
+    evidence = default_evidence(REPOSITORY_ROOT)
+    if MARKETPLACE_ROOT != _LIVE_MARKETPLACE_ROOT:
+        return build_archive(MARKETPLACE_ROOT, destination, evidence)
+    with tempfile.TemporaryDirectory(
+        prefix="workflow-observatory-marketplace-stage-"
+    ) as temporary:
+        staged = _stage_live_marketplace(MARKETPLACE_ROOT, Path(temporary))
+        return build_archive(staged, destination, evidence)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version")
@@ -630,11 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         / "dist"
         / f"workflow-observatory-{arguments.version}.zip"
     )
-    digest = build_archive(
-        MARKETPLACE_ROOT,
-        destination,
-        default_evidence(REPOSITORY_ROOT),
-    )
+    digest = _build_default_archive(destination)
     print(f"{digest}  {destination.relative_to(REPOSITORY_ROOT)}")
     return 0
 
