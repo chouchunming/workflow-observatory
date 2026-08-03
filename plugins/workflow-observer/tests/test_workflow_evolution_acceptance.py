@@ -48,7 +48,6 @@ from snapshot_store import (
     SnapshotPublicationError,
     create_learning_snapshot,
     read_learning_artifact,
-    validate_learning_artifact,
     validate_learning_artifact_bytes,
 )
 from store_config import LLMWIKI_SEMANTICS, PORTABLE_SEMANTICS, StoreConfig
@@ -582,6 +581,13 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         missing_core = build_snapshot_core(
             self._snapshot_input([zero_observed]), self.policies
         )
+        input_tokens = self._metric(missing_core, "input_tokens")
+        output_tokens = self._metric(missing_core, "output_tokens")
+        self.assertEqual(
+            input_tokens["missingness"], output_tokens["missingness"]
+        )
+        self.assertEqual(0, input_tokens["missingness"]["observed_n"])
+        self.assertEqual(0, output_tokens["missingness"]["observed_n"])
         candidates = [
             candidate for candidate in missing_core["candidates"]
             if candidate["source"]["kind"] == "metric"
@@ -593,7 +599,31 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             {"input_tokens", "output_tokens"},
             {candidate["source"]["identity"] for candidate in candidates},
         )
+        self.assertEqual(2, len(candidates))
         self.assertEqual(2, len({row["candidate_id"] for row in candidates}))
+        candidate_by_metric = {
+            candidate["source"]["identity"]: candidate
+            for candidate in candidates
+        }
+        input_candidate_missingness = (
+            candidate_by_metric["input_tokens"]["evidence"]["missingness"]
+        )
+        output_candidate_missingness = (
+            candidate_by_metric["output_tokens"]["evidence"]["missingness"]
+        )
+        self.assertEqual(
+            input_candidate_missingness, output_candidate_missingness
+        )
+        self.assertEqual(0, input_candidate_missingness["observed_n"])
+        self.assertEqual(0, output_candidate_missingness["observed_n"])
+        self.assertEqual(
+            input_tokens["missingness"],
+            input_candidate_missingness,
+        )
+        self.assertEqual(
+            output_tokens["missingness"],
+            output_candidate_missingness,
+        )
 
     def test_06_lifecycle_records_do_not_enter_outcome_denominator(self):
         outcomes = [
@@ -726,6 +756,13 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         self.assertEqual(
             run_id, acquired.semantic_bundle["episodes"][0]["run_id"]
         )
+        self.assertEqual(
+            {
+                "availability": "observed",
+                "value": "implementation-with-review@1",
+            },
+            acquired.semantic_bundle["episodes"][0]["workflow_generation"],
+        )
 
     def test_09_gate_failure_produces_no_snapshot_or_proposal(self):
         self.store.v2_path.unlink()
@@ -769,13 +806,22 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         for field in ("narrative", "annotation", "summary_markdown"):
             with self.subTest(field=field):
                 tampered = {**artifact, field: "unsupported text"}
-                with self.assertRaises(SnapshotPublicationError):
-                    validate_learning_artifact(tampered)
+                tampered.pop("artifact_sha256")
+                tampered["artifact_sha256"] = hashlib.sha256(
+                    canonicalize(tampered)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    SnapshotPublicationError,
+                    "learning snapshot artifact has wrong fields",
+                ):
+                    validate_learning_artifact_bytes(canonicalize(tampered))
 
-        annotation_dir = self.home / "learning" / "annotations"
         self.assertEqual(
             [],
-            list(annotation_dir.iterdir()) if annotation_dir.exists() else [],
+            [
+                path for path in self.home.rglob("*")
+                if "annotation" in path.name.lower()
+            ],
         )
 
     def test_12_no_approval_causes_no_external_mutation(self):
