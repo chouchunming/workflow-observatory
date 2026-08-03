@@ -799,6 +799,7 @@ class SnapshotInputTests(unittest.TestCase):
         self.assertEqual(
             (
                 "scripts/episode_schema.py",
+                "scripts/learning_snapshot.py",
                 "scripts/policy_artifacts.py",
                 "scripts/snapshot_input.py",
                 "scripts/store_config.py",

@@ -52,6 +52,7 @@ _STORE_IDENTITY_DOMAIN = b"workflow-observatory:store-identity:v1\0"
 _ADAPTER_IMPLEMENTATION_VERSION = "workflow-observer-snapshot-adapter@1"
 SNAPSHOT_ANALYZER_FILES = (
     "scripts/episode_schema.py",
+    "scripts/learning_snapshot.py",
     "scripts/policy_artifacts.py",
     "scripts/snapshot_input.py",
     "scripts/store_config.py",
