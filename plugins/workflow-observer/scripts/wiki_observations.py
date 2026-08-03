@@ -21,7 +21,11 @@ import sys
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from policy_artifacts import PolicyError, read_regular_file_evidence
+from policy_artifacts import (
+    PolicyError,
+    read_regular_file_evidence,
+    validate_relative_posix_artifact_path,
+)
 from store_config import AdapterSemantics, PORTABLE_SEMANTICS
 
 if TYPE_CHECKING:
@@ -217,9 +221,16 @@ class RecordDocument:
 
 
 @dataclass(frozen=True)
+class StoreRootEvidence:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class ObservationCollection:
     records: tuple[RecordDocument, ...]
     invalidations: tuple[InvalidationEvidence, ...]
+    root_evidence: StoreRootEvidence | None = None
 
     @property
     def invalidated(self) -> frozenset[str]:
@@ -235,12 +246,32 @@ class ObservationCollection:
 
 class ReferenceResolver:
     def __init__(
-        self, paths: ObservationPaths, semantics: AdapterSemantics
+        self,
+        paths: ObservationPaths,
+        semantics: AdapterSemantics,
+        *,
+        root_fd: int | None = None,
     ) -> None:
         if not isinstance(semantics, AdapterSemantics):
             raise _validation("adapter semantics have the wrong type")
-        self.paths = _canonical_observation_paths(paths)
+        if root_fd is None:
+            self.paths = _canonical_observation_paths(paths)
+        else:
+            if not isinstance(paths, ObservationPaths):
+                raise _validation("observation paths have the wrong type")
+            if type(root_fd) is not int or root_fd < 0:
+                raise _validation("store root descriptor is invalid")
+            try:
+                root_metadata = os.fstat(root_fd)
+            except OSError as error:
+                raise ObservationError(
+                    "io", f"could not inspect store root descriptor: {error}"
+                ) from error
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise _validation("store root descriptor must name a directory")
+            self.paths = paths
         self.semantics = semantics
+        self._root_fd = root_fd
         self._references: dict[tuple[str, str], ReferenceEvidence] = {}
 
     @property
@@ -267,17 +298,27 @@ class ReferenceResolver:
         if existing is not None:
             return existing, None
         try:
-            opened = read_regular_file_evidence(
-                self.paths.root,
-                relative.as_posix(),
-                max_bytes=_REFERENCE_LIMIT,
-            )
-        except PolicyError as error:
+            if self._root_fd is None:
+                opened = read_regular_file_evidence(
+                    self.paths.root,
+                    relative.as_posix(),
+                    max_bytes=_REFERENCE_LIMIT,
+                )
+                content = opened.content
+                source_sha256 = opened.sha256
+            else:
+                content = _read_root_relative_regular_file(
+                    self._root_fd,
+                    relative,
+                    f"{kind} reference {identity}",
+                )
+                source_sha256 = hashlib.sha256(content).hexdigest()
+        except (PolicyError, ObservationError) as error:
             if self._missing_cause(error):
                 raise FileNotFoundError(relative.as_posix()) from error
             raise _validation("reference target must be a stable regular file") from error
-        evidence = ReferenceEvidence(kind, identity, opened.sha256)
-        return evidence, opened.content
+        evidence = ReferenceEvidence(kind, identity, source_sha256)
+        return evidence, content
 
     def _remember(self, evidence: ReferenceEvidence) -> ReferenceEvidence:
         self._references[(evidence.kind, evidence.identity)] = evidence
@@ -2295,6 +2336,48 @@ def _read_report_regular_file(
             _close_preserving_error(descriptor)
 
 
+def _read_root_relative_regular_file(
+    root_fd: int,
+    relative: PurePosixPath,
+    label: str,
+) -> bytes:
+    normalized = validate_relative_posix_artifact_path(relative.as_posix())
+    components = normalized.split("/")
+    try:
+        current_fd = os.dup(root_fd)
+    except OSError as error:
+        raise ObservationError(
+            "io", f"could not duplicate store root descriptor: {error}"
+        ) from error
+    try:
+        for component in components[:-1]:
+            entry = _report_entry_stat(
+                current_fd,
+                component,
+                f"{label} directory component {component}",
+            )
+            next_fd = _open_report_child_directory(
+                current_fd,
+                component,
+                f"{label} directory component {component}",
+                missing_ok=False,
+                expected=entry,
+            )
+            assert next_fd is not None
+            _close_preserving_error(current_fd)
+            current_fd = next_fd
+        final_component = components[-1]
+        entry = _report_entry_stat(current_fd, final_component, label)
+        return _read_report_regular_file(
+            current_fd,
+            final_component,
+            entry,
+            label,
+        )
+    finally:
+        _close_preserving_error(current_fd)
+
+
 def _metrics_from_record(body: str, status: object) -> dict[str, object]:
     if status == "draft":
         return {}
@@ -2392,6 +2475,17 @@ def collect_record_documents(
     if type(strict_layout) is not bool:
         raise _validation("strict layout mode must be a boolean")
     root_fd = _open_report_root(secure_paths.root)
+    try:
+        root_metadata = os.fstat(root_fd)
+    except OSError as error:
+        _close_preserving_error(root_fd)
+        raise ObservationError(
+            "io", f"could not inspect held store root: {error}"
+        ) from error
+    root_evidence = StoreRootEvidence(
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+    )
     wiki_fd: int | None = None
     observations_fd: int | None = None
     locks_fd: int | None = None
@@ -2403,7 +2497,7 @@ def collect_record_documents(
             root_fd, "wiki", "wiki directory", missing_ok=True
         )
         if wiki_fd is None:
-            return ObservationCollection((), ())
+            return ObservationCollection((), (), root_evidence)
         observations_fd = _open_report_child_directory(
             wiki_fd,
             "observations",
@@ -2411,7 +2505,7 @@ def collect_record_documents(
             missing_ok=True,
         )
         if observations_fd is None:
-            return ObservationCollection((), ())
+            return ObservationCollection((), (), root_evidence)
 
         locks_entry = None
         invalidations_entry = None
@@ -2455,7 +2549,11 @@ def collect_record_documents(
             metadata, body = _parse_frontmatter(content)
             if metadata.get("run_id") != run_id:
                 raise _validation("record run_id does not match filename")
-            resolver = ReferenceResolver(secure_paths, semantics)
+            resolver = ReferenceResolver(
+                secure_paths,
+                semantics,
+                root_fd=root_fd,
+            )
             validation_errors = validate_record(
                 metadata,
                 body,
@@ -2507,7 +2605,11 @@ def collect_record_documents(
                 if stat.S_IMODE(entry.st_mode) & 0o077:
                     raise _validation(f"unsafe lock permissions: {name}")
         if invalidations_entry is None:
-            return ObservationCollection(tuple(documents), ())
+            return ObservationCollection(
+                tuple(documents),
+                (),
+                root_evidence,
+            )
         invalidations_fd = _open_report_child_directory(
             observations_fd,
             "invalidations",
@@ -2544,6 +2646,7 @@ def collect_record_documents(
         return ObservationCollection(
             tuple(documents),
             tuple(invalidations),
+            root_evidence,
         )
     finally:
         for descriptor in (

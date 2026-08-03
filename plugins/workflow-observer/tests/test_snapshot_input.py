@@ -6,6 +6,7 @@ from dataclasses import fields
 from datetime import date
 import hashlib
 import io
+import os
 from pathlib import Path
 import re
 import sys
@@ -22,6 +23,7 @@ from canonical_json import canonicalize, hash_canonical
 from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
+    SnapshotInput,
     SnapshotInputError,
     SnapshotQuery,
     acquire_snapshot_input,
@@ -155,6 +157,66 @@ class SnapshotInputTests(unittest.TestCase):
         self.store.v1_path.write_bytes(content)
         self.store.v1_path.chmod(0o600)
 
+    def _write_referenced_evidence(self, store, marker):
+        task_bytes = (
+            "---\n"
+            "type: task\n"
+            "id: fixture-task\n"
+            "title: Fixture task\n"
+            "status: pending\n"
+            "tags: [\"workflow\"]\n"
+            "timestamp: 2026-08-02\n"
+            "sources: []\n"
+            "---\n"
+            f"# {marker}\n"
+        ).encode("utf-8")
+        store._write_private(store.task_path, task_bytes)
+        source = store.store_root / "raw/root-swap.md"
+        source.parent.mkdir()
+        source_bytes = (marker + "\n").encode("utf-8")
+        store._write_private(source, source_bytes)
+        record_bytes = store.v1_path.read_bytes().replace(
+            b"sources: []\n---\n",
+            b'task_ref: "[[fixture-task]]"\n'
+            b'sources: ["raw/root-swap.md"]\n---\n',
+            1,
+        )
+        store._write_private(store.v1_path, record_bytes)
+        return task_bytes, source_bytes
+
+    def _write_supersession_and_invalidation(self, store, marker):
+        target_run_id = "obs-20260802-000001-fedcba"
+        target_bytes = store.expected_raw_bytes["v2"].replace(
+            b'title: "Workflow evolution fixture"\n',
+            f'title: "Workflow evolution {marker}"\n'.encode("utf-8"),
+            1,
+        )
+        store._write_private(store.v2_path, target_bytes)
+        superseded_bytes = store.v1_path.read_bytes().replace(
+            b'status: "success"\n',
+            b'status: "superseded"\n'
+            + f'superseded_by: "{target_run_id}"\n'.encode("ascii"),
+            1,
+        )
+        store._write_private(store.v1_path, superseded_bytes)
+        run_id = "obs-20260802-000000-abcdef"
+        tombstone_bytes = (
+            "---\n"
+            "type: observation-invalidation\n"
+            f"title: Invalidate {run_id}\n"
+            'tags: ["observation","invalidation"]\n'
+            "timestamp: 2026-08-02T09:00:00Z\n"
+            f"target_run_id: {run_id}\n"
+            f"reason: duplicate observation in {marker}\n"
+            "sources: []\n"
+            "---\n"
+        ).encode("utf-8")
+        store._write_private(
+            store.invalidations / f"{run_id}.md",
+            tombstone_bytes,
+        )
+        return target_bytes, tombstone_bytes
+
     def _draft_document_at(
         self,
         document,
@@ -189,6 +251,239 @@ class SnapshotInputTests(unittest.TestCase):
             ),
             tuple(field.name for field in fields(SnapshotQuery)),
         )
+
+    def test_snapshot_query_defensively_copies_nested_interval(self):
+        interval = deepcopy(self.query.interval)
+        expected = deepcopy(interval)
+
+        query = SnapshotQuery(
+            interval=interval,
+            lifecycle_as_of=interval["until_exclusive"],
+            project=None,
+            workspace=None,
+            workspace_id=None,
+            task_type=None,
+        )
+        interval["requested_dates"]["since"] = "1999-01-01"
+        exposed = query.interval
+        exposed["requested_dates"]["until_inclusive"] = "2099-01-01"
+
+        self.assertEqual(expected, query.interval)
+
+    def test_snapshot_input_defensively_copies_constructor_inputs(self):
+        acquired = self.acquire()
+        adapter = acquired.adapter
+        semantic_bundle = acquired.semantic_bundle
+
+        rebuilt = SnapshotInput(
+            adapter,
+            acquired.store_identity,
+            semantic_bundle,
+        )
+        expected_bytes = rebuilt.manifest_bytes
+        adapter["name"] = "mutated-adapter"
+        semantic_bundle["episodes"].clear()
+
+        self.assertEqual(expected_bytes, rebuilt.manifest_bytes)
+        self.assertEqual("portable", rebuilt.adapter["name"])
+        self.assertEqual(1, len(rebuilt.semantic_bundle["episodes"]))
+
+    def test_snapshot_input_properties_return_defensive_nested_copies(self):
+        acquired = self.acquire()
+        expected_bytes = acquired.manifest_bytes
+        adapter = acquired.adapter
+        semantic_bundle = acquired.semantic_bundle
+
+        adapter["name"] = "mutated-adapter"
+        semantic_bundle["query"]["interval"]["requested_dates"][
+            "since"
+        ] = "1999-01-01"
+        semantic_bundle["episodes"].clear()
+
+        self.assertEqual(expected_bytes, acquired.manifest_bytes)
+        self.assertEqual("portable", acquired.adapter["name"])
+        self.assertEqual("2026-08-02", acquired.semantic_bundle["query"]
+                         ["interval"]["requested_dates"]["since"])
+        self.assertEqual(1, len(acquired.semantic_bundle["episodes"]))
+
+    def test_snapshot_input_rejects_stale_manifest_digest(self):
+        acquired = self.acquire()
+        semantic_bundle = acquired.semantic_bundle
+        semantic_bundle["input_manifest_sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(SnapshotInputError, "manifest digest"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                semantic_bundle,
+            )
+
+    def test_snapshot_input_rejects_rehashed_non_exact_shapes(self):
+        acquired = self.acquire()
+        semantic_bundle = acquired.semantic_bundle
+        semantic_bundle["future"] = True
+        previous_digest = semantic_bundle.pop("input_manifest_sha256")
+        self.assertRegex(previous_digest, r"^[0-9a-f]{64}$")
+        semantic_bundle["input_manifest_sha256"] = hash_canonical(
+            b"workflow-observatory:snapshot-input-manifest:v1\0",
+            semantic_bundle,
+        )
+
+        malformed_values = (
+            (acquired.adapter, semantic_bundle),
+            ({**acquired.adapter, "future": "value"}, acquired.semantic_bundle),
+        )
+        for adapter, bundle in malformed_values:
+            with self.subTest(keys=(set(adapter), set(bundle))):
+                with self.assertRaisesRegex(SnapshotInputError, "exact fields"):
+                    SnapshotInput(adapter, acquired.store_identity, bundle)
+
+    def test_snapshot_input_rejects_rehashed_nested_corruption(self):
+        acquired = self.acquire()
+
+        def rehashed(mutate):
+            bundle = acquired.semantic_bundle
+            bundle.pop("input_manifest_sha256")
+            mutate(bundle)
+            bundle["input_manifest_sha256"] = hash_canonical(
+                b"workflow-observatory:snapshot-input-manifest:v1\0",
+                bundle,
+            )
+            return bundle
+
+        mutations = {
+            "invalid-status": lambda bundle: bundle["episodes"][0].__setitem__(
+                "status", "definitely-invalid"
+            ),
+            "success-with-failed-verification": lambda bundle: bundle[
+                "episodes"
+            ][0]["metrics"]["verification"].__setitem__("value", "fail"),
+            "unhashable-working-tree": lambda bundle: bundle["episodes"][
+                0
+            ].__setitem__("working_tree", {}),
+            "unhashable-verification": lambda bundle: bundle["episodes"][0][
+                "metrics"
+            ]["verification"].__setitem__("value", {}),
+            "metric-shape": lambda bundle: bundle["episodes"][0]["metrics"][
+                "elapsed_seconds"
+            ].__setitem__("future", True),
+            "generation-value": lambda bundle: bundle["episodes"][0][
+                "workflow_generation"
+            ].__setitem__("value", "unavailable"),
+            "v1-decisions": lambda bundle: bundle["episodes"][0][
+                "decisions"
+            ].append({}),
+            "capability-row": lambda bundle: bundle["schema_capabilities"]["1"][
+                "metrics"
+            ].__setitem__("future", False),
+            "policy-version": lambda bundle: bundle["policy_set"][
+                "canonical_projection_contract"
+            ].__setitem__("version", "future@9"),
+            "duplicate-episode": lambda bundle: (
+                bundle["episodes"].append(deepcopy(bundle["episodes"][0])),
+                bundle["record_counts"].update({
+                    "selected_episode_n": 2,
+                    "final_episode_n": 2,
+                }),
+            ),
+            "unknown-invalidation": lambda bundle: (
+                bundle["invalidations"].append({
+                    "run_id": "obs-20260802-000009-eeeeee",
+                    "source_sha256": "e" * 64,
+                    "timestamp": "2026-08-02T09:00:00Z",
+                }),
+                bundle["record_counts"].update({
+                    "selected_invalidation_n": 1,
+                }),
+            ),
+            "unknown-reference-kind": lambda bundle: bundle[
+                "reference_manifest"
+            ].append({
+                "kind": "future",
+                "identity": "opaque",
+                "sha256": "f" * 64,
+            }),
+            "draft-invalidation": lambda bundle: (
+                bundle["episodes"][0].update({
+                    "status": "draft",
+                    "finished_at": None,
+                    "metrics": {
+                        name: (
+                            {
+                                "availability": "not_recorded",
+                                "value": None,
+                                "unit": None,
+                            }
+                            if metric["availability"]
+                            != "unsupported_by_schema"
+                            else metric
+                        )
+                        for name, metric
+                        in bundle["episodes"][0]["metrics"].items()
+                    },
+                    "decisions": [],
+                }),
+                bundle["invalidations"].append({
+                    "run_id": bundle["episodes"][0]["run_id"],
+                    "source_sha256": "d" * 64,
+                    "timestamp": "2026-08-02T09:00:00Z",
+                }),
+                bundle["record_counts"].update({
+                    "draft_episode_n": 1,
+                    "final_episode_n": 0,
+                    "selected_invalidation_n": 1,
+                }),
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(SnapshotInputError):
+                    SnapshotInput(
+                        acquired.adapter,
+                        acquired.store_identity,
+                        rehashed(mutate),
+                    )
+
+        adapter = acquired.adapter
+        adapter["implementation_sha256"] = "0" * 64
+        with self.subTest(label="adapter-analyzer-binding"):
+            with self.assertRaises(SnapshotInputError):
+                SnapshotInput(
+                    adapter,
+                    acquired.store_identity,
+                    acquired.semantic_bundle,
+                )
+
+    def test_snapshot_input_rejects_rehashed_invalid_decision_summary(self):
+        self.store.v1_path.unlink()
+        self.store._write_private(
+            self.store.v2_path,
+            self.store.expected_raw_bytes["v2"],
+        )
+        acquired = self.acquire()
+        mutations = {
+            "url-summary": lambda decision: decision.__setitem__(
+                "summary", "https://private.example/evidence"
+            ),
+            "unhashable-phase": lambda decision: decision.__setitem__(
+                "phase", {}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                bundle = acquired.semantic_bundle
+                bundle.pop("input_manifest_sha256")
+                mutate(bundle["episodes"][0]["decisions"][0])
+                bundle["input_manifest_sha256"] = hash_canonical(
+                    b"workflow-observatory:snapshot-input-manifest:v1\0",
+                    bundle,
+                )
+                with self.assertRaises(SnapshotInputError):
+                    SnapshotInput(
+                        acquired.adapter,
+                        acquired.store_identity,
+                        bundle,
+                    )
 
     def test_taipei_dates_become_fixed_utc_half_open_interval(self):
         self.assertEqual({
@@ -295,6 +590,7 @@ class SnapshotInputTests(unittest.TestCase):
         duplicate = ObservationCollection(
             records=(collection.records[0], collection.records[0]),
             invalidations=(),
+            root_evidence=collection.root_evidence,
         )
         with mock.patch(
             "snapshot_input.collect_record_documents", return_value=duplicate
@@ -407,6 +703,75 @@ class SnapshotInputTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(collection.records))
+
+    def test_acquisition_binds_records_references_and_identity_to_one_root_fd(self):
+        replacement = FakeObservationStore("portable")
+        self.addCleanup(replacement.close)
+        task_a, source_a = self._write_referenced_evidence(
+            self.store, "held-store-a"
+        )
+        target_a, tombstone_a = self._write_supersession_and_invalidation(
+            self.store,
+            "held-store-a",
+        )
+        episode_a_sha256 = hashlib.sha256(
+            self.store.v1_path.read_bytes()
+        ).hexdigest()
+        self._write_referenced_evidence(replacement, "replacement-store-b")
+        self._write_supersession_and_invalidation(
+            replacement,
+            "replacement-store-b",
+        )
+        paths = ObservationPaths.from_root(self.store.store_root)
+        expected_store_identity = derive_store_identity(
+            paths, PORTABLE_SEMANTICS
+        )
+        held_root = self.store.store_root.with_name("held-store-a")
+        real_open_root = workflow_observer_cli.wiki_observations._open_report_root
+
+        def open_then_swap(path):
+            descriptor = real_open_root(path)
+            os.rename(self.store.store_root, held_root)
+            os.rename(replacement.store_root, self.store.store_root)
+            return descriptor
+
+        with mock.patch(
+            "wiki_observations._open_report_root",
+            side_effect=open_then_swap,
+        ):
+            acquired = acquire_snapshot_input(
+                paths,
+                PORTABLE_SEMANTICS,
+                self.query,
+                self.policy_set,
+            )
+
+        expected_references = {
+            ("task", "[[fixture-task]]"): hashlib.sha256(task_a).hexdigest(),
+            ("source", "raw/root-swap.md"): hashlib.sha256(source_a).hexdigest(),
+            (
+                "supersession-target",
+                "obs-20260802-000001-fedcba",
+            ): hashlib.sha256(target_a).hexdigest(),
+        }
+        actual_references = {
+            (row["kind"], row["identity"]): row["sha256"]
+            for row in acquired.semantic_bundle["reference_manifest"]
+        }
+        self.assertEqual(expected_store_identity, acquired.store_identity)
+        self.assertEqual(
+            episode_a_sha256,
+            acquired.semantic_bundle["episodes"][0]["source_sha256"],
+        )
+        self.assertEqual(
+            [{
+                "run_id": "obs-20260802-000000-abcdef",
+                "source_sha256": hashlib.sha256(tombstone_a).hexdigest(),
+                "timestamp": "2026-08-02T09:00:00Z",
+            }],
+            acquired.semantic_bundle["invalidations"],
+        )
+        self.assertEqual(expected_references, actual_references)
 
     def test_portable_and_llmwiki_equivalent_fixtures_project_identically(self):
         portable = self.acquire(adapter="portable")
@@ -604,7 +969,11 @@ class SnapshotInputTests(unittest.TestCase):
         )
         with mock.patch(
             "snapshot_input.collect_record_documents",
-            return_value=ObservationCollection(records, ()),
+            return_value=ObservationCollection(
+                records,
+                (),
+                collection.root_evidence,
+            ),
         ):
             acquired = self.acquire()
 
@@ -617,7 +986,8 @@ class SnapshotInputTests(unittest.TestCase):
         )
 
     def test_selection_ignores_finish_and_invalidation_timestamps(self):
-        base = self._collection().records[0]
+        collection = self._collection()
+        base = collection.records[0]
         metadata = deepcopy(base.metadata)
         metadata["run_id"] = "obs-20260802-235900-dddddd"
         metadata["timestamp"] = "2026-08-02T23:59:00Z"
@@ -638,7 +1008,11 @@ class SnapshotInputTests(unittest.TestCase):
         )
         with mock.patch(
             "snapshot_input.collect_record_documents",
-            return_value=ObservationCollection((crossing,), (invalidation,)),
+            return_value=ObservationCollection(
+                (crossing,),
+                (invalidation,),
+                collection.root_evidence,
+            ),
         ):
             acquired = self.acquire()
 
@@ -649,7 +1023,8 @@ class SnapshotInputTests(unittest.TestCase):
         self.assertEqual(crossing.run_id, acquired.semantic_bundle["invalidations"][0]["run_id"])
 
     def test_unselected_references_and_tombstones_are_excluded(self):
-        base = self._collection().records[0]
+        base_collection = self._collection()
+        base = base_collection.records[0]
         unselected_reference = ReferenceEvidence(
             "source", "raw/private.md", "f" * 64
         )
@@ -666,6 +1041,7 @@ class SnapshotInputTests(unittest.TestCase):
                 "2035-01-01T00:00:00Z",
                 "a" * 64,
             ),),
+            base_collection.root_evidence,
         )
         with mock.patch(
             "snapshot_input.collect_record_documents", return_value=collection
@@ -761,6 +1137,7 @@ class SnapshotInputTests(unittest.TestCase):
         selected = ObservationCollection(
             records=collection.records,
             invalidations=(invalidation,),
+            root_evidence=collection.root_evidence,
         )
         with mock.patch(
             "snapshot_input.collect_record_documents", return_value=selected
