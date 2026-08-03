@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from canonical_json import CanonicalizationError, canonicalize, hash_canonical
 from episode_schema import EpisodeSchemaError, canonical_episode_projection
-from policy_artifacts import PolicyError, PolicySet
+from policy_artifacts import PolicyError, PolicySet, validate_policy_documents
 from store_config import AdapterSemantics
 from wiki_observations import (
     InvalidationEvidence,
@@ -35,12 +35,6 @@ _UTC_INSTANT_RE = re.compile(
 )
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
-_RECORD_NAME_RE = re.compile(
-    r"^obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\.md$"
-)
-_LOCK_NAME_RE = re.compile(
-    r"^obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\.lock$"
-)
 _WORKSPACE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _GENERATION_RE = re.compile(r"^[a-z0-9][a-z0-9._:@+\-]{0,199}$")
 _REFERENCE_KIND_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -173,10 +167,16 @@ def canonical_interval(
     ):
         raise _snapshot_error("snapshot timezone must be a bounded IANA name")
     try:
-        zone = ZoneInfo(timezone_name)
-    except (ZoneInfoNotFoundError, ValueError) as error:
+        canonicalize(timezone_name)
+    except (CanonicalizationError, UnicodeError) as error:
         raise _snapshot_error(
-            f"unknown IANA timezone: {timezone_name}", cause=error
+            "snapshot timezone must be valid UTF-8 I-JSON text", cause=error
+        ) from error
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError, UnicodeError) as error:
+        raise _snapshot_error(
+            "unknown IANA timezone", cause=error
         ) from error
     try:
         end_date = until_inclusive + timedelta(days=1)
@@ -359,61 +359,6 @@ def derive_store_identity(
     return hashlib.sha256(material).hexdigest()
 
 
-def _directory_entries(path: Path, label: str) -> list[os.DirEntry[str]]:
-    try:
-        return list(os.scandir(path))
-    except FileNotFoundError:
-        return []
-    except OSError as error:
-        raise _snapshot_error(
-            f"could not scan {label}: {error}", kind="io", cause=error
-        ) from error
-
-
-def _entry_mode(entry: os.DirEntry[str], label: str) -> int:
-    try:
-        return entry.stat(follow_symlinks=False).st_mode
-    except OSError as error:
-        raise _snapshot_error(
-            f"could not inspect {label}: {error}", kind="io", cause=error
-        ) from error
-
-
-def _validate_integrity_layout(paths: ObservationPaths) -> None:
-    if not paths.observations.exists():
-        return
-    for entry in _directory_entries(paths.observations, "observation directory"):
-        mode = _entry_mode(entry, f"observation entry {entry.name}")
-        if stat.S_ISLNK(mode):
-            raise _snapshot_error("observation layout must not contain symlinks")
-        if entry.name in {".locks", "invalidations"}:
-            if not stat.S_ISDIR(mode):
-                raise _snapshot_error(f"{entry.name} must be a directory")
-            continue
-        if not stat.S_ISREG(mode) or _RECORD_NAME_RE.fullmatch(entry.name) is None:
-            raise _snapshot_error(f"unexpected observation entry: {entry.name}")
-
-    for entry in _directory_entries(paths.locks, "lock directory"):
-        mode = _entry_mode(entry, f"lock entry {entry.name}")
-        if (
-            stat.S_ISLNK(mode)
-            or not stat.S_ISREG(mode)
-            or _LOCK_NAME_RE.fullmatch(entry.name) is None
-        ):
-            raise _snapshot_error(f"unexpected lock entry: {entry.name}")
-        if stat.S_IMODE(mode) & 0o077:
-            raise _snapshot_error(f"unsafe lock permissions: {entry.name}")
-
-    for entry in _directory_entries(paths.invalidations, "invalidation directory"):
-        mode = _entry_mode(entry, f"invalidation entry {entry.name}")
-        if (
-            stat.S_ISLNK(mode)
-            or not stat.S_ISREG(mode)
-            or _RECORD_NAME_RE.fullmatch(entry.name) is None
-        ):
-            raise _snapshot_error(f"unexpected invalidation entry: {entry.name}")
-
-
 def _validate_policy_set(
     policy_set: PolicySet,
     semantics: AdapterSemantics,
@@ -422,8 +367,9 @@ def _validate_policy_set(
         raise _snapshot_error("snapshot policy_set has the wrong type")
     documents = policy_set.documents
     identities = policy_set.core_identity()
-    if set(documents) != set(_DOCUMENT_IDENTITIES):
-        raise _snapshot_error("snapshot policy_set document families are incomplete")
+    validate_policy_documents(
+        documents, allow_reviewed_generation_mapping=True
+    )
     for document_name, identity_name in _DOCUMENT_IDENTITIES.items():
         document = documents[document_name]
         identity = identities.get(identity_name)
@@ -449,18 +395,23 @@ def _validate_policy_set(
     }
     if set(identities) != expected_identity_names:
         raise _snapshot_error("snapshot policy identity set is incomplete")
-    for name in ("analyzer_artifact", "canonicalizer_artifact"):
+    artifact_versions = {
+        "analyzer_artifact": "workflow-learning-analyzer@0.2.0",
+        "canonicalizer_artifact": "rfc8785-jcs@1",
+    }
+    for name, expected_version in artifact_versions.items():
         identity = identities[name]
         if (
             not isinstance(identity, Mapping)
             or set(identity) != {"version", "sha256"}
-            or not isinstance(identity["version"], str)
-            or not identity["version"]
+            or identity["version"] != expected_version
             or not isinstance(identity["sha256"], str)
             or not identity["sha256"].startswith("sha256:")
             or _LOWER_SHA256_RE.fullmatch(identity["sha256"][7:]) is None
         ):
-            raise _snapshot_error(f"snapshot {name} identity is invalid")
+            raise _snapshot_error(
+                f"snapshot {name} identity version or digest is invalid"
+            )
     projection = documents["episode_projection"]
     if projection.get("version") != semantics.projection_version:
         raise _snapshot_error(
@@ -564,8 +515,7 @@ def _acquire_snapshot_input(
     documents, identities = _validate_policy_set(policy_set, semantics)
     generation_mapping = _generation_mapping(documents)
     store_identity = derive_store_identity(paths, semantics)
-    _validate_integrity_layout(paths)
-    collection = collect_record_documents(paths, semantics)
+    collection = collect_record_documents(paths, semantics, strict_layout=True)
     if not isinstance(collection, ObservationCollection):
         raise _snapshot_error("observation collection has the wrong type")
 

@@ -1155,18 +1155,7 @@ def _validated_start_time(now: datetime | None) -> datetime:
 def _canonical_observation_paths(paths: ObservationPaths) -> ObservationPaths:
     if not isinstance(paths, ObservationPaths):
         raise _validation("observation paths have the wrong type")
-    canonical = ObservationPaths.from_root(paths.root)
-    for supplied, expected in (
-        (paths.observations, canonical.observations),
-        (paths.locks, canonical.locks),
-        (paths.invalidations, canonical.invalidations),
-    ):
-        try:
-            if supplied.resolve(strict=False) != expected.resolve(strict=False):
-                raise _validation("observation path escapes canonical wiki root")
-        except OSError as error:
-            raise ObservationError("io", str(error)) from error
-    return canonical
+    return ObservationPaths.from_root(paths.root)
 
 
 def _raise_record_validation(errors: list[str]) -> None:
@@ -2392,15 +2381,20 @@ def _read_invalidation_evidence(
 def collect_record_documents(
     paths: ObservationPaths,
     semantics: AdapterSemantics,
+    *,
+    strict_layout: bool = False,
 ) -> ObservationCollection:
     """Securely read validated records and their descriptor-bound evidence."""
 
     secure_paths = _canonical_observation_paths(paths)
     if not isinstance(semantics, AdapterSemantics):
         raise _validation("adapter semantics have the wrong type")
+    if type(strict_layout) is not bool:
+        raise _validation("strict layout mode must be a boolean")
     root_fd = _open_report_root(secure_paths.root)
     wiki_fd: int | None = None
     observations_fd: int | None = None
+    locks_fd: int | None = None
     invalidations_fd: int | None = None
     documents: list[RecordDocument] = []
     invalidations: list[InvalidationEvidence] = []
@@ -2419,6 +2413,7 @@ def collect_record_documents(
         if observations_fd is None:
             return ObservationCollection((), ())
 
+        locks_entry = None
         invalidations_entry = None
         for name in _report_entry_names(observations_fd, "observation records"):
             entry = _report_entry_stat(
@@ -2431,9 +2426,19 @@ def collect_record_documents(
                     raise _validation("invalidations path must be a directory")
                 invalidations_entry = entry
                 continue
-            if name == ".locks" or stat.S_ISDIR(entry.st_mode):
+            if name == ".locks":
+                if strict_layout and not stat.S_ISDIR(entry.st_mode):
+                    raise _validation(".locks path must be a directory")
+                if stat.S_ISDIR(entry.st_mode):
+                    locks_entry = entry
+                continue
+            if stat.S_ISDIR(entry.st_mode):
+                if strict_layout:
+                    raise _validation(f"unexpected observation entry: {name}")
                 continue
             if Path(name).suffix != ".md":
+                if strict_layout:
+                    raise _validation(f"unexpected observation entry: {name}")
                 continue
             run_id = Path(name).stem
             if _RUN_ID_RE.fullmatch(run_id) is None:
@@ -2477,6 +2482,30 @@ def collect_record_documents(
             )
         )
         by_id = {document.run_id: document for document in documents}
+        if strict_layout and locks_entry is not None:
+            locks_fd = _open_report_child_directory(
+                observations_fd,
+                ".locks",
+                "lock directory",
+                missing_ok=False,
+                expected=locks_entry,
+            )
+            for name in _report_entry_names(locks_fd, "locks"):
+                entry = _report_entry_stat(
+                    locks_fd, name, f"lock entry {name}"
+                )
+                if (
+                    stat.S_ISLNK(entry.st_mode)
+                    or not stat.S_ISREG(entry.st_mode)
+                    or re.fullmatch(
+                        r"obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\.lock",
+                        name,
+                    )
+                    is None
+                ):
+                    raise _validation(f"unexpected lock entry: {name}")
+                if stat.S_IMODE(entry.st_mode) & 0o077:
+                    raise _validation(f"unsafe lock permissions: {name}")
         if invalidations_entry is None:
             return ObservationCollection(tuple(documents), ())
         invalidations_fd = _open_report_child_directory(
@@ -2493,7 +2522,11 @@ def collect_record_documents(
             if stat.S_ISLNK(entry.st_mode):
                 raise _validation("invalidations storage must not contain symlinks")
             if stat.S_ISDIR(entry.st_mode) or Path(name).suffix != ".md":
+                if strict_layout:
+                    raise _validation(f"unexpected invalidation entry: {name}")
                 continue
+            if strict_layout and _RUN_ID_RE.fullmatch(Path(name).stem) is None:
+                raise _validation(f"unexpected invalidation entry: {name}")
             content_bytes = _read_report_regular_file(
                 invalidations_fd,
                 name,
@@ -2513,7 +2546,13 @@ def collect_record_documents(
             tuple(invalidations),
         )
     finally:
-        for descriptor in (invalidations_fd, observations_fd, wiki_fd, root_fd):
+        for descriptor in (
+            invalidations_fd,
+            locks_fd,
+            observations_fd,
+            wiki_fd,
+            root_fd,
+        ):
             if descriptor is not None:
                 _close_preserving_error(descriptor)
 

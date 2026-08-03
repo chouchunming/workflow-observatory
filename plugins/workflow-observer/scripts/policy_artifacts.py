@@ -22,6 +22,9 @@ from canonical_json import (
 _UTC_INSTANT_PATTERN = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 )
+_RUN_ID_PATTERN = re.compile(
+    r"obs-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}"
+)
 _PRODUCER_GENERATION_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9._:@+\-]{0,199}"
 )
@@ -629,14 +632,50 @@ def _validate_candidate_policy(
             raise PolicyError("candidate_emission_policy does not close metric candidates")
 
 
-def _validate_policy_documents(documents: Mapping[str, Mapping[str, object]]) -> None:
+def validate_policy_documents(
+    documents: Mapping[str, Mapping[str, object]],
+    *,
+    allow_reviewed_generation_mapping: bool = False,
+) -> None:
+    """Validate the closed v0.2 policy document set and its semantics."""
+
+    if type(allow_reviewed_generation_mapping) is not bool:
+        raise PolicyError("reviewed generation mapping flag must be Boolean")
+    if not isinstance(documents, Mapping) or set(documents) != set(_POLICY_FILES):
+        raise PolicyError("policy documents do not have their exact families")
+    try:
+        canonicalize(documents)
+    except CanonicalizationError as error:
+        raise _policy_error("policy documents are not valid I-JSON", error)
+    for name, (_filename, _identity, expected_version, allowed_keys) in (
+        _POLICY_FILES.items()
+    ):
+        document = _require_exact_keys(documents[name], allowed_keys, name)
+        if (
+            type(document["schema_version"]) is not int
+            or document["schema_version"] != 1
+        ):
+            raise PolicyError(f"{name} schema_version is not supported")
+        if document["version"] != expected_version:
+            raise PolicyError(f"{name} version is not supported")
+
     _validate_projection(documents["episode_projection"])
     producer_entries = documents["producer_capabilities"]["entries"]
     if producer_entries != []:
         raise PolicyError("producer_capabilities entries are not defined in v0.2")
     generation_mapping = documents["workflow_generation_mapping"]["mapping"]
-    if generation_mapping != {}:
+    if not allow_reviewed_generation_mapping and generation_mapping != {}:
         raise PolicyError("workflow_generation_mapping entries are not defined in v0.2")
+    if allow_reviewed_generation_mapping:
+        if not isinstance(generation_mapping, Mapping):
+            raise PolicyError("workflow_generation_mapping.mapping must be an object")
+        for run_id, generation in generation_mapping.items():
+            if not isinstance(run_id, str) or _RUN_ID_PATTERN.fullmatch(run_id) is None:
+                raise PolicyError("workflow_generation_mapping run_id is invalid")
+            _producer_generation(
+                generation,
+                f"workflow_generation_mapping.mapping.{run_id}",
+            )
     _validate_metric_semantics(documents["metric_semantics"])
     projection_metrics = documents["episode_projection"]["schema_capabilities"]
     expected_metric_names = set(documents["metric_semantics"]["metrics"])
@@ -714,7 +753,7 @@ def load_policy_set(
             raise PolicyError(f"{name} version does not match its approved policy bytes")
         documents[name] = document
 
-    _validate_policy_documents(documents)
+    validate_policy_documents(documents)
     plugin_root = policy_root.parent
     analyzer_manifest = build_code_manifest(plugin_root, analyzer_files)
     canonicalizer_manifest = build_code_manifest(plugin_root, canonicalizer_files)

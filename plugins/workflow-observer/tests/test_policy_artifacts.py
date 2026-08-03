@@ -21,6 +21,7 @@ from policy_artifacts import (
     effective_boundary_applies,
     load_policy_set,
     read_regular_file_evidence,
+    validate_policy_documents,
     validate_effective_boundary,
 )
 
@@ -183,6 +184,52 @@ class PolicyArtifactTests(unittest.TestCase):
                 canonicalizer_files=["b.py"],
             ),
         )
+
+    def test_public_structural_validator_closes_document_envelopes(self):
+        validate_policy_documents(self.documents)
+        mutations = {
+            "missing family": lambda documents: documents.pop("quantile_policy"),
+            "extra family": lambda documents: documents.__setitem__(
+                "future_policy", {}
+            ),
+            "extra key": lambda documents: documents["quantile_policy"]
+                .__setitem__("future", True),
+            "schema version": lambda documents: documents["quantile_policy"]
+                .__setitem__("schema_version", 2),
+            "version label": lambda documents: documents["quantile_policy"]
+                .__setitem__("version", "linear-rational-quantile@2"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                documents = policy_documents()
+                mutate(documents)
+                with self.assertRaises(PolicyError):
+                    validate_policy_documents(documents)
+
+    def test_public_structural_validator_allows_only_reviewed_generation_mapping(self):
+        documents = policy_documents()
+        documents["workflow_generation_mapping"]["mapping"] = {
+            "obs-20260802-000000-abcdef": "implementation-with-review@1"
+        }
+        with self.assertRaisesRegex(PolicyError, "not defined"):
+            validate_policy_documents(documents)
+        validate_policy_documents(
+            documents, allow_reviewed_generation_mapping=True
+        )
+
+        invalid_mappings = (
+            {"legacy": "implementation-with-review@1"},
+            {"obs-20260802-000000-abcdef": "Unknown Generation"},
+            [],
+        )
+        for mapping in invalid_mappings:
+            with self.subTest(mapping=mapping):
+                malformed = policy_documents()
+                malformed["workflow_generation_mapping"]["mapping"] = mapping
+                with self.assertRaises(PolicyError):
+                    validate_policy_documents(
+                        malformed, allow_reviewed_generation_mapping=True
+                    )
 
     def test_effective_boundary_is_exactly_one_variant(self):
         actual = self._semantic_call(
