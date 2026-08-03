@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -23,7 +23,7 @@ from store_config import (
 import wiki_observations
 from episode_schema import EpisodeSchemaError, parse_v2_supplement
 from policy_artifacts import PolicyError, load_policy_set
-from canonical_json import CanonicalizationError
+from canonical_json import CanonicalizationError, canonicalize
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
     SnapshotInputError,
@@ -32,6 +32,7 @@ from snapshot_input import (
     canonical_interval,
     validate_snapshot_query,
 )
+from snapshot_store import create_learning_snapshot
 from wiki_observations import ObservationError, ObservationPaths
 
 
@@ -112,19 +113,23 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--since", type=_report_date)
     report.add_argument("--until", type=_report_date)
 
-    snapshot = subparsers.add_parser("snapshot-input")
-    snapshot.add_argument("--since", required=True, type=_snapshot_date)
-    snapshot.add_argument("--until", required=True, type=_snapshot_date)
-    snapshot.add_argument("--timezone", required=True)
-    snapshot.add_argument("--project")
-    snapshot.add_argument("--workspace")
-    snapshot.add_argument("--workspace-id")
-    snapshot.add_argument("--task-type")
-    snapshot.add_argument("--as-of")
+    _add_snapshot_query_arguments(subparsers.add_parser("snapshot-input"))
+    _add_snapshot_query_arguments(subparsers.add_parser("snapshot"))
 
     subparsers.add_parser("validate")
     subparsers.add_parser("integrity")
     return parser
+
+
+def _add_snapshot_query_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--since", required=True, type=_snapshot_date)
+    parser.add_argument("--until", required=True, type=_snapshot_date)
+    parser.add_argument("--timezone", required=True)
+    parser.add_argument("--project")
+    parser.add_argument("--workspace")
+    parser.add_argument("--workspace-id")
+    parser.add_argument("--task-type")
+    parser.add_argument("--as-of")
 
 
 def _read_private_payload(path_value: str, label: str) -> str:
@@ -520,7 +525,7 @@ def _run_bundled(
             paths, request, scope, semantics=semantics
         ))
         return 0
-    if args.command == "snapshot-input":
+    if args.command in {"snapshot-input", "snapshot"}:
         query = _snapshot_query(args)
         policy_set = _snapshot_policy_set()
         paths = (
@@ -529,10 +534,33 @@ def _run_bundled(
             else ObservationPaths.from_root(config.root)
         )
         assert paths is not None
-        acquired = acquire_snapshot_input(
-            paths, semantics, query, policy_set
+        def acquire():
+            return acquire_snapshot_input(
+                paths, semantics, query, policy_set
+            )
+
+        if args.command == "snapshot-input":
+            acquired = acquire()
+            sys.stdout.write(acquired.manifest_bytes.decode("utf-8") + "\n")
+            return 0
+        home = Path(os.environ.get(
+            "WORKFLOW_OBSERVATORY_HOME",
+            Path.home() / ".codex/workflow-observatory",
+        )).expanduser()
+        published = create_learning_snapshot(
+            acquire=acquire,
+            query=query,
+            policy_set=policy_set,
+            home=home,
+            generated_at=datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
         )
-        sys.stdout.write(acquired.manifest_bytes.decode("utf-8") + "\n")
+        response = {
+            "created": published.created,
+            "snapshot": dict(published.artifact),
+        }
+        sys.stdout.write(canonicalize(response).decode("utf-8") + "\n")
         return 0
     paths = (
         _portable_paths(

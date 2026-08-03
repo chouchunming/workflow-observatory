@@ -14,7 +14,8 @@ CLI = PLUGIN_ROOT / "scripts/workflow_observer_cli.py"
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 sys.path.insert(0, str(PLUGIN_ROOT / "tests"))
 from episode_schema import parse_episode_block
-from workflow_evolution_fixtures import load_projection_policy
+from canonical_json import canonicalize, strict_json_loads
+from workflow_evolution_fixtures import FakeObservationStore, load_projection_policy
 import workflow_observer_cli
 
 SCOPE = """## Scope
@@ -515,6 +516,55 @@ class PortableCliTests(unittest.TestCase):
                 workflow_observer_cli._read_private_payload(
                     str(self.scope), "Scope payload"
                 )
+
+    def test_snapshot_publishes_canonical_path_free_artifact_without_mutation(self):
+        with FakeObservationStore("portable") as store:
+            home = store.store_root.parent
+            before = {
+                path.relative_to(store.store_root): path.read_bytes()
+                for path in store.store_root.rglob("*")
+                if path.is_file()
+            }
+            arguments = (
+                "snapshot",
+                "--since", "2026-08-02",
+                "--until", "2026-08-02",
+                "--timezone", "Asia/Taipei",
+                "--as-of", "2026-08-02T16:00:00Z",
+            )
+
+            first = run_cli(home, *arguments)
+            second = run_cli(home, *arguments)
+
+            self.assertEqual((0, ""), (first.returncode, first.stderr))
+            self.assertEqual((0, ""), (second.returncode, second.stderr))
+            first_response = strict_json_loads(first.stdout.encode("utf-8"))
+            second_response = strict_json_loads(second.stdout.encode("utf-8"))
+            self.assertEqual(
+                {"created", "snapshot"}, set(first_response)
+            )
+            self.assertIs(True, first_response["created"])
+            self.assertIs(False, second_response["created"])
+            self.assertEqual(
+                first_response["snapshot"], second_response["snapshot"]
+            )
+            self.assertEqual(
+                canonicalize(first_response).decode("utf-8") + "\n",
+                first.stdout,
+            )
+            self.assertNotIn(str(home), first.stdout)
+            snapshot = first_response["snapshot"]
+            path = (
+                home / "learning/snapshots"
+                / f"{snapshot['snapshot_id']}.json"
+            )
+            self.assertEqual(canonicalize(snapshot), path.read_bytes())
+            after = {
+                path.relative_to(store.store_root): path.read_bytes()
+                for path in store.store_root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
