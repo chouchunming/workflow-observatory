@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
-  "source": "llmwiki/wiki_observations.py",
-  "sha256": "d3bbce90a72407096fde62302e9de439f0c6fe9668755ed15d11349871bc3a0f"
+  "schema_version": 2,
+  "source": "workflow-observatory/plugins/workflow-observer/scripts/wiki_observations.py",
+  "sha256": "12e874d6ae227d30ebff210121a01acfb7562e6034940210c096d2eca2aa059c"
 }
