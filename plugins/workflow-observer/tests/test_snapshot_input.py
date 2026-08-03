@@ -341,6 +341,71 @@ class SnapshotInputTests(unittest.TestCase):
                 semantic_bundle,
             )
 
+    def test_nonempty_bound_mapping_requires_exact_reviewed_document(self):
+        self.add_reviewed_generation_mapping()
+        acquired = self.acquire()
+        semantic_bundle = acquired.semantic_bundle
+        semantic_bundle.pop("input_manifest_sha256")
+        semantic_bundle["episodes"][0]["workflow_generation"] = {
+            "availability": "unavailable",
+            "value": None,
+        }
+        semantic_bundle["input_manifest_sha256"] = hash_canonical(
+            b"workflow-observatory:snapshot-input-manifest:v1\0",
+            semantic_bundle,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotInputError,
+            "reviewed generation mapping document is required",
+        ):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                semantic_bundle,
+            )
+
+    def test_approved_empty_mapping_identity_allows_omitted_document(self):
+        acquired = self.acquire()
+        self.assertEqual(
+            {},
+            self.policy_set.documents["workflow_generation_mapping"]["mapping"],
+        )
+
+        rebuilt = SnapshotInput(
+            acquired.adapter,
+            acquired.store_identity,
+            acquired.semantic_bundle,
+        )
+
+        self.assertEqual(acquired.manifest_bytes, rebuilt.manifest_bytes)
+        self.assertEqual(
+            {"availability": "unavailable", "value": None},
+            rebuilt.semantic_bundle["episodes"][0]["workflow_generation"],
+        )
+
+    def test_exact_nonempty_mapping_document_allows_mapped_observed_v1(self):
+        self.add_reviewed_generation_mapping()
+        acquired = self.acquire()
+
+        rebuilt = SnapshotInput(
+            acquired.adapter,
+            acquired.store_identity,
+            acquired.semantic_bundle,
+            reviewed_generation_mapping=(
+                self.policy_set.documents["workflow_generation_mapping"]
+            ),
+        )
+
+        self.assertEqual(acquired.manifest_bytes, rebuilt.manifest_bytes)
+        self.assertEqual(
+            {
+                "availability": "observed",
+                "value": "implementation-with-review@1",
+            },
+            rebuilt.semantic_bundle["episodes"][0]["workflow_generation"],
+        )
+
     def test_snapshot_input_rejects_rehashed_non_exact_shapes(self):
         acquired = self.acquire()
         semantic_bundle = acquired.semantic_bundle

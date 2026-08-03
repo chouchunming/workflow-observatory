@@ -586,17 +586,22 @@ class LearningSnapshotTests(unittest.TestCase):
             ),
         ):
             episode = self._projection(metadata_overrides={
-                "revision": "runtime-looking-revision",
-                "agent_surface": "runtime-looking-agent-surface",
+                "revision": "abcdef0123456789",
+                "agent_surface": "codex",
                 "environment_fingerprint": "runtime-looking-fingerprint",
                 "model": "runtime-looking-extra-field",
             })
 
-        self.assertEqual("runtime-looking-revision", episode["revision"])
+        acquired = self._snapshot_input([episode])
+        core = build_snapshot_core(acquired, self.policies)
+        validated = acquired.semantic_bundle["episodes"][0]
+
+        self.assertEqual("abcdef0123456789", validated["revision"])
+        self.assertEqual("codex", validated["agent_surface"])
+        self.assertIsNone(validated["runtime_provenance"])
         self.assertEqual(
-            "runtime-looking-agent-surface", episode["agent_surface"]
+            [], core["cohorts"][0]["comparative_inference_exclusions"]
         )
-        self.assertIsNone(episode["runtime_provenance"])
 
     def test_mapped_v1_v2_fixture_preserves_projection_v2_null_runtime_contract(self):
         acquired, policies = self._mixed_v1_v2_snapshot_input(

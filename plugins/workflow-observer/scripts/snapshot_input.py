@@ -186,6 +186,17 @@ _REVISION_RE = re.compile(r"^(?:[0-9a-f]{7,40}|unknown)$")
 _COST_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _MAX_SAFE_INTEGER = (2**53) - 1
+_APPROVED_EMPTY_GENERATION_MAPPING_DOCUMENT = {
+    "schema_version": 1,
+    "version": "workflow-generation-mapping@1",
+    "mapping": {},
+}
+_APPROVED_EMPTY_GENERATION_MAPPING_IDENTITY = {
+    "version": _APPROVED_EMPTY_GENERATION_MAPPING_DOCUMENT["version"],
+    "sha256": "sha256:" + hashlib.sha256(
+        canonicalize(_APPROVED_EMPTY_GENERATION_MAPPING_DOCUMENT)
+    ).hexdigest(),
+}
 
 
 class SnapshotInputError(ObservationError):
@@ -919,7 +930,16 @@ def _validated_snapshot_input_constructor(
         )
 
     generation_mapping: dict[str, str] = {}
-    if reviewed_generation_mapping is not None:
+    if reviewed_generation_mapping is None:
+        if (
+            policy_set["workflow_generation_mapping"]
+            != _APPROVED_EMPTY_GENERATION_MAPPING_IDENTITY
+        ):
+            raise _snapshot_error(
+                "reviewed generation mapping document is required for the "
+                "bound non-empty mapping identity"
+            )
+    else:
         mapping_document = _exact_mapping(
             reviewed_generation_mapping,
             {"schema_version", "version", "mapping"},
