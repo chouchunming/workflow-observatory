@@ -148,6 +148,28 @@ class LearningImprovingContractTests(unittest.TestCase):
         self.assertIn("exactly 64 lowercase hexadecimal characters", text)
         self.assertIn("exists in that exact Learning Snapshot", text)
 
+    def test_improving_uses_only_the_current_validated_learning_snapshot(self):
+        text = improving_skill()
+        self.assertIn(
+            "Use only the already-validated sanitized Learning Snapshot returned "
+            "by `workflow-learning` in the current context.",
+            text,
+        )
+        self.assertIn(
+            "Do not open or parse a local snapshot JSON file directly.", text
+        )
+        self.assertIn(
+            "report that the exact snapshot evidence is unavailable and stop", text
+        )
+        self.assertIn("Do not rerun `workflow-learning`", text)
+        self.assertIn("reconstruct the artifact", text)
+        self.assertNotIn("or its immutable local artifact", text)
+        self.assertNotRegex(
+            text,
+            r"(?i)\bor\s+(?:its|the|an?)\s+(?:immutable\s+)?local\s+"
+            r"(?:snapshot\s+)?(?:artifact|file)\b",
+        )
+
     def test_improving_stops_before_proposal_design_or_creation(self):
         text = improving_skill()
         self.assertIn("does not create an Evolution Proposal", text)

@@ -24,8 +24,14 @@ candidate from memory or a different snapshot.
 
 ## Verify membership
 
-Use the sanitized Learning Snapshot returned by `workflow-learning`, or its
-immutable local artifact, and verify all of the following before responding:
+Use only the already-validated sanitized Learning Snapshot returned by `workflow-learning` in the current context.
+Do not open or parse a local snapshot JSON file directly.
+
+If that validated artifact is unavailable in the current context, report that the exact snapshot evidence is unavailable and stop.
+Do not rerun `workflow-learning`, reconstruct the artifact, parse raw
+observations, or substitute memory or another snapshot.
+
+Verify all of the following before responding:
 
 - the artifact's exact `snapshot_id` equals the selected `snapshot_id`;
 - one and only one entry in `core.candidates` has the selected `candidate_id`;
