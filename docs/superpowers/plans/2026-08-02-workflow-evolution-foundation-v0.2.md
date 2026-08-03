@@ -4,6 +4,11 @@ Status: Revised after final focused external re-review; focused approval of the
 Decision recurrence cohort-size amendment is required before Task 1. The
 underlying design remains approved.
 
+Task 7 review amendment: Option A was approved on 2026-08-03. The v0.2
+projection remains `episode-projection@2` with exactly null
+`runtime_provenance`; bounded runtime identity and heterogeneous-runtime
+analysis are deferred to a future `episode-projection@3` plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` (recommended) or `executing-plans` to implement
 > this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -1669,6 +1674,14 @@ observation records with the same `run_id`, or conflicting canonical
 projections for one `run_id`, are a Data Trust Gate failure rather than a
 deduplication opportunity.
 
+The closed `SnapshotInput` constructor receives the reviewed generation-mapping
+document as validation authority during acquisition. Its version and digest
+must match the mapping identity already bound in the semantic bundle. A
+schema-v1 Episode may expose an observed generation only when its exact
+`run_id` maps to that exact value; absent or conflicting mapping evidence is a
+gate failure. The mapping document remains policy input and is not added as a
+second Episode or copied into the canonical bundle.
+
 `schema_capabilities` is copied from the hashed projection policy and reports
 the exact v1/v2 supported-field sets. `record_counts` contains non-negative
 integers for `selected_episode_n`, `draft_episode_n`, `final_episode_n`, and
@@ -1871,9 +1884,9 @@ Group outcomes by the exact six-part key:
 Every cohort and legacy descriptive collection exposes the exact handoff fields
 `comparative_inference_eligible` and `comparative_inference_exclusions`.
 Eligibility is true only when the exclusions array is empty. The array contains
-only the sorted bounded values `generation-unavailable` and
-`heterogeneous-runtime-provenance`; it is derived from the same facts that
-produce the exclusion ledger and cannot be independently overridden by Task 8.
+only the bounded value `generation-unavailable`; it is derived from the same
+facts that produce the exclusion ledger and cannot be independently overridden
+by Task 8.
 Sample size and Decision support remain separate gates: a cohort can be
 comparable but too small for a particular inference.
 
@@ -1886,15 +1899,16 @@ Episodes remains descriptive.
 
 The core includes an `exclusion_ledger` sorted by `(run_id, reason,
 excluded_from)` UTF-8 bytes. Reasons are the bounded values `draft`,
-`superseded`, `invalidated`, `generation-unavailable`, and
-`heterogeneous-runtime-provenance`; `excluded_from` is either `outcome-analysis`
-or `comparative-inference`. A run may have more than one lifecycle predicate
+`superseded`, `invalidated`, and `generation-unavailable`; `excluded_from` is
+either `outcome-analysis` or `comparative-inference`. A run may have more than
+one lifecycle predicate
 but appears at most once for each exact reason/scope pair. Generation-unavailable
 legacy Episodes remain eligible for separately labeled descriptive outcome
-counts but are excluded from comparative inference. Known multiple runtime
-generations without an approved compatibility policy add
-`heterogeneous-runtime-provenance` and force descriptive output; unknown
-runtime remains JSON null and is never inferred.
+counts but are excluded from comparative inference. Under
+`episode-projection@2`, `runtime_provenance` must be JSON null. Task 7 neither
+infers runtime identities nor emits a runtime-heterogeneity exclusion or
+candidate; bounded runtime provenance and its analysis require a future
+`episode-projection@3` amendment.
 
 - [ ] **Step 4: Implement metric eligibility and exact rational quartiles**
 
@@ -1973,7 +1987,8 @@ one fixture that deterministically triggers two candidate classes.
 `self.core_with_recurring_decision_pattern(...)` accepts explicit
 `outcome_episode_n` and `supporting_episode_n`, builds that many valid
 projections sharing one supported pattern, and may vary only the named
-generation or runtime provenance through the Task 7 fixture boundary.
+generation through the Task 7 fixture boundary. Runtime provenance remains
+JSON null under `episode-projection@2`.
 `self.core_with_equal_missingness(metrics)` assigns equal missingness to the
 named concrete metrics. No helper computes IDs, support, comparability, wildcard
 expansion, or candidate eligibility itself.
@@ -2037,26 +2052,6 @@ def test_unavailable_generation_decision_pattern_remains_descriptive(self):
         outcome_episode_n=5,
         supporting_episode_n=3,
         workflow_generation={"availability": "unavailable", "value": None},
-    )
-    self.assertEqual(
-        "descriptive",
-        core["decision_patterns"][0]["evidence_strength"],
-    )
-    self.assertFalse(any(
-        candidate["class"] == "decision-pattern"
-        for candidate in core["candidates"]
-    ))
-
-
-def test_heterogeneous_runtime_cohort_emits_no_decision_candidate(self):
-    core = self.core_with_recurring_decision_pattern(
-        outcome_episode_n=5,
-        supporting_episode_n=3,
-        runtime_generations=["runtime@1", "runtime@2"],
-    )
-    self.assertIn(
-        "heterogeneous-runtime-provenance",
-        {row["reason"] for row in core["exclusion_ledger"]},
     )
     self.assertEqual(
         "descriptive",
@@ -2175,10 +2170,11 @@ no `decision-pattern` candidate. In particular, four comparable outcome
 Episodes with three supporting Episodes remain descriptive, while five
 comparable outcomes with three supporting Episodes cross the cohort-size and
 support boundaries. A cohort whose exclusions contain
-`generation-unavailable` or `heterogeneous-runtime-provenance` may still
-expose deterministic Decision pattern counts, but every pattern remains
-`descriptive`. Task 8 consumes the Task 7 comparability fields directly and
-may not recompute, weaken, or override them.
+`generation-unavailable` may still expose deterministic Decision pattern
+counts, but every pattern remains `descriptive`. Task 8 consumes the Task 7
+comparability fields directly and may not recompute, weaken, or override them.
+Task 8 does not manufacture runtime identities or a runtime-heterogeneity
+candidate under the null-only `episode-projection@2` contract.
 
 - [ ] **Step 4: Emit deterministic unranked candidates**
 
@@ -2693,7 +2689,7 @@ begins.
 | `test_04_adapter_fixtures_project_identically` | Build equivalent portable and current-layout LLMWiki roots; assert equal semantic bundle bytes. |
 | `test_05_v1_absence_is_not_zero_or_v2_missing` | Mix four v1, two v2-null, and two v2-observed values; assert the exact 4/2/2/0 missingness partition, then give `input_tokens` and `output_tokens` equal zero-observed missingness and assert distinct concrete source identities and candidate IDs. |
 | `test_06_lifecycle_records_do_not_enter_outcome_denominator` | Mix four outcomes, drafts, superseded, and invalidated records; assert outcome `n=4` and separate overlapping lifecycle counts. |
-| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. With no comparability exclusions, assert four outcomes with three supporting Episodes remain descriptive and emit no Decision candidate, while five outcomes with three supporting Episodes become recurring and emit exactly one Decision candidate. Repeat a numerically supported pattern in generation-unavailable and heterogeneous-runtime cohorts; assert descriptive patterns and no Decision candidates. |
+| `test_07_decision_recurrence_uses_distinct_episodes` | Put ten identical events in one of five Episodes; assert event count 10, Episode support 1, and descriptive strength. With no comparability exclusions, assert four outcomes with three supporting Episodes remain descriptive and emit no Decision candidate, while five outcomes with three supporting Episodes become recurring and emit exactly one Decision candidate. Repeat a numerically supported pattern in a generation-unavailable cohort; assert a descriptive pattern and no Decision candidate. Runtime provenance remains null and is not varied under `episode-projection@2`. |
 | `test_08_reviewed_mapping_derived_view_counts_once` | Present one physical Episode plus its reviewed workflow-generation mapping; assert exactly one canonical projected Episode for that `run_id`. |
 | `test_09_gate_failure_produces_no_snapshot_or_proposal` | Break a task reference; assert no snapshot directory member and no proposal artifact anywhere in the fake home. |
 | `test_10_authoritative_tamper_is_not_acceptance` | Change learning artifact `authoritative` to true; assert schema rejection even after recomputing a generic file digest. |

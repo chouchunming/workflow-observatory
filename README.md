@@ -46,6 +46,11 @@ workflow generations, versioned analysis policies, per-metric missingness, and
 Episode-level Decision Event support. Its 11 reviewable implementation tasks
 end in a 15-case non-model acceptance matrix against isolated fake stores.
 
+`episode-projection@2` fixes `runtime_provenance` to JSON null. v0.2 neither
+infers runtime identities nor emits runtime-heterogeneity exclusions or
+candidates; bounded runtime provenance and heterogeneous-runtime analysis are
+deferred to a future `episode-projection@3` contract.
+
 Evolution Proposal artifacts, experiment execution, formal acceptance,
 post-hoc evaluation inputs, and automatic workflow mutation remain deferred.
 A future proposal must cite both `snapshot_id` and `candidate_id`, and no live

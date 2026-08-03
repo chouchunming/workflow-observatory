@@ -318,6 +318,29 @@ class SnapshotInputTests(unittest.TestCase):
                 semantic_bundle,
             )
 
+    def test_snapshot_input_rejects_unmapped_v1_observed_generation(self):
+        acquired = self.acquire()
+        semantic_bundle = acquired.semantic_bundle
+        semantic_bundle.pop("input_manifest_sha256")
+        semantic_bundle["episodes"][0]["workflow_generation"] = {
+            "availability": "observed",
+            "value": "forged-generation@9",
+        }
+        semantic_bundle["input_manifest_sha256"] = hash_canonical(
+            b"workflow-observatory:snapshot-input-manifest:v1\0",
+            semantic_bundle,
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotInputError,
+            "reviewed generation mapping",
+        ):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                semantic_bundle,
+            )
+
     def test_snapshot_input_rejects_rehashed_non_exact_shapes(self):
         acquired = self.acquire()
         semantic_bundle = acquired.semantic_bundle

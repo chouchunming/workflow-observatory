@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import os
@@ -239,13 +239,18 @@ class SnapshotInput:
     adapter: dict[str, str]
     store_identity: str | None
     semantic_bundle: dict
+    reviewed_generation_mapping: InitVar[Mapping[str, object] | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        reviewed_generation_mapping: Mapping[str, object] | None,
+    ) -> None:
         adapter, semantic_bundle, manifest_bytes = (
             _validated_snapshot_input_constructor(
                 object.__getattribute__(self, "adapter"),
                 object.__getattribute__(self, "store_identity"),
                 object.__getattribute__(self, "semantic_bundle"),
+                reviewed_generation_mapping,
             )
         )
         object.__setattr__(self, "adapter", _deep_freeze(adapter))
@@ -616,6 +621,7 @@ def _validated_episode(
     raw_episode: object,
     capabilities: Mapping[str, Mapping],
     query: SnapshotQuery,
+    generation_mapping: Mapping[str, str],
 ) -> dict:
     episode = _exact_mapping(
         raw_episode,
@@ -701,6 +707,27 @@ def _validated_episode(
     else:
         raise _snapshot_error(
             "snapshot Episode generation availability is invalid"
+        )
+    mapped_generation = generation_mapping.get(run_id)
+    if schema_version == 1:
+        if generation["availability"] == "observed" and (
+            mapped_generation != generation["value"]
+        ):
+            raise _snapshot_error(
+                "schema-v1 observed generation lacks its reviewed generation mapping"
+            )
+        if generation["availability"] == "unavailable" and (
+            mapped_generation is not None
+        ):
+            raise _snapshot_error(
+                "schema-v1 generation does not apply its reviewed generation mapping"
+            )
+    elif mapped_generation is not None and generation != {
+        "availability": "observed",
+        "value": mapped_generation,
+    }:
+        raise _snapshot_error(
+            "snapshot Episode generation conflicts with its reviewed generation mapping"
         )
 
     schema_capability = capabilities[str(schema_version)]
@@ -798,6 +825,7 @@ def _validated_snapshot_input_constructor(
     adapter: object,
     store_identity: object,
     semantic_bundle: object,
+    reviewed_generation_mapping: object,
 ) -> tuple[dict, dict, bytes]:
     adapter_copy = _exact_mapping(
         adapter,
@@ -890,6 +918,38 @@ def _validated_snapshot_input_constructor(
             "snapshot adapter is not bound to its analyzer artifact"
         )
 
+    generation_mapping: dict[str, str] = {}
+    if reviewed_generation_mapping is not None:
+        mapping_document = _exact_mapping(
+            reviewed_generation_mapping,
+            {"schema_version", "version", "mapping"},
+            "reviewed workflow generation mapping",
+        )
+        if (
+            type(mapping_document["schema_version"]) is not int
+            or mapping_document["schema_version"] != 1
+            or mapping_document["version"] != "workflow-generation-mapping@1"
+        ):
+            raise _snapshot_error(
+                "reviewed workflow generation mapping version is invalid"
+            )
+        generation_mapping = _generation_mapping({
+            "workflow_generation_mapping": mapping_document,
+        })
+        expected_mapping_identity = {
+            "version": mapping_document["version"],
+            "sha256": "sha256:" + hashlib.sha256(
+                canonicalize(mapping_document)
+            ).hexdigest(),
+        }
+        if (
+            policy_set["workflow_generation_mapping"]
+            != expected_mapping_identity
+        ):
+            raise _snapshot_error(
+                "reviewed workflow generation mapping is not bound to the snapshot"
+            )
+
     capabilities = _validated_schema_capabilities(
         bundle_copy["schema_capabilities"]
     )
@@ -902,7 +962,12 @@ def _validated_snapshot_input_constructor(
     if not isinstance(invalidations, list):
         raise _snapshot_error("snapshot invalidations must be a list")
     validated_episodes = [
-        _validated_episode(raw_episode, capabilities, query)
+        _validated_episode(
+            raw_episode,
+            capabilities,
+            query,
+            generation_mapping,
+        )
         for raw_episode in episodes
     ]
     episode_run_ids = [episode["run_id"] for episode in validated_episodes]
@@ -1396,7 +1461,12 @@ def _acquire_snapshot_input(
         "implementation_version": _ADAPTER_IMPLEMENTATION_VERSION,
         "implementation_sha256": analyzer_sha256,
     }
-    result = SnapshotInput(adapter, store_identity, bundle)
+    result = SnapshotInput(
+        adapter,
+        store_identity,
+        bundle,
+        reviewed_generation_mapping=documents["workflow_generation_mapping"],
+    )
     result.manifest_bytes
     return result
 

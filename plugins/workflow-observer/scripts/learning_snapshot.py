@@ -21,14 +21,12 @@ _UTC_INSTANT_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 )
 _GENERATION_RE = re.compile(r"[a-z0-9][a-z0-9._:@+\-]{0,199}")
-_RUNTIME_GENERATION_RE = re.compile(r"[a-z0-9][a-z0-9._:@+\-]{0,199}")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?")
 _OUTCOME_STATUSES = ("failed", "partial", "rolled-back", "success")
 _EXCLUSION_REASONS = {
     "draft",
     "generation-unavailable",
-    "heterogeneous-runtime-provenance",
     "invalidated",
     "superseded",
 }
@@ -307,19 +305,6 @@ def _generation(episode: Mapping) -> str | None:
     return generation
 
 
-def _runtime_generation(episode: Mapping) -> str | None:
-    value = episode.get("runtime_provenance")
-    if value is None:
-        return None
-    if (
-        not isinstance(value, str)
-        or _RUNTIME_GENERATION_RE.fullmatch(value) is None
-        or value in {"unknown", "unavailable"}
-    ):
-        raise LearningSnapshotError("Episode runtime_provenance is invalid")
-    return value
-
-
 def _validate_metric_projection(
     name: str,
     metric: object,
@@ -365,7 +350,10 @@ def _validate_episode(episode: object, documents: Mapping) -> Mapping:
     ):
         _bounded_text(episode[name], f"Episode {name}")
     _generation(episode)
-    _runtime_generation(episode)
+    if episode["runtime_provenance"] is not None:
+        raise LearningSnapshotError(
+            "episode-projection@2 runtime_provenance must be null"
+        )
     metrics = episode["metrics"]
     metric_semantics = documents["metric_semantics"]["metrics"]
     if not isinstance(metrics, Mapping) or set(metrics) != set(metric_semantics):
@@ -615,19 +603,6 @@ def _build_cohort(
             ledger.add(_ledger_row(
                 episode["run_id"],
                 "generation-unavailable",
-                "comparative-inference",
-            ))
-    runtime_generations = {
-        runtime
-        for runtime in (_runtime_generation(episode) for episode in outcomes)
-        if runtime is not None
-    }
-    if len(runtime_generations) > 1:
-        exclusions.append("heterogeneous-runtime-provenance")
-        for episode in outcomes:
-            ledger.add(_ledger_row(
-                episode["run_id"],
-                "heterogeneous-runtime-provenance",
                 "comparative-inference",
             ))
     exclusions.sort(key=_utf8)

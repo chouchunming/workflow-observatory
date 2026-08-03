@@ -102,6 +102,9 @@ and
 
 ## Later — learning and ecosystem expansion
 
+- Define `episode-projection@3` with bounded runtime provenance, an explicit
+  compatibility policy, and reviewed heterogeneous-runtime analysis before
+  making any cross-runtime exclusion, candidate, or comparison claim.
 - Add reviewed human-readable narrative and annotation artifacts over Learning
   Snapshots only after their independent identity and provenance contract is
   approved.

@@ -25,7 +25,7 @@ from learning_snapshot import (
     build_snapshot_core,
     linear_rational_quantile,
 )
-from policy_artifacts import load_policy_set
+from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotInput
 from workflow_evolution_fixtures import (
     V1_BODY,
@@ -83,6 +83,7 @@ class LearningSnapshotTests(unittest.TestCase):
         completion_metrics: dict[str, object] | None = None,
         supplement_execution: dict[str, object] | None = None,
         supplement_quality: dict[str, object] | None = None,
+        metadata_overrides: dict[str, object] | None = None,
     ) -> dict:
         run_id = self._run_id()
         completion = {
@@ -99,6 +100,7 @@ class LearningSnapshotTests(unittest.TestCase):
             "status": status,
             "timestamp": started_at,
         })
+        metadata.update(metadata_overrides or {})
         if schema_version == 2:
             metadata["schema_version"] = 2
             if generation is None:
@@ -140,15 +142,26 @@ class LearningSnapshotTests(unittest.TestCase):
                 body = body.rstrip() + "\n\n" + render_episode_block(episode)
 
         projected = canonical_episode_projection(metadata, body, self.projection)
-        if schema_version == 1 and generation is not None:
-            projected["workflow_generation"] = {
-                "availability": "observed",
-                "value": generation,
-            }
         projected["source_sha256"] = hashlib.sha256(
             canonicalize(projected)
         ).hexdigest()
         return projected
+
+    def _policies_with_generation_mapping(
+        self,
+        mapping: dict[str, str],
+    ) -> PolicySet:
+        documents = self.policies.documents
+        mapping_document = documents["workflow_generation_mapping"]
+        mapping_document["mapping"] = dict(mapping)
+        identities = self.policies.identities
+        identities["workflow_generation_mapping"] = {
+            "version": mapping_document["version"],
+            "sha256": "sha256:" + hashlib.sha256(
+                canonicalize(mapping_document)
+            ).hexdigest(),
+        }
+        return PolicySet(documents, identities)
 
     def _snapshot_input(
         self,
@@ -156,7 +169,9 @@ class LearningSnapshotTests(unittest.TestCase):
         *,
         invalidated: frozenset[str] = frozenset(),
         as_of: str = "2026-08-02T16:00:00Z",
+        policies: PolicySet | None = None,
     ) -> SnapshotInput:
+        selected_policies = self.policies if policies is None else policies
         invalidations = [
             {
                 "run_id": run_id,
@@ -188,7 +203,7 @@ class LearningSnapshotTests(unittest.TestCase):
                 "task_type": None,
             },
             "lifecycle_as_of": as_of,
-            "policy_set": self.policies.core_identity(),
+            "policy_set": selected_policies.core_identity(),
             "schema_capabilities": deepcopy(
                 self.projection["episode_projection"]["schema_capabilities"]
             ),
@@ -222,11 +237,15 @@ class LearningSnapshotTests(unittest.TestCase):
                 "name": "portable",
                 "implementation_version": "workflow-observer-snapshot-adapter@1",
                 "implementation_sha256": (
-                    self.policies.core_identity()["analyzer_artifact"]["sha256"][7:]
+                    selected_policies.core_identity()
+                    ["analyzer_artifact"]["sha256"][7:]
                 ),
             },
             store_identity="f" * 64,
             semantic_bundle=bundle,
+            reviewed_generation_mapping=(
+                selected_policies.documents["workflow_generation_mapping"]
+            ),
         )
 
     def bundle(
@@ -261,10 +280,20 @@ class LearningSnapshotTests(unittest.TestCase):
         )
 
     def metric_partition(self, v1_absent, v2_null, v2_values):
-        episodes = [
+        v1_episodes = [
             self._projection(schema_version=1)
             for _ in range(v1_absent)
         ]
+        mapping = {
+            episode["run_id"]: _GENERATION for episode in v1_episodes
+        }
+        policies = self._policies_with_generation_mapping(mapping)
+        for episode in v1_episodes:
+            episode["workflow_generation"] = {
+                "availability": "observed",
+                "value": mapping[episode["run_id"]],
+            }
+        episodes = list(v1_episodes)
         episodes.extend(
             self._projection(
                 supplement_quality={"test_failures": None},
@@ -277,7 +306,10 @@ class LearningSnapshotTests(unittest.TestCase):
             )
             for value in v2_values
         )
-        core = build_snapshot_core(self._snapshot_input(episodes), self.policies)
+        core = build_snapshot_core(
+            self._snapshot_input(episodes, policies=policies),
+            policies,
+        )
         return self._metric(core["cohorts"][0], "test_failures")
 
     def metric_output(self, name, values):
@@ -485,7 +517,7 @@ class LearningSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(1, cohort["generation_unavailable_episode_n"])
 
-    def test_unknown_runtime_is_not_inferred_and_lifecycle_exclusions_are_ledgered(self):
+    def test_null_runtime_is_not_inferred_and_lifecycle_exclusions_are_ledgered(self):
         first = self._projection()
         second = self._projection()
         draft = self._projection(status="draft")
@@ -521,10 +553,131 @@ class LearningSnapshotTests(unittest.TestCase):
             "reason": "superseded",
             "excluded_from": "outcome-analysis",
         }, core["exclusion_ledger"])
-        self.assertFalse(any(
-            row["reason"] == "heterogeneous-runtime-provenance"
-            for row in core["exclusion_ledger"]
+        self.assertTrue(all(
+            episode["runtime_provenance"] is None
+            for episode in (first, second, draft, superseded)
         ))
+
+    def test_each_cohort_dimension_splits_independently(self):
+        cases = (
+            (
+                "project",
+                {"metadata_overrides": {"project": "project-a"}},
+                {"metadata_overrides": {"project": "project-b"}},
+            ),
+            (
+                "workspace",
+                {"metadata_overrides": {"workspace": "workspace-a"}},
+                {"metadata_overrides": {"workspace": "workspace-b"}},
+            ),
+            (
+                "workspace_id",
+                {"metadata_overrides": {"workspace_id": "aaaaaaaaaaaa"}},
+                {"metadata_overrides": {"workspace_id": "bbbbbbbbbbbb"}},
+            ),
+            (
+                "task_type",
+                {"metadata_overrides": {
+                    "task_type": "compile",
+                    "workflow_variant": "compile-with-review",
+                }},
+                {"metadata_overrides": {
+                    "task_type": "inbox-processing",
+                    "workflow_variant": "compile-with-review",
+                }},
+            ),
+            (
+                "workflow_variant",
+                {"metadata_overrides": {
+                    "workflow_variant": "maintenance-basic",
+                }},
+                {"metadata_overrides": {
+                    "workflow_variant": "implementation-with-review",
+                }},
+            ),
+            (
+                "workflow_generation",
+                {"generation": "implementation-with-review@2"},
+                {"generation": "implementation-with-review@3"},
+            ),
+        )
+        for dimension, left_options, right_options in cases:
+            with self.subTest(dimension=dimension):
+                self._sequence = 0
+                core = build_snapshot_core(
+                    self._snapshot_input([
+                        self._projection(**left_options),
+                        self._projection(**right_options),
+                    ]),
+                    self.policies,
+                )
+                self.assertEqual(2, len(core["cohorts"]))
+                self.assertEqual(
+                    [1, 1],
+                    [row["outcome_episode_n"] for row in core["cohorts"]],
+                )
+
+    def test_invalidated_final_episode_is_excluded_from_outcomes_and_metrics(self):
+        invalidated = self._projection(status="success")
+        retained = self._projection(status="success")
+        core = build_snapshot_core(
+            self._snapshot_input(
+                [invalidated, retained],
+                invalidated=frozenset({invalidated["run_id"]}),
+            ),
+            self.policies,
+        )
+        cohort = core["cohorts"][0]
+        self.assertEqual(1, cohort["outcome_episode_n"])
+        self.assertEqual(
+            {"failed": 0, "partial": 0, "rolled-back": 0, "success": 1},
+            cohort["outcome_counts"],
+        )
+        self.assertEqual(
+            1,
+            self._metric(cohort, "elapsed_seconds")["missingness"]
+            ["eligible_episode_n"],
+        )
+
+    def test_returned_core_does_not_alias_snapshot_or_policy_inputs(self):
+        acquired = self.bundle(outcomes=["success"])
+        expected = build_snapshot_core(acquired, self.policies)
+        mutated = build_snapshot_core(acquired, self.policies)
+
+        mutated["query"]["interval"]["requested_dates"]["since"] = "1999-01-01"
+        mutated["analysis_policy_set"].clear()
+        mutated["input_manifest"]["reference_manifest"].clear()
+        mutated["cohorts"][0]["metrics"][0]["missingness"]["observed_n"] = 99
+
+        self.assertEqual(expected, build_snapshot_core(acquired, self.policies))
+
+    def test_exclusion_ledger_has_one_row_per_exact_reason_scope_pair(self):
+        superseded = self._projection(status="superseded")
+        core = build_snapshot_core(
+            self._snapshot_input(
+                [superseded],
+                invalidated=frozenset({superseded["run_id"]}),
+            ),
+            self.policies,
+        )
+        expected = [
+            {
+                "run_id": superseded["run_id"],
+                "reason": "invalidated",
+                "excluded_from": "outcome-analysis",
+            },
+            {
+                "run_id": superseded["run_id"],
+                "reason": "superseded",
+                "excluded_from": "outcome-analysis",
+            },
+        ]
+        self.assertEqual(expected, core["exclusion_ledger"])
+        keys = [
+            (row["run_id"], row["reason"], row["excluded_from"])
+            for row in core["exclusion_ledger"]
+        ]
+        self.assertEqual(len(keys), len(set(keys)))
 
     def test_five_comparable_outcomes_are_recurring_strength(self):
         core = build_snapshot_core(

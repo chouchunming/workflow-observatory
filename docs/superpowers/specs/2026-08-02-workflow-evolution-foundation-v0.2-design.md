@@ -10,6 +10,8 @@ Review mode: Architecture, then adversarial — complete
 - Section 2 — Episode v2 and Decision Events: Approved baseline
 - Section 2 additive amendment — Workflow generation: Approved
 - Section 3 — Learning Snapshot, comparability, and improvement candidates: Approved
+- Task 7 review amendment — `episode-projection@2` null-runtime boundary:
+  Approved on 2026-08-03
 - Evolution Proposal schema, experiment lifecycle, and formal acceptance
   execution: Deferred to a later design
 
@@ -256,6 +258,11 @@ value. `unknown` is not a generation, and records without an auditable
 generation mapping are descriptive-only for workflow comparison. A fixed,
 reviewed migration mapping may supply a generation in a derived view; it does
 not edit the Episode or create another sample.
+Any schema-v1 Episode that appears with an observed generation in canonical
+snapshot input must match its exact `run_id` entry in the reviewed mapping
+artifact bound by the snapshot policy identity. The closed `SnapshotInput`
+constructor rejects an observed schema-v1 generation when that mapping
+evidence is absent or different.
 
 ## Section 3 — Learning Snapshot, comparability, and improvement candidates
 
@@ -537,10 +544,13 @@ inference.
 
 Revision, model/runtime identity, environment fingerprint, and Episode schema
 version remain provenance rather than unbounded metric labels. Unknown
-model/runtime identity remains null and is never inferred. If a cohort contains
-multiple known runtime generations without an approved compatibility policy,
-the snapshot emits `heterogeneous-runtime-provenance` and limits that cohort to
-descriptive output.
+model/runtime identity remains null and is never inferred. In
+`episode-projection@2`, `runtime_provenance` is exactly JSON null for every
+Episode. v0.2 therefore cannot detect or infer heterogeneous runtime and emits
+no runtime-heterogeneity exclusion or candidate. A future approved
+`episode-projection@3` may add bounded runtime provenance together with its
+compatibility policy and heterogeneous-runtime analysis; those semantics are
+outside v0.2.
 
 ### Outcome analysis and lifecycle health
 
@@ -735,8 +745,9 @@ inspect validated inputs selected by the canonical UTC interval corresponding
 to 2026-07-15 through 2026-08-02 in Asia/Taipei. Candidate collections include
 LLMWiki compile-basic, compile-with-review, feature-with-review, and
 maintenance-basic records, plus Workflow Observatory feature-with-review
-records. Generation or runtime heterogeneity may restrict any collection to
-descriptive output. These names identify analysis candidates, not conclusions.
+records. Generation unavailability may restrict a collection to descriptive
+output. Runtime heterogeneity is not observable under `episode-projection@2`.
+These names identify analysis candidates, not conclusions.
 
 ## Section 3 acceptance tests for the later implementation plan
 
