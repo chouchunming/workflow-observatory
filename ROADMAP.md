@@ -29,10 +29,11 @@ are documented in
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
 Status: design and implementation plan approved as of 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 5 are complete on the
-design branch, including the externally reviewed Task 4 readback and Task 5
-adapter-report/invalidation-evidence corrections. These changes are not
-included in the current release.
+Implementation started on 2026-08-02; Tasks 1 through 6 are complete on the
+design branch, including the externally reviewed Task 4 readback, Task 5
+adapter-report/invalidation-evidence corrections, and Task 6 canonical
+`snapshot-input` acquisition with its single-view trust-boundary corrections.
+These changes are not included in the current release.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:

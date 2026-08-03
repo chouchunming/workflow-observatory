@@ -23,9 +23,10 @@ automatically.
 
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 5 are complete on the
-design branch, including the externally reviewed Task 4 readback and Task 5
-adapter-report/invalidation-evidence corrections.
+Implementation started on 2026-08-02; Tasks 1 through 6 are complete on the
+design branch, including the externally reviewed Task 4 readback, Task 5
+adapter-report/invalidation-evidence corrections, and Task 6 canonical
+`snapshot-input` acquisition with its single-view trust-boundary corrections.
 These capabilities are not part of the current released plugin.
 
 The bounded milestone will extend the existing observation layer through this
