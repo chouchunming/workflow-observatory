@@ -29,10 +29,13 @@ are documented in
 ## Approved next milestone — Workflow Evolution Foundation v0.2
 
 Status: design and implementation plan approved as of 2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 10 are complete on the
-design branch. Task 11's 15-case non-model acceptance matrix, bounded fake-store
-historical dry run, and supported-interpreter execution remain pending. These
-changes are not included in the current release.
+Implementation started on 2026-08-02; all 11 milestone tasks are complete on the
+design branch. The v0.2 15-case non-model acceptance matrix and bounded
+fake-store historical dry run are included in public prerelease
+[`v0.2.0-rc1`](https://github.com/chouchunming/workflow-observatory/releases/tag/v0.2.0-rc1).
+
+`supported-interpreter execution` remains pending under a separate approval and
+is not part of this milestone.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -81,7 +84,7 @@ The following remain outside this milestone and require later approved designs:
 - execution of approval gates, workflow changes, branches, or pull requests;
 - post-hoc evaluation artifacts and immutable health-event history/streams;
 - background scheduling, network transport, and automatic live-data analysis;
-- formal acceptance execution, including the Task 11 interpreter matrix;
+- formal acceptance execution, including the Task 11 interpreter execution matrix;
 - causal or cross-runtime claims without an explicit comparability policy.
 
 Any future Evolution Proposal must reference `snapshot_id + candidate_id` so

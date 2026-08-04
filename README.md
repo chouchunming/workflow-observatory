@@ -24,9 +24,15 @@ automatically.
 The v0.2 foundation design and implementation plan are approved as of
 2026-08-02.
 Implementation started on 2026-08-02; Tasks 1 through 10 are complete on the
-design branch. The remaining Task 11 acceptance matrix and bounded fake-store
-historical dry run are not complete. These capabilities are not part of the
-current released plugin.
+design branch. Task 11 has been implemented with the 15-case acceptance matrix
+and bounded fake-store historical dry run completed on this branch.
+These capabilities are now included in public prerelease
+[`v0.2.0-rc1`](https://github.com/chouchunming/workflow-observatory/releases/tag/v0.2.0-rc1).
+See also the release SHA (`workflow-observatory-0.2.0-rc1-65ec366.zip.sha256`)
+published with the archive.
+
+The current plugin release remains `0.1.x`; `v0.2.0-rc1` is a public
+pre-release for dry-run validation and non-authoritative review.
 
 The bounded milestone will extend the existing observation layer through this
 evidence path:
