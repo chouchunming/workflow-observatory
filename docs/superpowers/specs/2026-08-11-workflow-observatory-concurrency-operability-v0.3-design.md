@@ -1,8 +1,9 @@
 # Workflow Observatory Concurrency and Operability Foundation v0.3 Design
 
 Date: 2026-08-11
-Status: Approved design direction; written specification pending review
+Status: Approved for bounded phase implementation planning
 Review mode: Architecture, then adversarial
+Approval: Explicit user approval on 2026-08-11
 
 ## Section status
 
@@ -17,16 +18,14 @@ Review mode: Architecture, then adversarial
 - Cross-platform verification and release claims: Approved in design discussion
 - Rollout, responsibilities, and interruption checkpoints: Approved in design
   discussion
-- Written specification as a whole: Pending review
+- Written specification as a whole: Approved
 - Production implementation: Not authorized by this document
 
 This specification defines one umbrella milestone with five sequential,
 independently reviewable implementation phases. The repository maintainer/user
-is the approval authority. Until that person explicitly approves this written
-specification, it authorizes neither phase-plan creation nor implementation.
-Approval of this document authorizes implementation planning only. It does not
-authorize code changes, live-store migration, release publication, merge, or
-push.
+is the approval authority. The explicit approval recorded above authorizes
+implementation planning only. It does not authorize code changes, live-store
+migration, release publication, merge, or push.
 
 ## Purpose
 
@@ -1081,10 +1080,11 @@ The eventual v0.3 source archive includes:
 - deterministic source inventory and SHA-256 checksums.
 
 The current packager intentionally allowlists the exact approved v0.2 design
-and plan paths. While this v0.3 document is a draft, package tests are expected
-to reject it as an unknown marketplace file. After written-spec approval, the
-first implementation phase must add the exact approved v0.3 document path and
-test its inventory; a broad `docs/superpowers/**` wildcard is prohibited.
+and plan paths. Until Phase 1 updates that exact allowlist, package tests are
+expected to reject this new approved v0.3 document as an unknown marketplace
+file. The first implementation phase must add the exact approved v0.3 document
+path and test its inventory; a broad `docs/superpowers/**` wildcard is
+prohibited.
 
 It excludes:
 
