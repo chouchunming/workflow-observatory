@@ -26,7 +26,10 @@ class ManifestTests(unittest.TestCase):
             "policies/artifact_migration_registry.json",
             "policies/artifact_schema_registry.json",
             "policies/health_event_schema.json",
+            "scripts/artifact_migration.py",
             "scripts/artifact_schema.py",
+            "tests/fixtures/artifact_migration_vectors.json",
+            "tests/test_artifact_migration.py",
             "tests/test_artifact_schema.py",
         }
         actual = {
@@ -38,7 +41,10 @@ class ManifestTests(unittest.TestCase):
                     "artifact_migration_registry.json",
                     "artifact_schema_registry.json",
                     "health_event_schema.json",
+                    "artifact_migration.py",
                     "artifact_schema.py",
+                    "artifact_migration_vectors.json",
+                    "test_artifact_migration.py",
                     "test_artifact_schema.py",
                 }
             )

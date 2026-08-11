@@ -146,7 +146,10 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
         return len(policy.parts) == 2 and policy.suffix == ".json"
     if nested.startswith("tests/skill_evals/"):
         return nested.endswith(".json")
-    if nested == "tests/fixtures/jcs_conformance_vectors.json":
+    if nested in {
+        "tests/fixtures/artifact_migration_vectors.json",
+        "tests/fixtures/jcs_conformance_vectors.json",
+    }:
         return True
     if nested.startswith("tests/"):
         return nested.endswith(".py")

@@ -219,6 +219,16 @@ class ArtifactSchemaRef:
 
 
 @dataclass(frozen=True)
+class ArtifactMigrationRef:
+    source_artifact_type: str
+    source_schema_version: int
+    target_contract: str
+    target_schema_version: int
+    migration_identity: str
+    handler: str
+
+
+@dataclass(frozen=True)
 class MarkdownEnvelope:
     metadata: Mapping[str, object]
     body: str
@@ -535,6 +545,39 @@ class ArtifactPolicySet:
 
     def identities(self) -> dict[str, dict[str, str]]:
         return _deep_thaw(self._identities)
+
+
+def resolve_artifact_migration(
+    artifact: ArtifactSchemaRef,
+    *,
+    policies: ArtifactPolicySet,
+) -> ArtifactMigrationRef:
+    """Resolve one validated registry row for an exact source schema."""
+
+    if not isinstance(artifact, ArtifactSchemaRef):
+        raise ArtifactSchemaError("artifact schema reference is required")
+    if not isinstance(policies, ArtifactPolicySet):
+        raise ArtifactSchemaError("artifact policies are required")
+    registered = policies._schema_index.get(
+        (artifact.artifact_type, artifact.schema_version)
+    )
+    if registered != artifact:
+        raise ArtifactSchemaError("artifact schema reference is not policy-bound")
+    rows = policies._migration_registry["migrations"]
+    for row in rows:
+        if (
+            row["source_artifact_type"] == artifact.artifact_type
+            and row["source_schema_version"] == artifact.schema_version
+        ):
+            return ArtifactMigrationRef(
+                source_artifact_type=row["source_artifact_type"],
+                source_schema_version=row["source_schema_version"],
+                target_contract=row["target_contract"],
+                target_schema_version=row["target_schema_version"],
+                migration_identity=row["migration_identity"],
+                handler=row["handler"],
+            )
+    raise ArtifactSchemaError("artifact schema has no declared migration")
 
 
 def load_artifact_policy_set(policy_root: Path) -> ArtifactPolicySet:

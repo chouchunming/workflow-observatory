@@ -215,6 +215,20 @@ class ArchiveTests(unittest.TestCase):
         ):
             build_archive(self.source, self.archive, self.evidence)
 
+    def test_archive_rejects_unlisted_migration_fixture_sibling(self):
+        sibling = (
+            self.source
+            / "plugins/workflow-observer/tests/fixtures/"
+            "unapproved_migration_vectors.json"
+        )
+        sibling.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            PackageError,
+            "unexpected marketplace file: plugins/workflow-observer/tests/"
+            "fixtures/unapproved_migration_vectors.json",
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
     def test_public_main_builds_from_live_v02_source_inventory(self):
         destination = self.root / "public-main.zip"
         real_build_archive = build_archive
@@ -285,7 +299,11 @@ class ArchiveTests(unittest.TestCase):
             "artifact_migration_registry.json",
             "plugins/workflow-observer/policies/artifact_schema_registry.json",
             "plugins/workflow-observer/policies/health_event_schema.json",
+            "plugins/workflow-observer/scripts/artifact_migration.py",
             "plugins/workflow-observer/scripts/artifact_schema.py",
+            "plugins/workflow-observer/tests/fixtures/"
+            "artifact_migration_vectors.json",
+            "plugins/workflow-observer/tests/test_artifact_migration.py",
             "plugins/workflow-observer/tests/test_artifact_schema.py",
         }
         self.assertLessEqual(expected, set(marketplace))
