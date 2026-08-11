@@ -29,7 +29,7 @@ from policy_artifacts import (
 from store_config import AdapterSemantics, PORTABLE_SEMANTICS
 
 if TYPE_CHECKING:
-    from artifact_schema import ArtifactSchemaRef
+    from artifact_schema import ArtifactPolicySet, ArtifactSchemaRef
     from episode_schema import EpisodeV2Supplement
 
 
@@ -2271,8 +2271,10 @@ def invalidate_observation(
         )
         if metadata.get("status") == "draft":
             raise ObservationError("state", f"{run_id} is still draft")
+        created_invalidations = False
         try:
-            os.mkdir("invalidations", 0o755, dir_fd=observations_fd)
+            os.mkdir("invalidations", 0o700, dir_fd=observations_fd)
+            created_invalidations = True
         except FileExistsError:
             pass
         except OSError as error:
@@ -2293,6 +2295,18 @@ def invalidate_observation(
         _assert_directory_identity(
             invalidations_fd, secure_paths.invalidations
         )
+        if created_invalidations:
+            try:
+                os.fchmod(invalidations_fd, 0o700)
+                invalidations_mode = stat.S_IMODE(
+                    os.fstat(invalidations_fd).st_mode
+                )
+            except OSError as error:
+                raise ObservationError("io", str(error)) from error
+            if invalidations_mode != 0o700:
+                raise _validation(
+                    "created observation invalidations directory must have mode 0700"
+                )
         destination_name = f"{run_id}.md"
         content = _render_invalidation(run_id, invalidated_at)
         try:
@@ -2691,6 +2705,7 @@ def collect_record_documents(
     semantics: AdapterSemantics,
     *,
     strict_layout: bool = False,
+    artifact_policy_set: ArtifactPolicySet | None = None,
 ) -> ObservationCollection:
     """Securely read validated records and their descriptor-bound evidence."""
 
@@ -2701,16 +2716,21 @@ def collect_record_documents(
         raise _validation("strict layout mode must be a boolean")
     try:
         from artifact_schema import (
+            ArtifactPolicySet,
             ArtifactSchemaError,
             load_artifact_policy_set,
             parse_markdown_envelope,
         )
 
-        artifact_policies = load_artifact_policy_set(
-            Path(__file__).resolve().parents[1] / "policies"
-        )
+        if artifact_policy_set is None:
+            artifact_policy_set = load_artifact_policy_set(
+                Path(__file__).resolve().parents[1] / "policies"
+            )
     except (ArtifactSchemaError, OSError) as error:
         raise _validation(f"could not load artifact schema policy: {error}") from error
+    if not isinstance(artifact_policy_set, ArtifactPolicySet):
+        raise _validation("artifact_policy_set must be an ArtifactPolicySet")
+    artifact_policies = artifact_policy_set
     root_fd = _open_report_root(secure_paths.root)
     try:
         root_metadata = os.fstat(root_fd)

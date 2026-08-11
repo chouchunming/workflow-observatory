@@ -667,7 +667,14 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                 sorted(bundle["migration_manifest"], key=canonicalize),
                 bundle["migration_manifest"],
             )
-            self.assertEqual(1, len(bundle["migration_manifest"]))
+            self.assertEqual(2, len(bundle["migration_manifest"]))
+            self.assertEqual(
+                {1, 2},
+                {
+                    row["source_schema_version"]
+                    for row in bundle["migration_manifest"]
+                },
+            )
             self.assertNotIn(PRIVACY_SENTINEL.encode("utf-8"), semantic_bytes[-1])
         self.assertEqual(semantic_bytes[0], semantic_bytes[1])
 

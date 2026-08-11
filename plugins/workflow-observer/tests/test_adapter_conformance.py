@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 from store_config import LLMWIKI_SEMANTICS, PORTABLE_SEMANTICS
 from canonical_json import canonicalize
+import workflow_observer_cli
 
 SCOPE_TEXT = """## Scope
 
@@ -289,6 +291,44 @@ class AdapterConformanceTests(unittest.TestCase):
             (validation.returncode, validation.stdout, validation.stderr),
         )
 
+    def test_missing_invalidation_directory_is_created_private_for_both_adapters(self):
+        roots = {
+            "portable": self.homes["portable"] / "store",
+            "llmwiki": self.llm_root,
+        }
+        for adapter, root in roots.items():
+            with self.subTest(adapter=adapter):
+                started = self.start(adapter)
+                self.assertEqual(0, started.returncode, started.stderr)
+                run_id = started.stdout.strip()
+                finished = self.run_cli(
+                    adapter,
+                    "finish",
+                    run_id,
+                    "--status",
+                    "success",
+                    "--from-file",
+                    str(self.completion),
+                )
+                self.assertEqual(0, finished.returncode, finished.stderr)
+                invalidations = root / "wiki/observations/invalidations"
+                invalidations.rmdir()
+
+                invalidated = self.run_cli(
+                    adapter,
+                    "invalidate",
+                    run_id,
+                    "--reason",
+                    "private directory regression",
+                )
+
+                self.assertEqual(0, invalidated.returncode, invalidated.stderr)
+                self.assertEqual(0o700, stat.S_IMODE(invalidations.stat().st_mode))
+                self.assertEqual(
+                    0o600,
+                    stat.S_IMODE((invalidations / f"{run_id}.md").stat().st_mode),
+                )
+
     def test_existing_legacy_tombstone_is_readable_and_never_rewritten(self):
         from wiki_observations import (
             InvalidationEvidence,
@@ -436,6 +476,38 @@ class AdapterConformanceTests(unittest.TestCase):
         )
         self.assertFalse(marker.exists(), "malformed draft reached the delegate")
         self.assertEqual(malformed, record.read_bytes())
+
+    def test_llmwiki_draft_schema_read_stops_at_record_size_ceiling(self):
+        from artifact_schema import ArtifactSchemaError
+        from wiki_observations import ObservationError, ObservationPaths, _PAYLOAD_LIMIT
+
+        started = self.start("llmwiki")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        record.write_bytes(record.read_bytes() + b"x" * (_PAYLOAD_LIMIT + 1))
+        real_read = os.read
+        bytes_read = 0
+
+        def counted_read(descriptor, amount):
+            nonlocal bytes_read
+            chunk = real_read(descriptor, amount)
+            bytes_read += len(chunk)
+            return chunk
+
+        with mock.patch.object(
+            workflow_observer_cli.os,
+            "read",
+            side_effect=counted_read,
+        ), self.assertRaisesRegex(
+            (ObservationError, ArtifactSchemaError), "too large|exceed"
+        ):
+            workflow_observer_cli._read_draft_schema(
+                ObservationPaths.from_root(self.llm_root),
+                run_id,
+            )
+
+        self.assertLessEqual(bytes_read, _PAYLOAD_LIMIT)
 
     def test_invalidation_evidence_binds_timestamp_and_exact_tombstone_bytes(self):
         from wiki_observations import ObservationPaths, collect_record_documents

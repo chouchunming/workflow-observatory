@@ -253,11 +253,16 @@ def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
             raise ObservationError(
                 "validation", "observation record changed while opening"
             )
+        max_record_bytes = wiki_observations._PAYLOAD_LIMIT
+        if opened.st_size > max_record_bytes:
+            raise ObservationError(
+                "validation", "observation record is too large"
+            )
 
         frontmatter = bytearray()
         delimiter = b"\n---\n"
         while not frontmatter.endswith(delimiter):
-            if len(frontmatter) >= 64 * 1024:
+            if len(frontmatter) >= max_record_bytes:
                 raise ObservationError(
                     "validation", "observation frontmatter is too large"
                 )
@@ -270,10 +275,19 @@ def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
 
         content = bytearray(frontmatter)
         while True:
-            chunk = os.read(descriptor, 64 * 1024)
+            remaining = max_record_bytes + 1 - len(content)
+            if remaining <= 0:
+                raise ObservationError(
+                    "validation", "observation record is too large"
+                )
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
             if not chunk:
                 break
             content.extend(chunk)
+            if len(content) > max_record_bytes:
+                raise ObservationError(
+                    "validation", "observation record is too large"
+                )
 
         after = os.fstat(descriptor)
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)

@@ -284,7 +284,6 @@ class LearningSnapshotTests(unittest.TestCase):
                         "target_contract": "episode-projection@2",
                     }
                     for episode in episodes
-                    if episode["episode_schema_version"] == 1
                 ],
                 key=canonicalize,
             )

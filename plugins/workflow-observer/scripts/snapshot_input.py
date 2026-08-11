@@ -894,10 +894,7 @@ def _validate_snapshot_v2_artifact_fields(
     raw_manifest = bundle["migration_manifest"]
     if not isinstance(raw_manifest, list):
         raise _snapshot_error("snapshot migration manifest must be a list")
-    legacy_episode_ids = {
-        run_id for run_id, episode in episodes_by_id.items()
-        if episode["episode_schema_version"] == 1
-    }
+    selected_episode_ids = set(episodes_by_id)
     manifest = []
     migration_keys = set()
     for raw_row in raw_manifest:
@@ -914,7 +911,7 @@ def _validate_snapshot_v2_artifact_fields(
             or not isinstance(run_id, str)
             or _RUN_ID_RE.fullmatch(run_id) is None
             or type(source_schema_version) is not int
-            or source_schema_version != 1
+            or source_schema_version not in _OBSERVATION_MIGRATIONS
             or row["migration_identity"]
                 != _OBSERVATION_MIGRATIONS[source_schema_version]
             or row["target_contract"] != "episode-projection@2"
@@ -939,9 +936,9 @@ def _validate_snapshot_v2_artifact_fields(
         manifest.append(row)
     if manifest != sorted(manifest, key=canonicalize):
         raise _snapshot_error("snapshot migration manifest is not JCS-byte sorted")
-    if {row["run_id"] for row in manifest} != legacy_episode_ids:
+    if {row["run_id"] for row in manifest} != selected_episode_ids:
         raise _snapshot_error(
-            "snapshot migration manifest does not cover selected legacy sources"
+            "snapshot migration manifest does not cover selected sources"
         )
     bundle["migration_manifest"] = manifest
 
@@ -1536,7 +1533,12 @@ def _acquire_snapshot_input(
         raise _snapshot_error("artifact_policy_set must be an ArtifactPolicySet")
     documents, identities = _validate_policy_set(policy_set, semantics)
     generation_mapping = _generation_mapping(documents)
-    collection = collect_record_documents(paths, semantics, strict_layout=True)
+    collection = collect_record_documents(
+        paths,
+        semantics,
+        strict_layout=True,
+        artifact_policy_set=artifact_policy_set,
+    )
     if not isinstance(collection, ObservationCollection):
         raise _snapshot_error("observation collection has the wrong type")
     store_identity = _derive_store_identity_from_evidence(
@@ -1582,8 +1584,6 @@ def _acquire_snapshot_input(
     ]
     migration_manifest = []
     for document, projection in selected:
-        if document.artifact.schema_version != 1:
-            continue
         migration = resolve_artifact_migration(
             document.artifact,
             policies=artifact_policy_set,

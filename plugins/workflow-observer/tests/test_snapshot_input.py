@@ -731,13 +731,22 @@ class SnapshotInputTests(unittest.TestCase):
         real_collect = collect_record_documents
         observed_strict_modes = []
 
-        def insert_then_collect(paths, semantics, *, strict_layout=False):
+        def insert_then_collect(
+            paths,
+            semantics,
+            *,
+            strict_layout=False,
+            artifact_policy_set=None,
+        ):
             observed_strict_modes.append(strict_layout)
             (self.store.observations / "inserted-after-prepass.tmp").write_text(
                 "unexpected", encoding="utf-8"
             )
             return real_collect(
-                paths, semantics, strict_layout=strict_layout
+                paths,
+                semantics,
+                strict_layout=strict_layout,
+                artifact_policy_set=artifact_policy_set,
             )
 
         with mock.patch(
@@ -1439,7 +1448,7 @@ class SnapshotInputTests(unittest.TestCase):
             store._write_private(store.v2_path, store.expected_raw_bytes["v2"])
         acquired = self.acquire()
         rows = acquired.semantic_bundle["migration_manifest"]
-        self.assertEqual(1, len(rows))
+        self.assertEqual(2, len(rows))
         self.assertEqual(
             sorted(rows, key=canonicalize),
             rows,
@@ -1456,34 +1465,21 @@ class SnapshotInputTests(unittest.TestCase):
                 for row in rows
             }),
         )
-        self.assertEqual({1}, {row["source_schema_version"] for row in rows})
+        self.assertEqual({1, 2}, {row["source_schema_version"] for row in rows})
         self.assertEqual(2, acquired.semantic_bundle["record_counts"][
             "selected_episode_n"
         ])
 
         bundle = acquired.semantic_bundle
-        v2_episode = next(
-            episode for episode in bundle["episodes"]
-            if episode["episode_schema_version"] == 2
-        )
-        bundle["migration_manifest"].append({
-            "artifact_type": "workflow-observation",
-            "migration_identity": (
-                "workflow-observation-v2-to-episode-projection@1"
-            ),
-            "run_id": v2_episode["run_id"],
-            "source_schema_version": 2,
-            "source_sha256": v2_episode["source_sha256"],
-            "target_contract": "episode-projection@2",
-        })
-        bundle["migration_manifest"].sort(key=canonicalize)
+        bundle["migration_manifest"] = [
+            row for row in bundle["migration_manifest"]
+            if row["source_schema_version"] == 1
+        ]
         bundle.pop("input_manifest_sha256")
         bundle["input_manifest_sha256"] = hash_canonical(
             b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
         )
-        with self.assertRaisesRegex(
-            SnapshotInputError, "legacy|migration manifest"
-        ):
+        with self.assertRaisesRegex(SnapshotInputError, "migration manifest"):
             SnapshotInput(
                 acquired.adapter,
                 acquired.store_identity,
@@ -1491,6 +1487,16 @@ class SnapshotInputTests(unittest.TestCase):
                 artifact_type="snapshot-input",
                 schema_version=2,
             )
+
+    def test_acquisition_uses_supplied_artifact_policies_without_reloading(self):
+        with mock.patch(
+            "artifact_schema.load_artifact_policy_set",
+            side_effect=AssertionError("artifact policies were reloaded"),
+        ) as loader:
+            acquired = self.acquire()
+
+        self.assertEqual("snapshot-input", acquired.artifact_type)
+        loader.assert_not_called()
 
     def test_acquisition_requires_explicit_artifact_policy_set(self):
         with self.assertRaisesRegex(TypeError, "artifact_policy_set"):
