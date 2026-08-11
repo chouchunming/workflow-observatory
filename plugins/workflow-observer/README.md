@@ -51,11 +51,25 @@ requests, or experiments.
 
 ## Workflow Observatory v0.3 Phase 1 checkpoint
 
-Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+Workflow Evolution Foundation v0.2, including Task 11's 15-case matrix and
+bounded fake-store historical dry run, is complete.
+The current stable GitHub release is `v0.1.0`, and `v0.2.0-rc1` is a public
+prerelease. The Phase 1 source below remains unreleased.
+
+Phase 1 is an unreleased implementation checkpoint, not a v0.3 release or
+publication.
+The commit-pinned implementation baseline is
+`53d45af5344dc5fc231723802dad70fa5a0b564a`.
 It implements the explicit artifact schema registry and policies, pure derived
 migrations, the exact invalidation v2 writer with legacy reads, Snapshot Input
 and Learning Snapshot v2 zero-sampling semantics, v1/v2 Learning Snapshot
 readback and publication dispatch, and the fixed 12-case acceptance matrix.
+
+Phase 1 preserves existing observation v1, invalidation v1, and Learning
+Snapshot v1/v2 artifact bytes byte-for-byte. Readback and pure derived
+migrations never rewrite those artifacts in place.
+Zero-sampling fields are schema semantics only: they state that no record/sample
+selection policy ran; Phase 1 does not select, retain, drop, or sample records.
 
 The checkpoint does not implement the cooperative lock/CAS/maintenance
 transaction, a durable health-event sink/store/reporting path,
@@ -66,6 +80,13 @@ decisions, or a Windows lock backend.
 - Linux native runtime verification: pending; Linux support is not yet certified.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
+The executable contract is the
+[fixed 12-case test](tests/test_schema_migration_acceptance.py). The exact
+macOS and pending native-Linux commands, pass criteria, required evidence
+fields, and external evidence destination are in the repository
+[Phase 1 verification boundary](../../README.md#phase-1-verification-boundary).
+Roadmap and backlog items describe future design work; they are not
+implementation authority.
 The next design unit is the Phase 2 cross-platform same-machine writer-safety
 plan. Phase 1 does not authorize Phase 2 code.
 
@@ -78,8 +99,9 @@ python3 -m unittest discover -s plugins/workflow-observer/tests -p 'test_*.py'
 python3 plugins/workflow-observer/scripts/workflow_observer_cli.py integrity
 ```
 
-The v0.2 suites create only isolated temporary fake portable and fake LLM Wiki
-roots. Do not point learning tests at a live observation store. The source
+The completed v0.2 and Phase 1 suites create only isolated temporary fake
+portable and fake LLM Wiki roots. Do not point learning tests at a live
+observation store. The source
 archive allowlist includes only direct policy `.json` files, the JCS
 conformance fixture, and the exact approved v0.2 design and plan in addition to
 the existing package surface.
@@ -88,6 +110,10 @@ The release archive also contains the frozen 20 forward and 8 lifecycle
 manifests, repository evaluator/harness tests, specifications, plans, historical
 failure evidence, and a machine-readable completeness inventory. Model-bearing
 evaluations are not required for ordinary installation.
+
+Archive member digests belong in `SHA256SUMS.json`; a whole-ZIP hash belongs in
+external local or independently published acceptance evidence and cannot be
+self-authenticated by the ZIP.
 
 The plugin does not send observation data off-device. v0.2 snapshots grant no
 authority to change workflows, create proposals, open branches or pull

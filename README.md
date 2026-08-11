@@ -21,20 +21,19 @@ automatically.
 
 ## Workflow Evolution Foundation v0.2
 
-The v0.2 foundation design and implementation plan are approved as of
-2026-08-02.
-Implementation started on 2026-08-02; Tasks 1 through 10 are complete on the
-design branch. Task 11 has been implemented with the 15-case acceptance matrix
-and bounded fake-store historical dry run completed on this branch.
-These capabilities are now included in public prerelease
+Workflow Evolution Foundation v0.2, including Task 11's 15-case matrix and
+bounded fake-store historical dry run, is complete. These capabilities are
+included in public prerelease
 [`v0.2.0-rc1`](https://github.com/chouchunming/workflow-observatory/releases/tag/v0.2.0-rc1).
 See also the release SHA (`workflow-observatory-0.2.0-rc1-65ec366.zip.sha256`)
 published with the archive.
 
-The current plugin release remains `0.1.x`; `v0.2.0-rc1` is a public
-pre-release for dry-run validation and non-authoritative review.
+The current stable GitHub release is v0.1.0; v0.2.0-rc1 is a public prerelease.
+The GitHub source-install commands below use the repository's published default
+branch. They do not install the unreleased Phase 1 checkpoint from this design
+branch.
 
-The bounded milestone will extend the existing observation layer through this
+The bounded milestone extended the existing observation layer through this
 evidence path:
 
 ```text
@@ -49,7 +48,7 @@ The milestone preserves the local-first privacy boundary and separates outcome
 analysis from lifecycle health. It also defines stable-read checks, explicit
 workflow generations, versioned analysis policies, per-metric missingness, and
 Episode-level Decision Event support. Its 11 reviewable implementation tasks
-end in a 15-case non-model acceptance matrix against isolated fake stores.
+ended in a 15-case non-model acceptance matrix against isolated fake stores.
 
 `snapshot-input` is the adapter-neutral, canonical machine-readable acquisition
 boundary. `snapshot` reruns that acquisition for a stable-read check, performs
@@ -91,11 +90,20 @@ and
 
 ## Workflow Observatory v0.3 Phase 1 checkpoint
 
-Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+Phase 1 is an unreleased implementation checkpoint, not a v0.3 release or
+publication.
+Its commit-pinned implementation baseline is
+`53d45af5344dc5fc231723802dad70fa5a0b564a`.
 It implements the explicit artifact schema registry and policies, pure derived
 migrations, the exact invalidation v2 writer with legacy reads, Snapshot Input
 and Learning Snapshot v2 zero-sampling semantics, v1/v2 Learning Snapshot
 readback and publication dispatch, and the fixed 12-case acceptance matrix.
+
+Phase 1 preserves existing observation v1, invalidation v1, and Learning
+Snapshot v1/v2 artifact bytes byte-for-byte. Readback and pure derived
+migrations never rewrite those artifacts in place.
+Zero-sampling fields are schema semantics only: they state that no record/sample
+selection policy ran; Phase 1 does not select, retain, drop, or sample records.
 
 The checkpoint does not implement the cooperative lock/CAS/maintenance
 transaction, a durable health-event sink/store/reporting path,
@@ -106,8 +114,86 @@ decisions, or a Windows lock backend.
 - Linux native runtime verification: pending; Linux support is not yet certified.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
+The executable contract is the
+[fixed 12-case schema migration acceptance test](plugins/workflow-observer/tests/test_schema_migration_acceptance.py).
+Roadmap and backlog items describe future design work; they are not
+implementation authority.
 The next design unit is the Phase 2 cross-platform same-machine writer-safety
 plan. Phase 1 does not authorize Phase 2 code.
+
+### Phase 1 verification boundary
+
+Run the macOS gates from a clean checkout of one reviewed checkpoint whose
+history contains the implementation baseline:
+
+```bash
+test "$(git merge-base 53d45af5344dc5fc231723802dad70fa5a0b564a HEAD)" = \
+  53d45af5344dc5fc231723802dad70fa5a0b564a
+for py in 3.11 3.12 3.13 3.14; do
+  caffeinate -i -m uv run --no-project --python "$py" \
+    python -m unittest \
+    plugins/workflow-observer/tests/test_schema_migration_acceptance.py -v
+done
+caffeinate -i -m python3 -m unittest discover \
+  -s plugins/workflow-observer/tests -p 'test_*.py' -v
+mkdir -p evidence/dist/phase1-verify-a evidence/dist/phase1-verify-b
+rm -f evidence/dist/phase1-verify-{a,b}/workflow-observatory-0.3.0-phase1-verify.zip
+caffeinate -i -m python3 evidence/scripts/package_workflow_observatory.py \
+  --version 0.3.0-phase1-verify
+cp evidence/dist/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-a/
+caffeinate -i -m python3 evidence/scripts/package_workflow_observatory.py \
+  --version 0.3.0-phase1-verify
+cp evidence/dist/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-b/
+cmp evidence/dist/phase1-verify-a/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-b/workflow-observatory-0.3.0-phase1-verify.zip
+```
+
+Linux certification must use a native Linux environment and an explicitly
+pinned reviewed checkpoint. It remains pending; these commands are the gate,
+not a claim that it has run:
+
+```bash
+PHASE1_CANDIDATE_COMMIT="${PHASE1_CANDIDATE_COMMIT:?set reviewed checkpoint SHA}"
+git switch --detach "$PHASE1_CANDIDATE_COMMIT"
+test "$(git rev-parse HEAD)" = "$PHASE1_CANDIDATE_COMMIT"
+test "$(git merge-base 53d45af5344dc5fc231723802dad70fa5a0b564a HEAD)" = \
+  53d45af5344dc5fc231723802dad70fa5a0b564a
+uname -a
+python3 --version
+uv --version
+for py in 3.11 3.12 3.13 3.14; do
+  uv run --no-project --python "$py" python -m unittest \
+    plugins/workflow-observer/tests/test_schema_migration_acceptance.py -v
+done
+python3 -m unittest discover \
+  -s plugins/workflow-observer/tests -p 'test_*.py' -v
+mkdir -p evidence/dist/phase1-verify-a evidence/dist/phase1-verify-b
+rm -f evidence/dist/phase1-verify-{a,b}/workflow-observatory-0.3.0-phase1-verify.zip
+python3 evidence/scripts/package_workflow_observatory.py \
+  --version 0.3.0-phase1-verify
+cp evidence/dist/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-a/
+python3 evidence/scripts/package_workflow_observatory.py \
+  --version 0.3.0-phase1-verify
+cp evidence/dist/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-b/
+cmp evidence/dist/phase1-verify-a/workflow-observatory-0.3.0-phase1-verify.zip \
+  evidence/dist/phase1-verify-b/workflow-observatory-0.3.0-phase1-verify.zip
+```
+
+Pass criterion: 12/12 on every requested interpreter with no skip, the complete
+plugin suite with no failure, and two exact-inventory archives with
+byte-identical ZIP bytes.
+
+Write platform evidence outside the package inventory at
+`evidence/dist/phase1-acceptance/<platform>/<candidate-commit>/`. Record the
+candidate commit, implementation baseline, timestamp, distribution, kernel,
+architecture, Python versions, exact commands, test counts, skips, failures,
+and exit statuses, archive filenames and SHA-256 hashes, and byte-comparison
+result. That ignored local directory may be copied to independently published
+acceptance evidence; it is not part of the release archive.
 
 ## Install from GitHub
 
@@ -135,8 +221,9 @@ Remove the plugin with:
 codex plugin remove workflow-observer@workflow-observatory
 ```
 
-Removal does not delete the portable observation store. Delete or export local
-data separately according to your own retention policy.
+Removal does not delete the portable observation store. This release provides
+no product delete or export operation. Manual filesystem deletion or copying is
+an operator action, not a product delete/export operation.
 
 ## Storage
 
@@ -178,6 +265,10 @@ Release archives contain:
   composite release-acceptance boundary;
 - `SHA256SUMS.json`, mapping every packaged file and repository evidence path
   to source and portable SHA-256 digests.
+
+A ZIP archive hash must be recorded outside the ZIP in local or independently
+published acceptance evidence; `SHA256SUMS.json` authenticates members but
+cannot authenticate its containing archive.
 
 Author-specific paths are normalized only in archive copies. Production raw
 inputs, observations, credentials, local configuration, caches, and temporary

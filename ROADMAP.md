@@ -3,11 +3,13 @@
 This roadmap contains only Workflow Observatory product work. Personal LLM Wiki
 tasks and production observations are intentionally excluded.
 
-## Now — 0.1.x release hardening
+## Current public release line
 
+- Maintain stable release `v0.1.0` and public prerelease `v0.2.0-rc1`; the
+  unreleased Phase 1 checkpoint is not on this release line.
 - Keep the completed deterministic archive and clean-room gate passing on
-  Python 3.11+ and current Codex for every 0.1.x release.
-- Publish the public MIT-licensed marketplace with its specifications, plans,
+  Python 3.11+ and current Codex for future releases.
+- Maintain the public MIT-licensed marketplace with its specifications, plans,
   complete test evidence, and SHA-256 inventory.
 - Keep the implemented sharded evaluator coordinator, ordered leases, sealed
   worker evidence, cleanup recovery, and opt-in Marketplace CLI passing their
@@ -26,16 +28,13 @@ The implemented worker layout, isolation model, retry policy, and RED/GREEN reco
 are documented in
 [`docs/parallel-evaluation-plan.md`](docs/parallel-evaluation-plan.md).
 
-## Approved next milestone — Workflow Evolution Foundation v0.2
+## Completed milestone — Workflow Evolution Foundation v0.2
 
-Status: design and implementation plan approved as of 2026-08-02.
-Implementation started on 2026-08-02; all 11 milestone tasks are complete on the
-design branch. The v0.2 15-case non-model acceptance matrix and bounded
-fake-store historical dry run are included in public prerelease
+Workflow Evolution Foundation v0.2, including Task 11's 15-case matrix and
+bounded fake-store historical dry run, is complete.
+All 11 milestone tasks and the supported-interpreter execution completed before
+the v0.2 checkpoint was included in public prerelease
 [`v0.2.0-rc1`](https://github.com/chouchunming/workflow-observatory/releases/tag/v0.2.0-rc1).
-
-`supported-interpreter execution` remains pending under a separate approval and
-is not part of this milestone.
 
 The bounded foundation turns privacy-minimized observations into reproducible,
 non-authoritative learning evidence without changing workflows automatically:
@@ -48,7 +47,7 @@ Episode v2
     -> stable observational candidates
 ```
 
-Implementation is divided into 11 independently reviewable TDD units:
+Implementation was divided into 11 independently reviewable TDD units:
 
 1. Add RFC 8785 JCS identity primitives and deterministic code-artifact
    manifests.
@@ -67,7 +66,7 @@ Implementation is divided into 11 independently reviewable TDD units:
 9. Require manifest A/B stable reads and atomic Learning Snapshot publication.
 10. Update learning, telemetry, improving, packaging, and user-facing
     contracts without enabling mutation.
-11. Pass the 15-case non-model acceptance matrix across isolated fake stores
+11. Passed the 15-case non-model acceptance matrix across isolated fake stores
     and the supported CPython 3.11–3.14 matrix.
 
 The completed Task 10 contract routes learning through canonical
@@ -84,7 +83,6 @@ The following remain outside this milestone and require later approved designs:
 - execution of approval gates, workflow changes, branches, or pull requests;
 - post-hoc evaluation artifacts and immutable health-event history/streams;
 - background scheduling, network transport, and automatic live-data analysis;
-- formal acceptance execution, including the Task 11 interpreter execution matrix;
 - causal or cross-runtime claims without an explicit comparability policy.
 
 Any future Evolution Proposal must reference `snapshot_id + candidate_id` so
@@ -98,11 +96,20 @@ and
 
 ## Workflow Observatory v0.3 Phase 1 checkpoint
 
-Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+Phase 1 is an unreleased implementation checkpoint, not a v0.3 release or
+publication.
+The commit-pinned implementation baseline is
+`53d45af5344dc5fc231723802dad70fa5a0b564a`.
 It implements the explicit artifact schema registry and policies, pure derived
 migrations, the exact invalidation v2 writer with legacy reads, Snapshot Input
 and Learning Snapshot v2 zero-sampling semantics, v1/v2 Learning Snapshot
 readback and publication dispatch, and the fixed 12-case acceptance matrix.
+
+Phase 1 preserves existing observation v1, invalidation v1, and Learning
+Snapshot v1/v2 artifact bytes byte-for-byte. Readback and pure derived
+migrations never rewrite those artifacts in place.
+Zero-sampling fields are schema semantics only: they state that no record/sample
+selection policy ran; Phase 1 does not select, retain, drop, or sample records.
 
 The checkpoint does not implement the cooperative lock/CAS/maintenance
 transaction, a durable health-event sink/store/reporting path,
@@ -116,7 +123,12 @@ decisions, or a Windows lock backend.
 Linux certification remains a concrete pending gate: on one commit-pinned
 candidate, run the unchanged 12-case CPython matrix, the complete plugin suite,
 and two exact-inventory package builds in a native Linux environment. Record
-the distribution, kernel, Python versions, commit, and artifact SHA-256 hashes.
+the distribution, kernel, architecture, Python versions, commit, command exit
+statuses, test counts, archive hashes, and byte-comparison result outside the
+package at `evidence/dist/phase1-acceptance/linux/<candidate-commit>/`. Use the
+exact commands and pass criteria in the
+[Phase 1 verification boundary](README.md#phase-1-verification-boundary) and the
+[fixed 12-case test](plugins/workflow-observer/tests/test_schema_migration_acceptance.py).
 
 ## Next design unit — same-machine writer safety
 
@@ -129,6 +141,9 @@ and the Windows lock backend and verification boundary.
 Later operability phases must separately design the durable health-event
 sink/store/reporting path; retention/export/delete/restore/purge operations;
 and observation v3 sampling decisions.
+
+Roadmap and backlog items describe future design work; they are not
+implementation authority.
 
 ## Later — learning and ecosystem expansion
 

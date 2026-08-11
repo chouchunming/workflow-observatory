@@ -64,6 +64,29 @@ PHASE1_ACCEPTANCE_PACKAGE_INVENTORY = frozenset(
         *PHASE1_ACCEPTANCE_TEST_INVENTORY,
     }
 )
+PHASE1_IMPLEMENTATION_BASELINE = "53d45af5344dc5fc231723802dad70fa5a0b564a"
+PHASE1_CHECKPOINT_STATUS = (
+    "Phase 1 is an unreleased implementation checkpoint, not a v0.3 release "
+    "or publication."
+)
+V02_COMPLETION_STATUS = (
+    "Workflow Evolution Foundation v0.2, including Task 11's 15-case matrix "
+    "and bounded fake-store historical dry run, is complete."
+)
+LEGACY_BYTE_PRESERVATION = (
+    "Phase 1 preserves existing observation v1, invalidation v1, and Learning "
+    "Snapshot v1/v2 artifact bytes byte-for-byte. Readback and pure derived "
+    "migrations never rewrite those artifacts in place."
+)
+ZERO_SAMPLING_BOUNDARY = (
+    "Zero-sampling fields are schema semantics only: they state that no "
+    "record/sample selection policy ran; Phase 1 does not select, retain, "
+    "drop, or sample records."
+)
+BACKLOG_AUTHORITY_BOUNDARY = (
+    "Roadmap and backlog items describe future design work; they are not "
+    "implementation authority."
+)
 
 
 class ArchiveTests(unittest.TestCase):
@@ -102,6 +125,12 @@ class ArchiveTests(unittest.TestCase):
             return json.loads(
                 bundle.read("workflow-observatory/SHA256SUMS.json")
             )
+
+    def _public_documents(self):
+        return {
+            path: (self.source / path).read_text(encoding="utf-8")
+            for path in PHASE1_ACCEPTANCE_DOCUMENT_INVENTORY
+        }
 
     def _assert_live_v02_inventory(self, archive):
         inventory = self._inventory(archive)
@@ -252,6 +281,99 @@ class ArchiveTests(unittest.TestCase):
             )
         )
         self.assertEqual(PHASE1_ACCEPTANCE_PACKAGE_INVENTORY, selected)
+
+    def test_public_documents_close_phase1_schema_and_authority_boundaries(self):
+        for path, text in self._public_documents().items():
+            with self.subTest(path=path):
+                normalized = " ".join(text.split())
+                self.assertIn(PHASE1_IMPLEMENTATION_BASELINE, normalized)
+                self.assertIn(PHASE1_CHECKPOINT_STATUS, normalized)
+                self.assertIn(V02_COMPLETION_STATUS, normalized)
+                self.assertIn(LEGACY_BYTE_PRESERVATION, normalized)
+                self.assertIn(ZERO_SAMPLING_BOUNDARY, normalized)
+                self.assertIn(BACKLOG_AUTHORITY_BOUNDARY, normalized)
+                self.assertIn("test_schema_migration_acceptance.py", normalized)
+
+    def test_public_documents_remove_stale_v02_and_phase1_checklists(self):
+        documents = self._public_documents()
+        roadmap = documents["ROADMAP.md"]
+        todo = documents["TODO.md"]
+        for stale in (
+            "`supported-interpreter execution` remains pending",
+            "formal acceptance execution, including the Task 11 interpreter",
+            "Execute Task 11's 15-case acceptance matrix",
+        ):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, roadmap + todo)
+        phase1_todo = todo.split(
+            "## Workflow Observatory v0.3 Phase 1 checkpoint", 1
+        )[1].split("\n## ", 1)[0]
+        self.assertNotIn("- [ ]", phase1_todo)
+        self.assertIn("## Backlog and design gates — not implementation authority", todo)
+
+    def test_root_readme_records_exact_platform_acceptance_contract(self):
+        readme = self._public_documents()["README.md"]
+        normalized = " ".join(readme.split())
+        for command in (
+            'for py in 3.11 3.12 3.13 3.14; do',
+            'caffeinate -i -m uv run --no-project --python "$py"',
+            "caffeinate -i -m python3 -m unittest discover",
+            'PHASE1_CANDIDATE_COMMIT="${PHASE1_CANDIDATE_COMMIT:?set reviewed checkpoint SHA}"',
+            'uv run --no-project --python "$py" python -m unittest',
+            "python3 -m unittest discover",
+            "python3 evidence/scripts/package_workflow_observatory.py",
+            "cmp evidence/dist/phase1-verify-a/",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, readme)
+        for evidence_field in (
+            "candidate commit",
+            "implementation baseline",
+            "distribution",
+            "kernel",
+            "architecture",
+            "Python versions",
+            "test counts, skips, failures, and exit statuses",
+            "archive filenames and SHA-256 hashes",
+            "byte-comparison result",
+        ):
+            with self.subTest(evidence_field=evidence_field):
+                self.assertIn(evidence_field, normalized)
+        self.assertIn(
+            "evidence/dist/phase1-acceptance/<platform>/<candidate-commit>/",
+            readme,
+        )
+        self.assertIn(
+            "Pass criterion: 12/12 on every requested interpreter with no "
+            "skip, the complete plugin suite with no failure, and two "
+            "exact-inventory archives with byte-identical ZIP bytes.",
+            normalized,
+        )
+
+    def test_public_release_and_archive_hash_language_matches_repository_state(self):
+        documents = self._public_documents()
+        readme = documents["README.md"]
+        normalized = " ".join(readme.split())
+        todo = documents["TODO.md"]
+        self.assertIn(
+            "The current stable GitHub release is v0.1.0; v0.2.0-rc1 is a "
+            "public prerelease.",
+            normalized,
+        )
+        self.assertIn("- [x] Publish the public MIT repository.", todo)
+        self.assertIn("- [x] Publish the stable v0.1.0 release archive.", todo)
+        self.assertIn(
+            "Manual filesystem deletion or copying is an operator action, not "
+            "a product delete/export operation.",
+            normalized,
+        )
+        self.assertIn(
+            "A ZIP archive hash must be recorded outside the ZIP in local or "
+            "independently published acceptance evidence; `SHA256SUMS.json` "
+            "authenticates members but cannot authenticate its containing "
+            "archive.",
+            normalized,
+        )
 
     def test_archive_rejects_unlisted_v03_phase1_document_sibling(self):
         sibling = self.source / "docs/superpowers/specs/unlisted-v0.3-sibling.md"
