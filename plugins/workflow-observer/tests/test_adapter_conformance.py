@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -287,6 +288,154 @@ class AdapterConformanceTests(unittest.TestCase):
             (validation.returncode, validation.stdout, validation.stderr),
         )
 
+    def test_existing_legacy_tombstone_is_readable_and_never_rewritten(self):
+        from wiki_observations import (
+            InvalidationEvidence,
+            ObservationError,
+            ObservationPaths,
+            collect_record_documents,
+            invalidate_observation,
+        )
+
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "portable", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        portable_root = self.homes["portable"] / "store"
+        legacy_bytes = (
+            "---\n"
+            "type: observation-invalidation\n"
+            f"title: Invalidate {run_id}\n"
+            'tags: ["observation","invalidation"]\n'
+            "timestamp: 2026-08-02T23:17:45+08:00\n"
+            f"target_run_id: {run_id}\n"
+            "reason: legacy-reason-remains-byte-identical\n"
+            "sources: []\n"
+            "---\n"
+        ).encode("utf-8")
+        tombstone = (
+            portable_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        tombstone.write_bytes(legacy_bytes)
+
+        collection = collect_record_documents(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        )
+        self.assertEqual(
+            (InvalidationEvidence(
+                run_id,
+                "2026-08-02T15:17:45Z",
+                hashlib.sha256(legacy_bytes).hexdigest(),
+            ),),
+            collection.invalidations,
+        )
+        with self.assertRaisesRegex(ObservationError, "already invalidated"):
+            invalidate_observation(
+                ObservationPaths.from_root(portable_root),
+                run_id,
+                "new reason must not replace legacy bytes",
+                now=datetime(2026, 8, 11, 1, 2, 3, tzinfo=timezone.utc),
+            )
+        self.assertEqual(legacy_bytes, tombstone.read_bytes())
+
+    def test_legacy_and_explicit_v2_invalidation_evidence_has_adapter_parity(self):
+        from wiki_observations import ObservationPaths, collect_record_documents
+
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "portable", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        portable_root = self.homes["portable"] / "store"
+        portable_record = portable_root / "wiki/observations" / f"{run_id}.md"
+        llm_record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        llm_record.write_bytes(portable_record.read_bytes())
+        legacy_bytes = (
+            "---\n"
+            "type: observation-invalidation\n"
+            f"title: Invalidate {run_id}\n"
+            'tags: ["observation","invalidation"]\n'
+            "timestamp: 2026-08-02T23:17:45+08:00\n"
+            f"target_run_id: {run_id}\n"
+            "reason: legacy parity\n"
+            "sources: []\n"
+            "---\n"
+        ).encode("utf-8")
+        v2_bytes = (
+            "---\n"
+            "type: observation-invalidation\n"
+            "artifact_type: observation-invalidation\n"
+            "schema_version: 2\n"
+            f"run_id: {run_id}\n"
+            "timestamp: 2026-08-02T15:17:45Z\n"
+            "---\n"
+        ).encode("utf-8")
+        portable_tombstone = (
+            portable_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        llm_tombstone = (
+            self.llm_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        portable_tombstone.write_bytes(legacy_bytes)
+        llm_tombstone.write_bytes(v2_bytes)
+
+        legacy = collect_record_documents(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        ).invalidations[0]
+        explicit = collect_record_documents(
+            ObservationPaths.from_root(self.llm_root), LLMWIKI_SEMANTICS
+        ).invalidations[0]
+        self.assertEqual((legacy.run_id, legacy.timestamp),
+                         (explicit.run_id, explicit.timestamp))
+        self.assertEqual(hashlib.sha256(legacy_bytes).hexdigest(),
+                         legacy.source_sha256)
+        self.assertEqual(hashlib.sha256(v2_bytes).hexdigest(),
+                         explicit.source_sha256)
+
+        portable_tombstone.write_bytes(v2_bytes)
+        portable_v2 = collect_record_documents(
+            ObservationPaths.from_root(portable_root), PORTABLE_SEMANTICS
+        ).invalidations
+        llmwiki_v2 = collect_record_documents(
+            ObservationPaths.from_root(self.llm_root), LLMWIKI_SEMANTICS
+        ).invalidations
+        self.assertEqual(portable_v2, llmwiki_v2)
+
+    def test_llmwiki_finish_classifies_complete_draft_before_delegation(self):
+        started = self.start("llmwiki")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        original = record.read_bytes()
+        record.write_bytes(original.replace(
+            b'type: "observation"\n',
+            b'type: "observation"\nartifact_type: workflow-observation\n',
+            1,
+        ))
+        malformed = record.read_bytes()
+        marker = self._select_delegate_probe()
+
+        rejected = self.run_cli(
+            "llmwiki", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+        )
+
+        self.assertEqual(2, rejected.returncode, rejected.stderr)
+        self.assertEqual("", rejected.stdout)
+        self.assertIn(
+            "explicit Markdown artifact_type requires schema_version",
+            rejected.stderr,
+        )
+        self.assertFalse(marker.exists(), "malformed draft reached the delegate")
+        self.assertEqual(malformed, record.read_bytes())
+
     def test_invalidation_evidence_binds_timestamp_and_exact_tombstone_bytes(self):
         from wiki_observations import ObservationPaths, collect_record_documents
 
@@ -420,6 +569,72 @@ class AdapterConformanceTests(unittest.TestCase):
         )
         self.assertIn("schema_version: 2\n", record)
         self.assertIn("## Episode data\n", record)
+
+    def test_llmwiki_invalidate_uses_bundled_exact_v2_without_delegate(self):
+        marker = self._select_delegate_probe(exit_code=91)
+        started = self.start("llmwiki", title="Invalidate v2", schema_version=2)
+        self.assertEqual(0, started.returncode, started.stderr)
+        self.assertFalse(marker.exists())
+        run_id = started.stdout.strip()
+        finished = self.run_cli(
+            "llmwiki", "finish", run_id, "--status", "success",
+            "--from-file", str(self.completion),
+            "--episode-from-file", str(self.episode),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+
+        absent_run_id = "obs-20260811-010203-abcdef"
+        absent = self.run_cli(
+            "llmwiki", "invalidate", absent_run_id,
+            "--reason", "absent LLMWiki target",
+        )
+        self.assertEqual(2, absent.returncode, absent.stderr)
+        self.assertEqual("", absent.stdout)
+        self.assertIn("does not exist", absent.stderr)
+        self.assertFalse(
+            (self.llm_root / "wiki/observations/invalidations"
+             / f"{absent_run_id}.md").exists()
+        )
+        self.assertFalse(marker.exists(), "absent target reached the delegate")
+
+        reason_sentinel = "llmwiki-reason-must-not-enter-v2-bytes"
+        invalidated = self.run_cli(
+            "llmwiki", "invalidate", run_id,
+            "--reason", reason_sentinel,
+        )
+        self.assertEqual(
+            (0, "", ""),
+            (invalidated.returncode, invalidated.stdout, invalidated.stderr),
+        )
+        tombstone = (
+            self.llm_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        tombstone_bytes = tombstone.read_bytes()
+        lines = tombstone_bytes.decode("utf-8").splitlines()
+        self.assertEqual(
+            [
+                "---",
+                "type: observation-invalidation",
+                "artifact_type: observation-invalidation",
+                "schema_version: 2",
+                f"run_id: {run_id}",
+            ],
+            lines[:5],
+        )
+        self.assertRegex(
+            lines[5],
+            r"^timestamp: [0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        )
+        self.assertEqual(["---"], lines[6:])
+        self.assertNotIn(reason_sentinel.encode("utf-8"), tombstone_bytes)
+        self.assertFalse(marker.exists(), "invalidation reached the delegate")
+        validation = self.run_cli("llmwiki", "validate")
+        self.assertEqual(
+            (0, "valid records=1 invalidated=1\n", ""),
+            (validation.returncode, validation.stdout, validation.stderr),
+        )
+        self.assertFalse(marker.exists(), "validation reached the delegate")
 
     def test_llmwiki_report_current_task_layout_uses_selected_semantics(self):
         portable_root = self.homes["portable"] / "store"

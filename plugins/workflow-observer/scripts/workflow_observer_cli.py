@@ -104,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--episode-from-file")
     finish.add_argument("--superseded-by")
 
+    invalidate = subparsers.add_parser("invalidate")
+    invalidate.add_argument("run_id")
+    invalidate.add_argument("--reason", required=True)
+
     report = subparsers.add_parser("report")
     report.add_argument("--project")
     report.add_argument("--workspace")
@@ -206,7 +210,7 @@ def _directory_open_flags() -> int:
 
 
 def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
-    """Securely read only a draft's frontmatter to select its lifecycle core."""
+    """Securely classify a complete draft before selecting its lifecycle core."""
 
     if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
         raise ObservationError("validation", "run_id has an invalid format")
@@ -263,6 +267,13 @@ def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
                 )
             frontmatter.extend(chunk)
 
+        content = bytearray(frontmatter)
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+
         after = os.fstat(descriptor)
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         wiki_observations._assert_directory_identity(
@@ -282,24 +293,28 @@ def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
                 "validation", "observation record changed while reading schema"
             )
         try:
-            text = bytes(frontmatter).decode("utf-8", errors="strict")
+            text = bytes(content).decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise ObservationError(
-                "validation", "record frontmatter must be UTF-8 text"
+                "validation", "observation record must be UTF-8 text"
             ) from error
-        metadata, _body = wiki_observations._parse_frontmatter(text)
+        from artifact_schema import load_artifact_policy_set, parse_markdown_envelope
+
+        envelope = parse_markdown_envelope(
+            text,
+            expected_human_type="observation",
+            policies=load_artifact_policy_set(
+                Path(__file__).resolve().parents[1] / "policies"
+            ),
+        )
+        metadata = envelope.metadata
         if metadata.get("run_id") != run_id:
             raise ObservationError(
                 "validation", "record run_id does not match filename"
             )
         if metadata.get("status") != "draft":
             raise ObservationError("state", f"{run_id} is already final")
-        schema_version = metadata.get("schema_version", 1)
-        if type(schema_version) is not int or schema_version not in {1, 2}:
-            raise ObservationError(
-                "validation", "draft schema_version is ambiguous"
-            )
-        return schema_version
+        return envelope.artifact.schema_version
     finally:
         if descriptor >= 0:
             try:
@@ -593,6 +608,15 @@ def _run_bundled(
             payload,
             superseded_by=args.superseded_by,
             episode_v2=episode_v2,
+            semantics=semantics,
+        )
+        return 0
+    if args.command == "invalidate":
+        assert paths is not None
+        wiki_observations.invalidate_observation(
+            paths,
+            args.run_id,
+            args.reason,
             semantics=semantics,
         )
         return 0

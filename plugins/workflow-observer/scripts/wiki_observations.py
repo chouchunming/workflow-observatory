@@ -2227,17 +2227,22 @@ def finish_observation(
             raise ObservationError("io", str(close_error)) from close_error
 
 
-def _render_invalidation(run_id: str, reason: str, timestamp: datetime) -> str:
-    metadata: dict[str, object] = {
-        "type": "observation-invalidation",
-        "title": f"Invalidate {run_id}",
-        "tags": ["observation", "invalidation"],
-        "timestamp": timestamp.isoformat(),
-        "target_run_id": run_id,
-        "reason": reason,
-        "sources": [],
-    }
-    return _render_frontmatter(metadata)
+def _render_invalidation(run_id: str, timestamp: datetime) -> str:
+    canonical_timestamp = (
+        timestamp.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    return (
+        "---\n"
+        "type: observation-invalidation\n"
+        "artifact_type: observation-invalidation\n"
+        "schema_version: 2\n"
+        f"run_id: {run_id}\n"
+        f"timestamp: {canonical_timestamp}\n"
+        "---\n"
+    )
 
 
 def invalidate_observation(
@@ -2289,7 +2294,7 @@ def invalidate_observation(
             invalidations_fd, secure_paths.invalidations
         )
         destination_name = f"{run_id}.md"
-        content = _render_invalidation(run_id, reason, invalidated_at)
+        content = _render_invalidation(run_id, invalidated_at)
         try:
             temporary_name, temporary = _create_temporary_file(
                 invalidations_fd
@@ -2646,7 +2651,7 @@ def _metrics_from_record(body: str, status: object) -> dict[str, object]:
 
 
 def _read_invalidation_evidence(
-    content_bytes: bytes, filename: str
+    content_bytes: bytes, filename: str, artifact_policies: object
 ) -> InvalidationEvidence:
     try:
         content = content_bytes.decode("utf-8", errors="strict")
@@ -2654,45 +2659,26 @@ def _read_invalidation_evidence(
         raise ObservationError(
             "io", f"could not read invalidation tombstone: {error}"
         ) from error
-    metadata, body = _parse_frontmatter(content)
-    required = {
-        "type",
-        "title",
-        "tags",
-        "timestamp",
-        "target_run_id",
-        "reason",
-        "sources",
-    }
-    missing = sorted(required - set(metadata))
-    unexpected = sorted(set(metadata) - required)
-    if missing:
-        raise _validation(
-            f"invalidation tombstone is missing required field `{missing[0]}`"
+    try:
+        from artifact_schema import ArtifactSchemaError, parse_markdown_envelope
+
+        envelope = parse_markdown_envelope(
+            content,
+            expected_human_type="observation-invalidation",
+            policies=artifact_policies,
         )
-    if unexpected:
-        raise _validation(
-            f"invalidation tombstone has unexpected field `{unexpected[0]}`"
-        )
-    target = metadata.get("target_run_id")
-    if not isinstance(target, str) or _RUN_ID_RE.fullmatch(target) is None:
-        raise _validation("invalidation target_run_id has an invalid format")
+    except ArtifactSchemaError as error:
+        raise _validation(str(error)) from error
+    metadata = envelope.metadata
+    target_field = (
+        "run_id" if envelope.artifact.schema_version == 2 else "target_run_id"
+    )
+    target = metadata[target_field]
     if Path(filename).stem != target:
-        raise _validation("invalidation target_run_id must match its filename")
-    if metadata.get("type") != "observation-invalidation":
-        raise _validation("invalidation tombstone has an invalid type")
-    if metadata.get("title") != f"Invalidate {target}":
-        raise _validation("invalidation tombstone has an invalid title")
-    if metadata.get("tags") != ["observation", "invalidation"]:
-        raise _validation("invalidation tombstone has invalid tags")
-    if metadata.get("sources") != []:
-        raise _validation("invalidation tombstone sources must be empty")
+        raise _validation(f"invalidation {target_field} must match its filename")
     timestamp = _aware_datetime(
         metadata.get("timestamp"), "invalidation timestamp"
     ).astimezone(timezone.utc).replace(microsecond=0)
-    _validate_scalar(metadata.get("reason"), "invalidation reason")
-    if body:
-        raise _validation("invalidation tombstone must not contain a body")
     return InvalidationEvidence(
         target,
         timestamp.isoformat().replace("+00:00", "Z"),
@@ -2897,7 +2883,9 @@ def collect_record_documents(
                 entry,
                 f"invalidation tombstone {Path(name).stem}",
             )
-            evidence = _read_invalidation_evidence(content_bytes, name)
+            evidence = _read_invalidation_evidence(
+                content_bytes, name, artifact_policies
+            )
             target_record = by_id.get(evidence.run_id)
             if target_record is None:
                 raise _validation("invalidation points to no observation record")

@@ -34,6 +34,18 @@ class CoreParityTests(unittest.TestCase):
             hashlib.sha256(BUNDLED_CORE.read_bytes()).hexdigest(),
         )
 
+    def test_core_manifest_has_exact_generated_three_key_shape(self):
+        digest = hashlib.sha256(BUNDLED_CORE.read_bytes()).hexdigest()
+        expected = (
+            "{\n"
+            '  "schema_version": 2,\n'
+            f'  "source": "{EXPECTED_SOURCE}",\n'
+            f'  "sha256": "{digest}"\n'
+            "}\n"
+        ).encode("utf-8")
+
+        self.assertEqual(expected, CORE_SOURCE.read_bytes())
+
     def test_duplicate_key_manifest_fails_before_hash_comparison(self):
         duplicate = (
             b'{"schema_version":2,"source":"' + EXPECTED_SOURCE.encode("ascii")

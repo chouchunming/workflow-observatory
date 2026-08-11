@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 sys.path.insert(0, str(PLUGIN_ROOT / "tests"))
 from episode_schema import parse_episode_block
 from canonical_json import canonicalize, strict_json_loads
+from store_config import PORTABLE_SEMANTICS
 from workflow_evolution_fixtures import FakeObservationStore, load_projection_policy
 import workflow_observer_cli
 
@@ -150,6 +152,239 @@ class PortableCliTests(unittest.TestCase):
             ),
             "classification/validation/reporting must not rewrite v1 bytes",
         )
+
+    def test_invalidate_writes_exact_five_key_v2_without_reason(self):
+        from wiki_observations import (
+            InvalidationEvidence,
+            ObservationPaths,
+            collect_record_documents,
+        )
+
+        started = self.start()
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = run_cli(
+            self.home,
+            "finish",
+            run_id,
+            "--status",
+            "success",
+            "--from-file",
+            str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        root = self.home / "store"
+        reason_sentinel = "reason-must-not-enter-explicit-v2-bytes"
+
+        invalidated = run_cli(
+            self.home,
+            "invalidate",
+            run_id,
+            "--reason",
+            reason_sentinel,
+        )
+        self.assertEqual(
+            (0, "", ""),
+            (invalidated.returncode, invalidated.stdout, invalidated.stderr),
+        )
+
+        tombstone = root / "wiki/observations/invalidations" / f"{run_id}.md"
+        tombstone_bytes = tombstone.read_bytes()
+        lines = tombstone_bytes.decode("utf-8").splitlines()
+        self.assertEqual(
+            [
+                "---",
+                "type: observation-invalidation",
+                "artifact_type: observation-invalidation",
+                "schema_version: 2",
+                f"run_id: {run_id}",
+            ],
+            lines[:5],
+        )
+        self.assertRegex(
+            lines[5],
+            r"^timestamp: [0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        )
+        self.assertEqual(["---"], lines[6:])
+        self.assertNotIn(reason_sentinel.encode("utf-8"), tombstone_bytes)
+        timestamp = lines[5].removeprefix("timestamp: ")
+        collection = collect_record_documents(
+            ObservationPaths.from_root(root),
+            PORTABLE_SEMANTICS,
+        )
+        self.assertEqual(
+            (InvalidationEvidence(
+                run_id,
+                timestamp,
+                hashlib.sha256(tombstone_bytes).hexdigest(),
+            ),),
+            collection.invalidations,
+        )
+
+    def test_invalidate_validates_target_before_tombstone_write(self):
+        started = self.start()
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        root = self.home / "store"
+        absent_run_id = "obs-20260811-010203-abcdef"
+
+        rejected = run_cli(
+            self.home,
+            "invalidate",
+            absent_run_id,
+            "--reason",
+            "target is absent",
+        )
+        self.assertEqual(2, rejected.returncode, rejected.stderr)
+        self.assertEqual("", rejected.stdout)
+        self.assertIn("does not exist", rejected.stderr)
+
+        self.assertFalse(
+            (root / "wiki/observations/invalidations" / f"{absent_run_id}.md")
+            .exists()
+        )
+
+        finished = run_cli(
+            self.home,
+            "finish",
+            run_id,
+            "--status",
+            "success",
+            "--from-file",
+            str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        record = root / "wiki/observations" / f"{run_id}.md"
+        record.write_bytes(record.read_bytes().replace(
+            b'type: "observation"\n',
+            b'type: "observation"\nartifact_type: workflow-observation\n',
+            1,
+        ))
+        malformed = record.read_bytes()
+
+        rejected = run_cli(
+            self.home,
+            "invalidate",
+            run_id,
+            "--reason",
+            "malformed target",
+        )
+        self.assertEqual(2, rejected.returncode, rejected.stderr)
+        self.assertEqual("", rejected.stdout)
+        self.assertIn(
+            "explicit Markdown artifact_type requires schema_version",
+            rejected.stderr,
+        )
+
+        self.assertFalse(
+            (root / "wiki/observations/invalidations" / f"{run_id}.md").exists()
+        )
+        self.assertEqual(malformed, record.read_bytes())
+
+    def test_invalidate_requires_reason_before_store_mutation(self):
+        started = self.start()
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        root = self.home / "store"
+
+        rejected = run_cli(self.home, "invalidate", run_id)
+
+        self.assertEqual(2, rejected.returncode, rejected.stderr)
+        self.assertEqual("", rejected.stdout)
+        self.assertIn("following arguments are required: --reason", rejected.stderr)
+        self.assertFalse(
+            (root / "wiki/observations/invalidations" / f"{run_id}.md").exists()
+        )
+
+    def test_invalidation_schema_adversaries_fail_closed(self):
+        started = self.start()
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        finished = run_cli(
+            self.home,
+            "finish",
+            run_id,
+            "--status",
+            "success",
+            "--from-file",
+            str(self.completion),
+        )
+        self.assertEqual(0, finished.returncode, finished.stderr)
+        tombstone = (
+            self.home
+            / "store/wiki/observations/invalidations"
+            / f"{run_id}.md"
+        )
+        cases = {
+            "legacy extra schema-like field": (
+                "---\n"
+                "type: observation-invalidation\n"
+                f"title: Invalidate {run_id}\n"
+                'tags: ["observation","invalidation"]\n'
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                f"target_run_id: {run_id}\n"
+                "reason: duplicate observation\n"
+                "sources: []\n"
+                "artifact_type: observation-invalidation\n"
+                "---\n"
+            ),
+            "explicit v2 missing artifact_type": (
+                "---\n"
+                "type: observation-invalidation\n"
+                "schema_version: 2\n"
+                f"run_id: {run_id}\n"
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                "---\n"
+            ),
+            "human type and artifact type mismatch": (
+                "---\n"
+                "type: observation\n"
+                "artifact_type: observation-invalidation\n"
+                "schema_version: 2\n"
+                f"run_id: {run_id}\n"
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                "---\n"
+            ),
+            "unknown schema version": (
+                "---\n"
+                "type: observation-invalidation\n"
+                "artifact_type: observation-invalidation\n"
+                "schema_version: 3\n"
+                f"run_id: {run_id}\n"
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                "---\n"
+            ),
+            "duplicate run_id": (
+                "---\n"
+                "type: observation-invalidation\n"
+                "artifact_type: observation-invalidation\n"
+                "schema_version: 2\n"
+                f"run_id: {run_id}\n"
+                f"run_id: {run_id}\n"
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                "---\n"
+            ),
+            "duplicate schema_version": (
+                "---\n"
+                "type: observation-invalidation\n"
+                "artifact_type: observation-invalidation\n"
+                "schema_version: 2\n"
+                "schema_version: 2\n"
+                f"run_id: {run_id}\n"
+                "timestamp: 2026-08-11T01:02:03Z\n"
+                "---\n"
+            ),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                tombstone.write_text(content, encoding="utf-8")
+                rejected = run_cli(self.home, "validate")
+                self.assertEqual(2, rejected.returncode, rejected.stderr)
+                self.assertEqual("", rejected.stdout)
+                self.assertTrue(rejected.stderr.startswith(
+                    "workflow observer validation error:"
+                ))
 
     def test_v2_start_and_finish_write_one_canonical_episode_block(self):
         supplement = self.base / "episode.json"
