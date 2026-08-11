@@ -813,6 +813,10 @@ class AdapterConformanceTests(unittest.TestCase):
             portable_bundle["semantic_bundle"],
             llmwiki_bundle["semantic_bundle"],
         )
+        self.assertEqual(
+            canonicalize(portable_bundle["semantic_bundle"]),
+            canonicalize(llmwiki_bundle["semantic_bundle"]),
+        )
         self.assertEqual("portable", portable_bundle["adapter"]["name"])
         self.assertEqual("llmwiki", llmwiki_bundle["adapter"]["name"])
         self.assertNotIn(str(self.base), portable.stdout)

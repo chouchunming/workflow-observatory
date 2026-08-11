@@ -20,7 +20,13 @@ if (_LAYOUT_ROOT / ".agents/plugins/marketplace.json").is_file():
 else:
     REPOSITORY_ROOT = _LAYOUT_ROOT / "evidence"
     MARKETPLACE_ROOT = REPOSITORY_ROOT / "marketplace/workflow-observatory"
-sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
+for module_root in (
+    REPOSITORY_ROOT / "scripts",
+    MARKETPLACE_ROOT / "plugins/workflow-observer/scripts",
+    MARKETPLACE_ROOT / "plugins/workflow-observer/tests",
+):
+    if str(module_root) not in sys.path:
+        sys.path.insert(0, str(module_root))
 
 import package_workflow_observatory as packager
 from package_workflow_observatory import (
@@ -29,6 +35,10 @@ from package_workflow_observatory import (
     default_evidence,
     main,
     verify_archive,
+)
+from workflow_evolution_fixtures import (
+    APPROVED_PHASE1_ARCHIVE_INVENTORY,
+    select_phase1_archive_inventory,
 )
 
 
@@ -204,6 +214,12 @@ class ArchiveTests(unittest.TestCase):
             "2026-08-11-workflow-observatory-v0.3-phase-1-schema-migration.md",
             marketplace,
         )
+
+    def test_archive_contains_exact_phase1_acceptance_inventory(self):
+        build_archive(self.source, self.archive, self.evidence)
+        marketplace = set(self._inventory()["marketplace_files"])
+        selected = select_phase1_archive_inventory(marketplace)
+        self.assertEqual(APPROVED_PHASE1_ARCHIVE_INVENTORY, selected)
 
     def test_archive_rejects_unlisted_v03_phase1_document_sibling(self):
         sibling = self.source / "docs/superpowers/specs/unlisted-v0.3-sibling.md"

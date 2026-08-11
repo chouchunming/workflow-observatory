@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 
@@ -15,6 +18,75 @@ from policy_artifacts import load_policy_set
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 POLICY_ROOT = PLUGIN_ROOT / "policies"
 PRIVACY_SENTINEL = "PRIVATE-EVIDENCE-6f92d978b81f"
+ARTIFACT_MIGRATION_FIXTURE = (
+    PLUGIN_ROOT / "tests/fixtures/artifact_migration_vectors.json"
+)
+APPROVED_PHASE1_ARCHIVE_INVENTORY = frozenset({
+    "docs/superpowers/plans/"
+    "2026-08-11-workflow-observatory-v0.3-phase-1-schema-migration.md",
+    "docs/superpowers/specs/"
+    "2026-08-11-workflow-observatory-concurrency-operability-v0.3-design.md",
+    *{
+        "plugins/workflow-observer/policies/" + name
+        for name in (
+            "artifact_migration_registry.json",
+            "artifact_schema_registry.json",
+            "candidate_emission_policy.json",
+            "decision_support_policy.json",
+            "episode_projection.json",
+            "health_event_schema.json",
+            "lifecycle_health_policy.json",
+            "metric_semantics.json",
+            "producer_capabilities.json",
+            "quantile_policy.json",
+            "workflow_generation_mapping.json",
+        )
+    },
+    *{
+        "plugins/workflow-observer/scripts/" + name
+        for name in (
+            "artifact_migration.py",
+            "artifact_schema.py",
+            "canonical_json.py",
+            "episode_schema.py",
+            "learning_snapshot.py",
+            "policy_artifacts.py",
+            "snapshot_input.py",
+            "snapshot_store.py",
+            "store_config.py",
+            "wiki_observations.py",
+            "workflow_observer_cli.py",
+        )
+    },
+    "plugins/workflow-observer/tests/fixtures/artifact_migration_vectors.json",
+    "plugins/workflow-observer/tests/test_schema_migration_acceptance.py",
+})
+
+
+def select_phase1_archive_inventory(paths) -> frozenset[str]:
+    return frozenset(
+        path
+        for path in paths
+        if (
+            path.startswith("plugins/workflow-observer/policies/")
+            or (
+                path.startswith("plugins/workflow-observer/scripts/")
+                and path.endswith(".py")
+            )
+            or path in {
+                "docs/superpowers/plans/"
+                "2026-08-11-workflow-observatory-v0.3-phase-1-schema-migration.md",
+                "docs/superpowers/specs/"
+                "2026-08-11-workflow-observatory-concurrency-operability-v0.3-design.md",
+                "plugins/workflow-observer/tests/fixtures/"
+                "artifact_migration_vectors.json",
+                "plugins/workflow-observer/tests/"
+                "test_schema_migration_acceptance.py",
+            }
+        )
+    )
+
+
 _EXPECTED_RAW_SHA256 = {
     "v1": "5c798fb0e6b95e4f29868126d0d3f3d7dea986f9c46badc8543957a5ee2e8d9a",
     "v2": "62e0951e3ba1a08730d200c31a547d3fffaf42cd8a0090f955642eb9899c6b10",
@@ -223,12 +295,20 @@ def _v2_body() -> str:
 class FakeObservationStore:
     """Private temporary portable or LLMWiki observation fixture layout."""
 
-    def __init__(self, adapter: str):
+    def __init__(self, adapter: str, *, base: Path | None = None):
         if adapter not in {"portable", "llmwiki"}:
             raise ValueError("adapter must be portable or llmwiki")
         self.adapter = adapter
-        self.temporary = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary.name).resolve()
+        self.temporary = None
+        if base is None:
+            self.temporary = tempfile.TemporaryDirectory()
+            self.base = Path(self.temporary.name).resolve(strict=True)
+            self.base.chmod(0o700)
+        else:
+            self.base = Path(base).resolve(strict=False)
+            self.base.mkdir(mode=0o700)
+            self.base = self.base.resolve(strict=True)
+            self.base.chmod(0o700)
         if adapter == "portable":
             self.store_root = self.base / "portable-home" / "store"
             self.tasks = self.store_root / "wiki" / "tasks"
@@ -243,8 +323,7 @@ class FakeObservationStore:
             self.invalidations,
             self.locks,
         ):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory.chmod(0o700)
+            self._mkdir_private(directory)
 
         self.task_path = self.tasks / "fixture-task.md"
         self._write_private(self.task_path, b"# Fixture task\n")
@@ -267,16 +346,174 @@ class FakeObservationStore:
         self.v1_raw_sha256 = self.expected_raw_sha256["v1"]
         self.v2_raw_sha256 = self.expected_raw_sha256["v2"]
 
+    def _mkdir_private(self, path: Path) -> None:
+        path.resolve(strict=False).relative_to(self.base)
+        relative = path.relative_to(self.base)
+        cursor = self.base
+        for part in relative.parts:
+            cursor = cursor / part
+            cursor.mkdir(exist_ok=True, mode=0o700)
+            cursor.chmod(0o700)
+
     def _write_private(self, path: Path, content: bytes) -> None:
         path.resolve(strict=False).relative_to(self.base)
         path.write_bytes(content)
         path.chmod(0o600)
 
     def close(self) -> None:
-        self.temporary.cleanup()
+        if self.temporary is not None:
+            self.temporary.cleanup()
 
     def __enter__(self) -> "FakeObservationStore":
         return self
 
     def __exit__(self, *_exc_info) -> None:
         self.close()
+
+
+@dataclass(frozen=True)
+class ArtifactMigrationVector:
+    name: str
+    source_bytes: bytes
+    derived_bytes: bytes
+    source_sha256: str
+    derived_sha256: str
+
+
+def load_artifact_migration_vectors() -> dict[str, ArtifactMigrationVector]:
+    fixture_bytes = ARTIFACT_MIGRATION_FIXTURE.read_bytes()
+    fixture = json.loads(fixture_bytes)
+    vectors = {}
+    for row in fixture["vectors"]:
+        encoded = row["source_bytes_base64"]
+        insertion = row.get("source_bytes_base64_tail_insertion", "")
+        if insertion:
+            encoded = encoded[:-4] + insertion + encoded[-4:]
+        source = base64.b64decode(encoded, validate=True)
+        derived = (
+            bytes.fromhex(row["canonical_derived_utf8_hex"])
+            if "canonical_derived_utf8_hex" in row
+            else base64.b64decode(
+                row["canonical_derived_bytes_base64"], validate=True
+            )
+        )
+        if hashlib.sha256(source).hexdigest() != row["source_sha256"]:
+            raise AssertionError(f"reviewed {row['name']} source digest is stale")
+        if hashlib.sha256(derived).hexdigest() != row["derived_sha256"]:
+            raise AssertionError(f"reviewed {row['name']} result digest is stale")
+        vectors[row["name"]] = ArtifactMigrationVector(
+            name=row["name"],
+            source_bytes=source,
+            derived_bytes=derived,
+            source_sha256=row["source_sha256"],
+            derived_sha256=row["derived_sha256"],
+        )
+    return vectors
+
+
+class AcceptanceFixtureMatrix:
+    """One private, isolated fake Portable/LLMWiki pair per frozen case."""
+
+    _ADAPTERS = ("portable", "llmwiki")
+    _LIVE_ROOT_ENVIRONMENT = (
+        "WORKFLOW_OBSERVATORY_HOME",
+        "OBSERVATION_WIKI_ROOT",
+        "LLMWIKI_ROOT",
+    )
+
+    def __init__(self, root: Path, case_ids: tuple[str, ...]):
+        self.root = Path(root).resolve(strict=True)
+        if stat.S_IMODE(self.root.stat().st_mode) != 0o700:
+            raise AssertionError("acceptance root must be mode-0700")
+        self._case_ids = tuple(case_ids)
+        self._case_roots = {}
+        self._stores = {}
+        for case_id in self._case_ids:
+            case_root = self.root / case_id
+            case_root.mkdir(mode=0o700)
+            case_root.chmod(0o700)
+            self._case_roots[case_id] = case_root
+            self._stores[case_id] = {
+                adapter: FakeObservationStore(
+                    adapter,
+                    base=case_root / adapter,
+                )
+                for adapter in self._ADAPTERS
+            }
+
+    def case_root(self, case_id: str) -> Path:
+        return self._case_roots[case_id]
+
+    def stores(self, case_id: str) -> dict[str, FakeObservationStore]:
+        return dict(self._stores[case_id])
+
+    def assert_isolated(self) -> None:
+        live_roots = {
+            (Path.home() / ".codex/workflow-observatory").resolve(strict=False)
+        }
+        for name in self._LIVE_ROOT_ENVIRONMENT:
+            value = os.environ.get(name)
+            if value:
+                live_roots.add(Path(value).expanduser().resolve(strict=False))
+        for case_id in self._case_ids:
+            case_root = self.case_root(case_id).resolve(strict=True)
+            case_root.relative_to(self.root)
+            for store in self._stores[case_id].values():
+                for path in (store.base, store.store_root):
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(self.root)
+                    for live_root in live_roots:
+                        if resolved == live_root or live_root in resolved.parents:
+                            raise AssertionError(
+                                "acceptance fixture descends from a configured live root"
+                            )
+
+    def assert_fixture_provenance(self) -> None:
+        fixture_bytes = [ARTIFACT_MIGRATION_FIXTURE.read_bytes()]
+        for stores in self._stores.values():
+            fixture_bytes.extend(
+                content
+                for store in stores.values()
+                for content in store.expected_raw_bytes.values()
+            )
+        combined = b"\n".join(fixture_bytes).lower()
+        forbidden = (
+            b"/users/",
+            b"c:\\users\\",
+            b"password",
+            b"api_key",
+            b"api-key",
+            b"credential",
+            b"transcript",
+            b"prompt:",
+        )
+        present = [marker.decode("ascii") for marker in forbidden if marker in combined]
+        if present:
+            raise AssertionError(
+                "acceptance fixture contains forbidden provenance: "
+                + ", ".join(present)
+            )
+
+    def assert_private_modes(self) -> None:
+        for path in self.root.rglob("*"):
+            details = path.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                raise AssertionError("acceptance fixture contains a symlink")
+            expected = 0o700 if stat.S_ISDIR(details.st_mode) else 0o600
+            if stat.S_IMODE(details.st_mode) != expected:
+                raise AssertionError(
+                    "acceptance fixture mode is not private: "
+                    f"{path.relative_to(self.root)}="
+                    f"{stat.S_IMODE(details.st_mode):04o}"
+                )
+
+    def assert_no_publication_residue(self) -> None:
+        residue = sorted(
+            path.relative_to(self.root).as_posix()
+            for pattern in (".snapshot-*.tmp", "*.ready", "publish.release")
+            for path in self.root.rglob(pattern)
+        )
+        if residue:
+            raise AssertionError(
+                "acceptance publication residue remains: " + ", ".join(residue)
+            )
