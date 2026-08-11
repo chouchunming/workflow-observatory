@@ -65,7 +65,7 @@ decisions, or a Windows lock backend. These capabilities are tracked outside
 the Phase 1 completion checklist.
 
 - macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
-- Linux native runtime verification: pending; Linux support is not yet certified.
+- Linux native runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
 The next design unit is the Phase 2 cross-platform same-machine writer-safety
@@ -74,9 +74,9 @@ plan. Phase 1 does not authorize Phase 2 code.
 See the [fixed 12-case test](plugins/workflow-observer/tests/test_schema_migration_acceptance.py)
 and the [exact platform commands, pass criteria, and external evidence contract](README.md#phase-1-verification-boundary).
 
-## Pending platform verification
+## Platform verification
 
-- [ ] In a native Linux environment, run the exact commit-pinned 12-case
+- [x] In a native Linux environment, run the exact commit-pinned 12-case
   CPython matrix, complete plugin suite, and two exact-inventory package gates;
   record the distribution, kernel, architecture, Python versions, candidate
   commit, implementation baseline, exit statuses, test counts, archive hashes,

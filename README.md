@@ -111,7 +111,7 @@ retention/export/delete/restore/purge operations, observation v3 or sampling
 decisions, or a Windows lock backend.
 
 - macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
-- Linux native runtime verification: pending; Linux support is not yet certified.
+- Linux native runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
 The executable contract is the

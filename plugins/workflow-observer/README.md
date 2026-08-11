@@ -77,12 +77,12 @@ retention/export/delete/restore/purge operations, observation v3 or sampling
 decisions, or a Windows lock backend.
 
 - macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
-- Linux native runtime verification: pending; Linux support is not yet certified.
+- Linux native runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
 The executable contract is the
 [fixed 12-case test](tests/test_schema_migration_acceptance.py). The exact
-macOS and pending native-Linux commands, pass criteria, required evidence
+macOS and native-Linux commands, pass criteria, required evidence
 fields, and external evidence destination are in the repository
 [Phase 1 verification boundary](../../README.md#phase-1-verification-boundary).
 Roadmap and backlog items describe future design work; they are not

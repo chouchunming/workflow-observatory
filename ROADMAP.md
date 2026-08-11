@@ -117,16 +117,13 @@ retention/export/delete/restore/purge operations, observation v3 or sampling
 decisions, or a Windows lock backend.
 
 - macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
-- Linux native runtime verification: pending; Linux support is not yet certified.
+- Linux native runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
 - Windows backend/runtime verification: not implemented or run; Windows support is not certified.
 
-Linux certification remains a concrete pending gate: on one commit-pinned
-candidate, run the unchanged 12-case CPython matrix, the complete plugin suite,
-and two exact-inventory package builds in a native Linux environment. Record
-the distribution, kernel, architecture, Python versions, commit, command exit
-statuses, test counts, archive hashes, and byte-comparison result outside the
-package at `evidence/dist/phase1-acceptance/linux/<candidate-commit>/`. Use the
-exact commands and pass criteria in the
+Linux certification completed on native Linux aarch64 with the unchanged
+12-case CPython 3.11–3.14 matrix, the complete plugin suite, and two
+byte-identical exact-inventory package builds. The exact commands and continuing
+evidence contract remain in the
 [Phase 1 verification boundary](README.md#phase-1-verification-boundary) and the
 [fixed 12-case test](plugins/workflow-observer/tests/test_schema_migration_acceptance.py).
 
