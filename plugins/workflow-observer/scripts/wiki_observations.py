@@ -29,6 +29,7 @@ from policy_artifacts import (
 from store_config import AdapterSemantics, PORTABLE_SEMANTICS
 
 if TYPE_CHECKING:
+    from artifact_schema import ArtifactSchemaRef
     from episode_schema import EpisodeV2Supplement
 
 
@@ -216,6 +217,7 @@ class RecordDocument:
     run_id: str
     metadata: dict
     body: str
+    artifact: ArtifactSchemaRef
     source_sha256: str
     references: tuple[ReferenceEvidence, ...]
 
@@ -908,6 +910,209 @@ def _partial_outcome_has_incomplete_items(outcome: str) -> bool:
     return value not in {"", "none", "none.", "nothing", "n/a", "unknown"}
 
 
+def _historical_observation_errors(
+    metadata: dict[str, object],
+    body: str,
+    schema_version: int,
+) -> list[str]:
+    errors: list[str] = []
+    required = {
+        "type", "title", "tags", "run_id", "timestamp", "project", "workspace",
+        "workspace_id", "revision", "working_tree", "agent_surface", "task_type",
+        "workflow_variant", "status", "start_mode", "sources",
+    }
+    allowed = required | {"task_ref", "superseded_by"}
+    if schema_version == 2:
+        allowed |= {"schema_version", "workflow_generation"}
+        required = required | {"schema_version"}
+    for field in sorted(set(metadata) - allowed):
+        errors.append(f"unexpected frontmatter field `{field}`")
+    for field in sorted(required - set(metadata)):
+        errors.append(f"missing required field `{field}`")
+    if required - set(metadata):
+        return errors
+
+    if metadata.get("type") != "observation":
+        errors.append("type must be observation")
+    tags = metadata.get("tags")
+    if (
+        not isinstance(tags, list)
+        or not all(isinstance(tag, str) for tag in tags)
+        or not {"observation", "workflow"}.issubset(set(tags))
+    ):
+        errors.append("tags must include observation and workflow")
+    run_id = metadata.get("run_id")
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        errors.append("run_id has an invalid format")
+
+    try:
+        _aware_datetime(metadata.get("timestamp"), "timestamp")
+    except ObservationError as error:
+        errors.append(str(error))
+
+    sources = metadata.get("sources")
+    request = StartRequest(
+        title=metadata.get("title"),
+        project=metadata.get("project"),
+        workspace=metadata.get("workspace"),
+        workspace_id=metadata.get("workspace_id"),
+        revision=metadata.get("revision"),
+        working_tree=metadata.get("working_tree"),
+        agent_surface=metadata.get("agent_surface"),
+        start_mode=metadata.get("start_mode"),
+        task_type=metadata.get("task_type"),
+        workflow_variant=metadata.get("workflow_variant"),
+        task_ref=metadata.get("task_ref"),
+        sources=tuple(sources) if isinstance(sources, list) else sources,
+        episode_schema_version=metadata.get("schema_version", 1),
+        workflow_generation=metadata.get("workflow_generation"),
+    )
+    errors.extend(_start_request_errors(request))
+
+    status = metadata.get("status")
+    if not isinstance(status, str) or status not in FINAL_STATUSES | {"draft"}:
+        errors.append(f"invalid status `{status}`")
+    superseded_by = metadata.get("superseded_by")
+    if status == "draft":
+        if superseded_by is not None:
+            errors.append("draft record must not contain superseded_by")
+    elif status == "superseded":
+        if (
+            not isinstance(superseded_by, str)
+            or _RUN_ID_RE.fullmatch(superseded_by) is None
+        ):
+            errors.append("superseded status requires superseded_by")
+        elif superseded_by == run_id:
+            errors.append("superseded_by must not reference itself")
+    elif superseded_by is not None:
+        errors.append("superseded_by is only valid for superseded status")
+
+    try:
+        from episode_schema import (
+            EpisodeSchemaError,
+            validate_episode_envelope_structure,
+        )
+
+        human_body = validate_episode_envelope_structure(metadata, body)
+    except (EpisodeSchemaError, ObservationError) as error:
+        errors.append(str(error))
+        return errors
+
+    if status == "draft":
+        return errors
+    marker = "\n## Execution evidence"
+    if marker not in human_body:
+        return errors
+    _scope_text, completion_tail = human_body.split(marker, 1)
+    try:
+        completion, _derived = _parse_completion(
+            "## Execution evidence" + completion_tail,
+            allow_derived=True,
+        )
+    except ObservationError:
+        return errors
+    if status == "success" and completion.verification == "fail":
+        errors.append("success status cannot have fail verification")
+    if status == "partial":
+        if completion.follow_up == "None — no further action":
+            errors.append("partial status requires a follow-up action")
+        if not _partial_outcome_has_incomplete_items(completion.outcome):
+            errors.append("partial outcome must identify incomplete Included items")
+    return errors
+
+
+def _historical_invalidation_errors(
+    metadata: dict[str, object],
+    body: str,
+    schema_version: int,
+) -> list[str]:
+    if schema_version == 2:
+        required = {
+            "type",
+            "artifact_type",
+            "schema_version",
+            "run_id",
+            "timestamp",
+        }
+    else:
+        required = {
+            "type",
+            "title",
+            "tags",
+            "timestamp",
+            "target_run_id",
+            "reason",
+            "sources",
+        }
+    errors = [
+        *(
+            f"invalidation tombstone is missing required field `{field}`"
+            for field in sorted(required - set(metadata))
+        ),
+        *(
+            f"invalidation tombstone has unexpected field `{field}`"
+            for field in sorted(set(metadata) - required)
+        ),
+    ]
+    if required - set(metadata):
+        return errors
+    if metadata.get("type") != "observation-invalidation":
+        errors.append("invalidation tombstone has an invalid type")
+    if schema_version == 2:
+        if metadata.get("artifact_type") != "observation-invalidation":
+            errors.append("invalidation tombstone has an invalid artifact_type")
+        if metadata.get("schema_version") != 2:
+            errors.append("invalidation tombstone has an invalid schema_version")
+        run_id = metadata.get("run_id")
+        if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+            errors.append("invalidation run_id has an invalid format")
+    else:
+        target = metadata.get("target_run_id")
+        if not isinstance(target, str) or _RUN_ID_RE.fullmatch(target) is None:
+            errors.append("invalidation target_run_id has an invalid format")
+        if metadata.get("title") != f"Invalidate {target}":
+            errors.append("invalidation tombstone has an invalid title")
+        if metadata.get("tags") != ["observation", "invalidation"]:
+            errors.append("invalidation tombstone has invalid tags")
+        if metadata.get("sources") != []:
+            errors.append("invalidation tombstone sources must be empty")
+        try:
+            _validate_scalar(metadata.get("reason"), "invalidation reason")
+        except ObservationError as error:
+            errors.append(str(error))
+    try:
+        _aware_datetime(metadata.get("timestamp"), "invalidation timestamp")
+    except ObservationError as error:
+        errors.append(str(error))
+    if body:
+        errors.append("invalidation tombstone must not contain a body")
+    return errors
+
+
+def _validate_historical_markdown(
+    metadata: object,
+    body: str,
+    artifact: object,
+) -> list[str]:
+    """Validate pure historical Markdown semantics without reference I/O."""
+
+    if not isinstance(metadata, dict):
+        try:
+            metadata = dict(metadata)
+        except (TypeError, ValueError):
+            return ["Markdown metadata must be an object"]
+    artifact_type = getattr(artifact, "artifact_type", None)
+    schema_version = getattr(artifact, "schema_version", None)
+    if artifact_type == "workflow-observation" and schema_version in {1, 2}:
+        return _historical_observation_errors(metadata, body, schema_version)
+    if artifact_type == "observation-invalidation" and schema_version in {1, 2}:
+        return _historical_invalidation_errors(metadata, body, schema_version)
+    return [
+        f"Markdown artifact schema_version {schema_version!r} "
+        "has no historical validator"
+    ]
+
+
 def validate_record(
     metadata: dict,
     body: str,
@@ -915,6 +1120,7 @@ def validate_record(
     reference_chain: frozenset[str] | None = None,
     semantics: AdapterSemantics = PORTABLE_SEMANTICS,
     resolver: ReferenceResolver | None = None,
+    artifact: ArtifactSchemaRef | None = None,
 ) -> list[str]:
     errors: list[str] = []
     required = {
@@ -923,7 +1129,33 @@ def validate_record(
         "workflow_variant", "status", "start_mode", "sources",
     }
     if not isinstance(metadata, dict):
+        try:
+            metadata = dict(metadata)
+        except (TypeError, ValueError):
+            return ["observation metadata must be an object"]
+    if not all(isinstance(key, str) for key in metadata):
         return ["observation metadata must be an object"]
+    try:
+        from artifact_schema import (
+            ArtifactSchemaRef,
+            ArtifactSchemaError,
+            classify_markdown_artifact,
+            load_artifact_policy_set,
+        )
+
+        if artifact is None:
+            artifact = classify_markdown_artifact(
+                metadata,
+                body,
+                expected_human_type="observation",
+                policies=load_artifact_policy_set(
+                    Path(__file__).resolve().parents[1] / "policies"
+                ),
+            )
+        elif not isinstance(artifact, ArtifactSchemaRef):
+            return ["observation artifact classification has the wrong type"]
+    except (ArtifactSchemaError, OSError) as error:
+        return [str(error)]
     allowed = required | {
         "task_ref",
         "superseded_by",
@@ -1021,7 +1253,14 @@ def validate_record(
 
         projection = _episode_projection_policy()
         human_body, _episode = parse_episode_block(body, projection)
-        canonical_episode_projection(metadata, body, projection)
+        if artifact.schema_version not in {1, 2}:
+            raise EpisodeSchemaError("observation artifact schema is unsupported")
+        canonical_episode_projection(
+            metadata,
+            body,
+            projection,
+            artifact=artifact,
+        )
     except (EpisodeSchemaError, ObservationError) as error:
         errors.append(str(error))
 
@@ -2474,6 +2713,18 @@ def collect_record_documents(
         raise _validation("adapter semantics have the wrong type")
     if type(strict_layout) is not bool:
         raise _validation("strict layout mode must be a boolean")
+    try:
+        from artifact_schema import (
+            ArtifactSchemaError,
+            load_artifact_policy_set,
+            parse_markdown_envelope,
+        )
+
+        artifact_policies = load_artifact_policy_set(
+            Path(__file__).resolve().parents[1] / "policies"
+        )
+    except (ArtifactSchemaError, OSError) as error:
+        raise _validation(f"could not load artifact schema policy: {error}") from error
     root_fd = _open_report_root(secure_paths.root)
     try:
         root_metadata = os.fstat(root_fd)
@@ -2546,7 +2797,16 @@ def collect_record_documents(
                 raise ObservationError(
                     "io", f"could not read observation record {run_id}: {error}"
                 ) from error
-            metadata, body = _parse_frontmatter(content)
+            try:
+                envelope = parse_markdown_envelope(
+                    content,
+                    expected_human_type="observation",
+                    policies=artifact_policies,
+                )
+            except ArtifactSchemaError as error:
+                raise _validation(str(error)) from error
+            metadata = envelope.metadata
+            body = envelope.body
             if metadata.get("run_id") != run_id:
                 raise _validation("record run_id does not match filename")
             resolver = ReferenceResolver(
@@ -2560,6 +2820,7 @@ def collect_record_documents(
                 secure_paths,
                 semantics=semantics,
                 resolver=resolver,
+                artifact=envelope.artifact,
             )
             if validation_errors:
                 raise _validation(
@@ -2569,6 +2830,7 @@ def collect_record_documents(
                 run_id,
                 dict(metadata),
                 body,
+                envelope.artifact,
                 hashlib.sha256(content_bytes).hexdigest(),
                 resolver.references,
             ))

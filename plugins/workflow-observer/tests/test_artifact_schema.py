@@ -6,21 +6,34 @@ import sys
 from tempfile import TemporaryDirectory
 from types import MappingProxyType
 import unittest
+from unittest import mock
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 POLICY_ROOT = PLUGIN_ROOT / "policies"
 SCRIPTS = PLUGIN_ROOT / "scripts"
+TESTS = PLUGIN_ROOT / "tests"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(TESTS))
 
 from artifact_schema import (
     ArtifactPolicySet,
+    ArtifactSchemaError,
     classify_json_artifact,
     load_artifact_policy_set,
+    parse_markdown_envelope,
     validate_health_event_document,
 )
 from canonical_json import canonicalize, hash_canonical, strict_json_loads
 from policy_artifacts import load_policy_set
+from wiki_observations import ObservationPaths, validate_record
+from workflow_evolution_fixtures import (
+    FakeObservationStore,
+    PRIVACY_SENTINEL,
+    V1_BODY,
+    V1_METADATA,
+    v1_body_with_privacy_sentinel,
+)
 
 
 SCHEMA_ROWS = [
@@ -324,6 +337,16 @@ class EqualitySpoof:
         return True
 
 
+def render_markdown(metadata, body=""):
+    lines = ["---"]
+    for key, value in metadata.items():
+        lines.append(
+            f"{key}: {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+        )
+    lines.extend(["---", ""])
+    return "\n".join(lines) + body
+
+
 class ArtifactSchemaTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -427,6 +450,302 @@ class ArtifactSchemaTests(unittest.TestCase):
                 expected_artifact_type="health-event",
                 policies=policies,
             )
+
+    def test_markdown_classifier_accepts_only_exact_legacy_observation_matrix(self):
+        policies = self.load()
+        with FakeObservationStore("portable") as store:
+            cases = (
+                (store.v1_path.read_text(encoding="utf-8"), 1),
+                (store.v2_path.read_text(encoding="utf-8"), 2),
+            )
+            for text, version in cases:
+                with self.subTest(version=version):
+                    envelope = parse_markdown_envelope(
+                        text,
+                        expected_human_type="observation",
+                        policies=policies,
+                    )
+                    self.assertEqual(
+                        f"workflow-observation@{version}",
+                        envelope.artifact.schema_identity,
+                    )
+                    self.assertEqual(version, envelope.artifact.schema_version)
+                    self.assertEqual("observation", envelope.metadata["type"])
+
+    def test_markdown_classifier_accepts_matching_explicit_registered_artifact(self):
+        metadata = {
+            "type": "observation-invalidation",
+            "artifact_type": "observation-invalidation",
+            "schema_version": 2,
+            "run_id": "obs-20260811-040000-abcdef",
+            "timestamp": "2026-08-11T04:00:00Z",
+        }
+        envelope = parse_markdown_envelope(
+            render_markdown(metadata),
+            expected_human_type="observation-invalidation",
+            policies=self.load(),
+        )
+        self.assertEqual("observation-invalidation@2", envelope.artifact.schema_identity)
+        self.assertEqual(metadata, envelope.metadata)
+        self.assertEqual("", envelope.body)
+
+    def test_explicit_invalidation_rejects_legacy_labels(self):
+        metadata = {
+            "type": "observation-invalidation",
+            "artifact_type": "observation-invalidation",
+            "schema_version": 2,
+            "run_id": "obs-20260811-040000-abcdef",
+            "timestamp": "2026-08-11T04:00:00Z",
+            "title": "Invalidate obs-20260811-040000-abcdef",
+            "tags": ["observation", "invalidation"],
+            "target_run_id": "obs-20260811-040000-abcdef",
+            "reason": "invalid source evidence",
+            "sources": [],
+        }
+        with self.assertRaisesRegex(ArtifactSchemaError, "unexpected field"):
+            parse_markdown_envelope(
+                render_markdown(metadata),
+                expected_human_type="observation-invalidation",
+                policies=self.load(),
+            )
+
+    def test_markdown_classifier_accepts_exact_legacy_invalidation(self):
+        metadata = {
+            "type": "observation-invalidation",
+            "title": "Invalidate obs-20260811-040000-abcdef",
+            "tags": ["observation", "invalidation"],
+            "timestamp": "2026-08-11T04:00:00Z",
+            "target_run_id": "obs-20260811-040000-abcdef",
+            "reason": "invalid source evidence",
+            "sources": [],
+        }
+        envelope = parse_markdown_envelope(
+            render_markdown(metadata),
+            expected_human_type="observation-invalidation",
+            policies=self.load(),
+        )
+        self.assertEqual("observation-invalidation@1", envelope.artifact.schema_identity)
+
+    def test_markdown_classifier_fails_closed_on_ambiguous_or_mismatched_envelopes(self):
+        policies = self.load()
+        explicit_invalidation = {
+            "type": "observation-invalidation",
+            "artifact_type": "observation-invalidation",
+            "schema_version": 2,
+            "run_id": "obs-20260811-040000-abcdef",
+            "timestamp": "2026-08-11T04:00:00Z",
+        }
+        invalid = {
+            "absent version with extra field": render_markdown(
+                {**V1_METADATA, "future": True}, V1_BODY
+            ),
+            "artifact without version": render_markdown(
+                {**V1_METADATA, "artifact_type": "workflow-observation"},
+                V1_BODY,
+            ),
+            "type mismatch": render_markdown(
+                {**explicit_invalidation, "artifact_type": "workflow-observation"}
+            ),
+            "unknown version": render_markdown(
+                {**explicit_invalidation, "schema_version": 3}
+            ),
+            "historically invalid body": render_markdown(
+                V1_METADATA,
+                V1_BODY.replace("## Scope", "## Not Scope", 1),
+            ),
+        }
+        for name, text in invalid.items():
+            human_type = (
+                "observation-invalidation"
+                if "invalidation" in text
+                else "observation"
+            )
+            with self.subTest(name=name), self.assertRaises(ArtifactSchemaError):
+                parse_markdown_envelope(
+                    text,
+                    expected_human_type=human_type,
+                    policies=policies,
+                )
+
+    def test_markdown_classifier_rejects_duplicate_frontmatter_key(self):
+        text = render_markdown(V1_METADATA, V1_BODY).replace(
+            "type: \"observation\"\n",
+            "type: \"observation\"\ntype: \"observation\"\n",
+            1,
+        )
+        with self.assertRaisesRegex(ArtifactSchemaError, "frontmatter"):
+            parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=self.load(),
+            )
+
+    def test_markdown_classifier_rejects_episode_envelope_disagreement(self):
+        policies = self.load()
+        with FakeObservationStore("portable") as store:
+            v2_text = store.v2_path.read_text(encoding="utf-8")
+            _v2_metadata, v2_body = v2_text.split("\n---\n", 1)
+            mismatches = (
+                render_markdown(V1_METADATA, v2_body.lstrip("\n")),
+                render_markdown({**V1_METADATA, "schema_version": 2}, V1_BODY),
+            )
+            for text in mismatches:
+                with self.subTest(text=text[:80]), self.assertRaisesRegex(
+                    ArtifactSchemaError,
+                    "Episode|schema",
+                ):
+                    parse_markdown_envelope(
+                        text,
+                        expected_human_type="observation",
+                        policies=policies,
+                    )
+
+    def test_pure_classifier_preserves_lifecycle_duration_validation(self):
+        text = render_markdown(
+            V1_METADATA,
+            V1_BODY.replace("elapsed_seconds: 120", "elapsed_seconds: 121", 1),
+        )
+        with self.assertRaisesRegex(ArtifactSchemaError, "elapsed_seconds"):
+            parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=self.load(),
+            )
+
+    def test_pure_classifier_rejects_fractional_draft_timestamps(self):
+        policies = self.load()
+        draft_body = V1_BODY.split("\n## Execution evidence", 1)[0].rstrip() + "\n"
+        for version in (1, 2):
+            metadata = {
+                **V1_METADATA,
+                "status": "draft",
+                "timestamp": "2026-08-02T08:00:00.123456+08:00",
+            }
+            if version == 2:
+                metadata["schema_version"] = 2
+            with self.subTest(version=version), self.assertRaisesRegex(
+                ArtifactSchemaError,
+                "second-precision",
+            ):
+                parse_markdown_envelope(
+                    render_markdown(metadata, draft_body),
+                    expected_human_type="observation",
+                    policies=policies,
+                )
+
+    def test_pure_classifier_accepts_utc_second_draft_timestamps(self):
+        policies = self.load()
+        draft_body = V1_BODY.split("\n## Execution evidence", 1)[0].rstrip() + "\n"
+        for version in (1, 2):
+            metadata = {
+                **V1_METADATA,
+                "status": "draft",
+                "timestamp": "2026-08-02T00:00:00Z",
+            }
+            if version == 2:
+                metadata["schema_version"] = 2
+            with self.subTest(version=version):
+                envelope = parse_markdown_envelope(
+                    render_markdown(metadata, draft_body),
+                    expected_human_type="observation",
+                    policies=policies,
+                )
+            self.assertEqual(version, envelope.artifact.schema_version)
+
+    def test_markdown_classifier_uses_one_existing_frontmatter_parse(self):
+        import wiki_observations
+
+        text = render_markdown(V1_METADATA, V1_BODY)
+        with mock.patch.object(
+            wiki_observations,
+            "_parse_frontmatter",
+            wraps=wiki_observations._parse_frontmatter,
+        ) as parser:
+            parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=self.load(),
+            )
+        parser.assert_called_once_with(text)
+
+    def test_markdown_classifier_performs_no_hidden_policy_or_file_loading(self):
+        policies = self.load()
+        with FakeObservationStore("portable") as store:
+            text = store.v2_path.read_text(encoding="utf-8")
+
+        failure = AssertionError("classifier performed hidden policy I/O")
+        with (
+            mock.patch(
+                "wiki_observations._episode_projection_policy",
+                side_effect=failure,
+            ),
+            mock.patch("policy_artifacts.load_policy_set", side_effect=failure),
+            mock.patch("artifact_schema.load_artifact_policy_set", side_effect=failure),
+            mock.patch("pathlib.Path.read_text", side_effect=failure),
+        ):
+            envelope = parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=policies,
+            )
+
+        self.assertEqual("workflow-observation@2", envelope.artifact.schema_identity)
+
+    def test_persisted_consumer_applies_policy_after_pure_classification(self):
+        with FakeObservationStore("portable") as store:
+            text = store.v2_path.read_text(encoding="utf-8").replace(
+                '"measurement_source":"tool-derived"',
+                '"measurement_source":"future-source"',
+                1,
+            )
+            envelope = parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=self.load(),
+            )
+            errors = validate_record(
+                envelope.metadata,
+                envelope.body,
+                ObservationPaths.from_root(store.store_root),
+                artifact=envelope.artifact,
+            )
+
+        self.assertIn(
+            "measurement_source is not allowed by projection policy",
+            errors,
+        )
+
+    def test_pure_classification_excludes_reference_acquisition(self):
+        metadata = {
+            **V1_METADATA,
+            "title": PRIVACY_SENTINEL,
+            "task_ref": "[[missing-task]]",
+            "sources": ["raw/missing-source.md"],
+        }
+        text = render_markdown(metadata, v1_body_with_privacy_sentinel())
+        import wiki_observations
+
+        with mock.patch.object(
+            wiki_observations,
+            "ReferenceResolver",
+            side_effect=AssertionError("classifier acquired filesystem evidence"),
+        ):
+            envelope = parse_markdown_envelope(
+                text,
+                expected_human_type="observation",
+                policies=self.load(),
+            )
+        self.assertNotIn(PRIVACY_SENTINEL, repr(envelope.artifact))
+
+        store_root = self.root / "fake-store"
+        (store_root / "wiki" / "observations").mkdir(parents=True)
+        errors = validate_record(
+            envelope.metadata,
+            envelope.body,
+            ObservationPaths.from_root(store_root),
+        )
+        self.assertIn("source does not exist: raw/missing-source.md", errors)
+        self.assertIn("task_ref points to no task record", errors)
 
     def test_registry_rejects_inconsistent_schema_identity(self):
         self.documents["artifact_schema_registry.json"]["schemas"][4][

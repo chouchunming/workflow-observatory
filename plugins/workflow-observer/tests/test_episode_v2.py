@@ -20,14 +20,20 @@ for module_root in (SCRIPTS, TESTS):
         sys.path.insert(0, str(module_root))
 
 from canonical_json import canonicalize
+from artifact_schema import (
+    ArtifactSchemaRef,
+    load_artifact_policy_set,
+    parse_markdown_envelope,
+)
 from episode_schema import (
     EpisodeSchemaError,
     EpisodeV2Supplement,
     build_episode_v2,
-    canonical_episode_projection,
+    canonical_episode_projection as classified_episode_projection,
     parse_episode_block,
     parse_v2_supplement,
     render_episode_block,
+    synthetic_episode_projection as canonical_episode_projection,
 )
 from wiki_observations import StartRequest, validate_start_request
 from workflow_evolution_fixtures import (
@@ -238,6 +244,44 @@ class EpisodeV2Tests(unittest.TestCase):
                     mismatched_body,
                     self.projection,
                 )
+
+    def test_episode_reader_consumes_central_artifact_classification(self):
+        with FakeObservationStore("portable") as store:
+            envelope = parse_markdown_envelope(
+                store.v1_path.read_text(encoding="utf-8"),
+                expected_human_type="observation",
+                policies=load_artifact_policy_set(PLUGIN_ROOT / "policies"),
+            )
+        projected = classified_episode_projection(
+            envelope.metadata,
+            envelope.body,
+            self.projection,
+            artifact=envelope.artifact,
+        )
+        self.assertEqual(1, projected["episode_schema_version"])
+
+        with self.assertRaisesRegex(EpisodeSchemaError, "central artifact"):
+            classified_episode_projection(
+                envelope.metadata,
+                envelope.body,
+                self.projection,
+                artifact=None,
+            )
+
+        mismatch = ArtifactSchemaRef(
+            artifact_type="observation-invalidation",
+            schema_version=1,
+            schema_identity="observation-invalidation@1",
+            reader_contract="legacy-exact-shape",
+            writer_contract="legacy-read-only",
+        )
+        with self.assertRaisesRegex(EpisodeSchemaError, "artifact schema"):
+            classified_episode_projection(
+                envelope.metadata,
+                envelope.body,
+                self.projection,
+                artifact=mismatch,
+            )
 
     def test_explicit_schema_version_must_be_exact_integer_two(self):
         body = self._v2_final_body()

@@ -18,9 +18,9 @@ for module_root in (PLUGIN_ROOT / "scripts", PLUGIN_ROOT / "tests"):
 from canonical_json import canonicalize, hash_canonical
 from episode_schema import (
     build_episode_v2,
-    canonical_episode_projection,
     parse_v2_supplement,
     render_episode_block,
+    synthetic_episode_projection as canonical_episode_projection,
 )
 from learning_snapshot import (
     LearningSnapshotError,

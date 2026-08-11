@@ -143,6 +143,13 @@ class PortableCliTests(unittest.TestCase):
         self.assertEqual(0, report.returncode)
         self.assertIn("maintenance-basic", report.stdout)
         self.assertEqual("", report.stderr)
+        self.assertEqual(
+            record,
+            (self.home / "store/wiki/observations" / f"{run_id}.md").read_text(
+                encoding="utf-8"
+            ),
+            "classification/validation/reporting must not rewrite v1 bytes",
+        )
 
     def test_v2_start_and_finish_write_one_canonical_episode_block(self):
         supplement = self.base / "episode.json"
@@ -183,6 +190,17 @@ class PortableCliTests(unittest.TestCase):
             record.split("---\n", 2)[2].lstrip(), load_projection_policy()
         )
         self.assertEqual(2, episode["schema_version"])
+        validated = run_cli(self.home, "validate")
+        report = run_cli(self.home, "report")
+        self.assertEqual((0, ""), (validated.returncode, validated.stderr))
+        self.assertEqual((0, ""), (report.returncode, report.stderr))
+        self.assertEqual(
+            record,
+            (self.home / "store/wiki/observations" / f"{run_id}.md").read_text(
+                encoding="utf-8"
+            ),
+            "classification/validation/reporting must not rewrite v2 bytes",
+        )
 
     def test_v2_complete_lifecycle_reads_human_completion_metrics(self):
         completion = self.base / "v2-completion.md"

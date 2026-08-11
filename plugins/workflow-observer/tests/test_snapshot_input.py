@@ -48,6 +48,7 @@ from workflow_evolution_fixtures import (
     temporary_timezone,
     v1_body_with_privacy_sentinel,
 )
+import snapshot_input
 import workflow_observer_cli
 
 
@@ -235,6 +236,7 @@ class SnapshotInputTests(unittest.TestCase):
             run_id,
             metadata,
             body,
+            document.artifact,
             hashlib.sha256(run_id.encode("ascii")).hexdigest(),
             document.references if references is None else references,
         )
@@ -792,6 +794,45 @@ class SnapshotInputTests(unittest.TestCase):
 
         self.assertEqual(1, len(collection.records))
 
+    def test_snapshot_projection_consumes_collected_artifact_classification(self):
+        collection = self._collection()
+        with (
+            mock.patch(
+                "snapshot_input.collect_record_documents",
+                return_value=collection,
+            ),
+            mock.patch(
+                "snapshot_input.canonical_episode_projection",
+                wraps=snapshot_input.canonical_episode_projection,
+            ) as project,
+        ):
+            self.acquire()
+
+        self.assertEqual(1, project.call_count)
+        self.assertIn("artifact", project.call_args.kwargs)
+        self.assertIs(
+            collection.records[0].artifact,
+            project.call_args.kwargs["artifact"],
+        )
+
+    def test_ambiguous_persisted_v1_never_reaches_snapshot_projection(self):
+        ambiguous = self.store.v1_path.read_bytes().replace(
+            b"sources: []\n---\n",
+            b"sources: []\nfuture_field: true\n---\n",
+            1,
+        )
+        self.store._write_private(self.store.v1_path, ambiguous)
+
+        with mock.patch(
+            "snapshot_input.canonical_episode_projection",
+            wraps=snapshot_input.canonical_episode_projection,
+        ) as project, self.assertRaisesRegex(
+            SnapshotInputError,
+            "unexpected frontmatter field",
+        ):
+            self.acquire()
+        project.assert_not_called()
+
     def test_acquisition_binds_records_references_and_identity_to_one_root_fd(self):
         replacement = FakeObservationStore("portable")
         self.addCleanup(replacement.close)
@@ -1087,6 +1128,7 @@ class SnapshotInputTests(unittest.TestCase):
                 'finished_at: "2026-08-02T08:02:00+08:00"',
                 'finished_at: "2026-08-03T00:01:00Z"',
             ),
+            base.artifact,
             "d" * 64,
             base.references,
         )

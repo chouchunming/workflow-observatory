@@ -1399,7 +1399,10 @@ def _acquire_snapshot_input(
         seen_physical.add(document.run_id)
         all_run_ids.add(document.run_id)
         projection = canonical_episode_projection(
-            document.metadata, document.body, documents
+            document.metadata,
+            document.body,
+            documents,
+            artifact=document.artifact,
         )
         if projection.get("run_id") != document.run_id:
             raise _snapshot_error("canonical Episode run_id conflicts with source")

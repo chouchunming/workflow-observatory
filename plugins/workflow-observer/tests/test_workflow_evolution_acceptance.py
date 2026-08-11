@@ -25,9 +25,9 @@ from canonical_json import (
 )
 from episode_schema import (
     build_episode_v2,
-    canonical_episode_projection,
     parse_v2_supplement,
     render_episode_block,
+    synthetic_episode_projection as canonical_episode_projection,
 )
 from learning_snapshot import build_snapshot_core
 from policy_artifacts import (

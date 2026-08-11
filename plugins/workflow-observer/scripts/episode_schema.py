@@ -446,10 +446,7 @@ def _validate_episode_v2(
     }
 
 
-def parse_episode_block(
-    body: str,
-    projection: Mapping,
-) -> tuple[str, dict | None]:
+def _parse_episode_block_payload(body: str) -> tuple[str, object | None]:
     if not isinstance(body, str):
         raise EpisodeSchemaError("observation body must be text")
     headings = list(re.finditer(r"(?m)^## Episode data$", body))
@@ -469,9 +466,110 @@ def parse_episode_block(
     canonical = _canonical_bytes(parsed, "Episode data")
     if canonical != original:
         raise EpisodeSchemaError("Episode data JSON must use canonical encoding")
+    return body[:match.start()], parsed
+
+
+def parse_episode_block(
+    body: str,
+    projection: Mapping,
+) -> tuple[str, dict | None]:
+    human_body, parsed = _parse_episode_block_payload(body)
+    if parsed is None:
+        return human_body, None
     projection_document = _projection_document(projection)
     episode = _validate_episode_v2(parsed, projection_document)
-    return body[:match.start()], episode
+    return human_body, episode
+
+
+def _validate_episode_v2_structure(value: object) -> dict[str, object]:
+    """Validate exact policy-independent Episode structure and scalar shapes."""
+
+    episode = _exact_mapping(value, _SUPPLEMENT_KEYS, "Episode data")
+    if type(episode["schema_version"]) is not int or episode["schema_version"] != 2:
+        raise EpisodeSchemaError("Episode data schema_version must be 2")
+    execution = _exact_mapping(
+        episode["execution"],
+        _EPISODE_EXECUTION_KEYS,
+        "Episode execution",
+    )
+    validated_execution = {
+        name: _safe_nonnegative_integer(execution[name], name, nullable=True)
+        for name in ("input_tokens", "output_tokens", "cache_read_tokens")
+    }
+    validated_execution["elapsed_seconds"] = _safe_nonnegative_integer(
+        execution["elapsed_seconds"], "elapsed_seconds"
+    )
+    amount = execution["cost_amount"]
+    if amount is not None and (
+        not isinstance(amount, str) or _COST_PATTERN.fullmatch(amount) is None
+    ):
+        raise EpisodeSchemaError(
+            "cost_amount must be a normalized decimal string or null"
+        )
+    currency = execution["cost_currency"]
+    if currency is not None and (
+        not isinstance(currency, str)
+        or _CURRENCY_PATTERN.fullmatch(currency) is None
+    ):
+        raise EpisodeSchemaError(
+            "cost_currency must be three ASCII uppercase letters or null"
+        )
+    if (amount is None) != (currency is None):
+        raise EpisodeSchemaError(
+            "cost_currency must be present exactly with cost_amount"
+        )
+    measurement_source = execution["measurement_source"]
+    if not isinstance(measurement_source, str) or not measurement_source:
+        raise EpisodeSchemaError("measurement_source must be a non-empty string")
+    validated_execution.update({
+        "cost_amount": amount,
+        "cost_currency": currency,
+        "measurement_source": measurement_source,
+    })
+
+    quality = _exact_mapping(
+        episode["quality"],
+        _EPISODE_QUALITY_KEYS,
+        "Episode quality",
+    )
+    validated_quality = _validated_completion_metrics({
+        key: quality[key] for key in _LIFECYCLE_QUALITY_KEYS
+    })
+    validated_quality.update(_validate_supplement_quality({
+        key: quality[key] for key in _SUPPLEMENT_QUALITY_KEYS
+    }))
+
+    decisions = episode["decisions"]
+    if not isinstance(decisions, list):
+        raise EpisodeSchemaError("decisions must be a JSON array")
+    validated_decisions = []
+    for index, value in enumerate(decisions, start=1):
+        decision = _exact_mapping(value, _DECISION_KEYS, f"decision {index}")
+        if _safe_nonnegative_integer(
+            decision["sequence"], f"decision {index} sequence"
+        ) != index:
+            raise EpisodeSchemaError(
+                "Decision sequence must be contiguous and one-based"
+            )
+        for name in (
+            "phase",
+            "actor_role",
+            "decision_type",
+            "reason_code",
+            "result",
+            "summary",
+        ):
+            if not isinstance(decision[name], str) or not decision[name]:
+                raise EpisodeSchemaError(
+                    f"Decision {name} must be a non-empty string"
+                )
+        validated_decisions.append(dict(decision))
+    return {
+        "schema_version": 2,
+        "execution": validated_execution,
+        "quality": validated_quality,
+        "decisions": validated_decisions,
+    }
 
 
 def _canonical_utc_instant(value: object, label: str) -> str:
@@ -510,6 +608,89 @@ def _parse_human_lifecycle(
         )
     except ObservationError as error:
         raise _error(f"final observation body: {error}", error)
+
+
+def validate_episode_envelope_structure(
+    metadata: Mapping,
+    body: str,
+) -> str:
+    """Validate persisted Episode/lifecycle structure without loading policy."""
+
+    if not isinstance(metadata, Mapping):
+        raise EpisodeSchemaError("observation metadata must be a mapping")
+    schema_version = _metadata_schema_version(metadata)
+    human_body, raw_episode = _parse_episode_block_payload(body)
+    episode = (
+        None
+        if raw_episode is None
+        else _validate_episode_v2_structure(raw_episode)
+    )
+    status = _metadata_string(metadata, "status")
+    if status not in FINAL_STATUSES | {"draft"}:
+        raise EpisodeSchemaError("observation status is invalid")
+    started_at = _canonical_utc_instant(metadata.get("timestamp"), "started_at")
+    if status == "draft" and episode is not None:
+        raise EpisodeSchemaError("draft observations cannot contain Episode data")
+    if status != "draft" and schema_version == 1 and episode is not None:
+        raise EpisodeSchemaError(
+            "schema-v1 metadata cannot contain schema-2 Episode data"
+        )
+    if status != "draft" and schema_version == 2 and episode is None:
+        raise EpisodeSchemaError(
+            "final schema-v2 observation requires Episode data"
+        )
+
+    completion, derived = _parse_human_lifecycle(human_body, status)
+    lifecycle_values: dict[str, object] = {}
+    if status != "draft":
+        assert completion is not None
+        finished_at = _canonical_utc_instant(
+            derived.get("finished_at"), "finished_at"
+        )
+        started = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        finished = datetime.strptime(
+            finished_at, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+        elapsed = _safe_nonnegative_integer(
+            derived.get("elapsed_seconds"), "elapsed_seconds"
+        )
+        if (
+            elapsed != int((finished - started).total_seconds())
+            or finished < started
+        ):
+            raise EpisodeSchemaError(
+                "elapsed_seconds must equal the non-negative lifecycle duration"
+            )
+        lifecycle_values = {
+            "elapsed_seconds": elapsed,
+            "verification": completion.verification,
+            "review_rounds": _quality_integer_or_unknown(
+                completion.review_rounds, "review_rounds"
+            ),
+            "defects_found": _quality_integer_or_unknown(
+                completion.defects_found, "defects_found"
+            ),
+            "rework_count": _quality_integer_or_unknown(
+                completion.rework_count, "rework_count"
+            ),
+        }
+    if episode is None:
+        return human_body
+    if (
+        episode["execution"]["elapsed_seconds"]
+        != lifecycle_values["elapsed_seconds"]
+    ):
+        raise EpisodeSchemaError(
+            "Episode elapsed_seconds does not match authoritative lifecycle completion"
+        )
+    for name in _LIFECYCLE_QUALITY_KEYS:
+        if episode["quality"][name] != lifecycle_values[name]:
+            raise EpisodeSchemaError(
+                f"Episode {name} does not match authoritative lifecycle completion"
+            )
+    return human_body
 
 
 def _projected_metric(
@@ -570,7 +751,7 @@ def _project_workflow_generation(
     return {"availability": "observed", "value": value}
 
 
-def canonical_episode_projection(
+def _canonical_episode_projection_unclassified(
     metadata: Mapping,
     body: str,
     projection: Mapping,
@@ -709,3 +890,37 @@ def canonical_episode_projection(
         "runtime_provenance": None,
         "decisions": decisions,
     }
+
+
+def canonical_episode_projection(
+    metadata: Mapping,
+    body: str,
+    projection: Mapping,
+    *,
+    artifact: object,
+) -> dict:
+    """Project a persisted observation under its central classification."""
+
+    from artifact_schema import ArtifactSchemaRef
+
+    if not isinstance(artifact, ArtifactSchemaRef):
+        raise EpisodeSchemaError(
+            "persisted observation requires central artifact classification"
+        )
+    if artifact.artifact_type != "workflow-observation":
+        raise EpisodeSchemaError("observation artifact schema type is invalid")
+    if artifact.schema_version != _metadata_schema_version(metadata):
+        raise EpisodeSchemaError(
+            "observation artifact schema_version disagrees with metadata"
+        )
+    return _canonical_episode_projection_unclassified(metadata, body, projection)
+
+
+def synthetic_episode_projection(
+    metadata: Mapping,
+    body: str,
+    projection: Mapping,
+) -> dict:
+    """Project explicitly synthetic/non-persisted test inputs."""
+
+    return _canonical_episode_projection_unclassified(metadata, body, projection)

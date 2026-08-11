@@ -46,6 +46,10 @@ _UTC_INSTANT = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 )
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_MARKDOWN_ARTIFACT_TYPES = {
+    "observation": "workflow-observation",
+    "observation-invalidation": "observation-invalidation",
+}
 _SCHEMA_ROOT_KEYS = {
     "artifact_type",
     "schema_version",
@@ -212,6 +216,19 @@ class ArtifactSchemaRef:
     schema_identity: str
     reader_contract: str
     writer_contract: str
+
+
+@dataclass(frozen=True)
+class MarkdownEnvelope:
+    metadata: Mapping[str, object]
+    body: str
+    artifact: ArtifactSchemaRef
+
+
+@dataclass(frozen=True)
+class _MarkdownSchemaCandidate:
+    artifact_type: str
+    schema_version: int
 
 
 def _validate_schema_registry(
@@ -577,6 +594,118 @@ def classify_json_artifact(
     if "schema_identity" in value and value["schema_identity"] != ref.schema_identity:
         raise ArtifactSchemaError("artifact schema identity is inconsistent")
     return ref
+
+
+def _markdown_schema_candidate(
+    metadata: Mapping[str, object],
+    *,
+    expected_human_type: str,
+) -> _MarkdownSchemaCandidate:
+    artifact_type = _MARKDOWN_ARTIFACT_TYPES.get(expected_human_type)
+    if artifact_type is None:
+        raise ArtifactSchemaError("expected Markdown human type is unsupported")
+    if metadata.get("type") != expected_human_type:
+        raise ArtifactSchemaError("Markdown human type does not match expectation")
+
+    has_artifact_type = "artifact_type" in metadata
+    has_schema_version = "schema_version" in metadata
+    explicit_type = metadata.get("artifact_type")
+    if has_artifact_type:
+        if explicit_type != artifact_type:
+            raise ArtifactSchemaError(
+                "Markdown type and artifact_type do not identify the same artifact"
+            )
+        if not has_schema_version:
+            raise ArtifactSchemaError(
+                "explicit Markdown artifact_type requires schema_version"
+            )
+    elif expected_human_type == "observation-invalidation" and has_schema_version:
+        raise ArtifactSchemaError(
+            "new Markdown schema_version requires explicit artifact_type"
+        )
+
+    if has_schema_version:
+        schema_version = metadata.get("schema_version")
+        if type(schema_version) is not int or schema_version <= 0:
+            raise ArtifactSchemaError("Markdown schema_version is invalid")
+    else:
+        schema_version = 1
+
+    if expected_human_type == "observation" and has_artifact_type:
+        raise ArtifactSchemaError(
+            "historical workflow observations must use their exact legacy envelope"
+        )
+    return _MarkdownSchemaCandidate(artifact_type, schema_version)
+
+
+def classify_markdown_artifact(
+    metadata: Mapping[str, object],
+    body: str,
+    *,
+    expected_human_type: str,
+    policies: ArtifactPolicySet,
+) -> ArtifactSchemaRef:
+    """Classify already-parsed Markdown after pure historical validation."""
+
+    _ascii_identifier(expected_human_type, "expected Markdown human type")
+    if not isinstance(policies, ArtifactPolicySet):
+        raise ArtifactSchemaError("artifact policies are required")
+    if not isinstance(metadata, Mapping):
+        raise ArtifactSchemaError("Markdown metadata must be a mapping")
+    if not isinstance(body, str):
+        raise ArtifactSchemaError("Markdown body must be text")
+
+    candidate = _markdown_schema_candidate(
+        metadata,
+        expected_human_type=expected_human_type,
+    )
+    try:
+        from wiki_observations import _validate_historical_markdown
+
+        errors = _validate_historical_markdown(metadata, body, candidate)
+    except (ImportError, ValueError) as error:
+        raise _error(f"Markdown historical validation failed: {error}", error)
+    if errors:
+        raise ArtifactSchemaError(
+            f"Markdown historical validation failed: {errors[0]}"
+        )
+    ref = policies._schema_index.get(
+        (candidate.artifact_type, candidate.schema_version)
+    )
+    if ref is None:
+        raise ArtifactSchemaError(
+            "unknown Markdown artifact type/schema_version pair"
+        )
+    return ref
+
+
+def parse_markdown_envelope(
+    text: str,
+    *,
+    expected_human_type: str,
+    policies: ArtifactPolicySet,
+) -> MarkdownEnvelope:
+    if not isinstance(text, str):
+        raise ArtifactSchemaError("Markdown artifact must be UTF-8 text")
+    try:
+        from wiki_observations import ObservationError, _parse_frontmatter
+    except ImportError as error:
+        raise _error("Markdown frontmatter parser is unavailable", error)
+    try:
+        metadata, body = _parse_frontmatter(text)
+    except ObservationError as error:
+        raise _error(f"Markdown frontmatter is invalid: {error}", error)
+    artifact = classify_markdown_artifact(
+        metadata,
+        body,
+        expected_human_type=expected_human_type,
+        policies=policies,
+    )
+    return MarkdownEnvelope(
+        metadata=MappingProxyType(dict(metadata)),
+        body=body,
+        artifact=artifact,
+    )
 
 
 def _canonical_utc_instant(value: object) -> str:
