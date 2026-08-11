@@ -54,6 +54,7 @@ _SYNTHETIC_USER_PATHS = (
     b"/" + b"Users/" + b"alice/private/story",
     b"/" + b"Users/" + b"alice/private.txt",
 )
+_SYNTHETIC_USER_HOMES = frozenset({b"/" + b"Users/" + b"alice"})
 PATH_NORMALIZATION_DECLARATIONS = {
     "repository-root": frozenset({
         "docs/superpowers/plans/2026-07-13-observation-records-v2.md",
@@ -155,8 +156,11 @@ def _contains_personal_path(data: bytes) -> bool:
             b"",
             candidate,
         )
-    return _USER_HOME_PATTERN.search(candidate) is not None or any(
-        marker in candidate for marker in FORBIDDEN_ARCHIVE_BYTES
+    host_home = str(Path.home()).encode("utf-8")
+    return (
+        _USER_HOME_PATTERN.search(candidate) is not None
+        or host_home in candidate
+        or any(marker in candidate for marker in FORBIDDEN_ARCHIVE_BYTES)
     )
 
 
@@ -370,15 +374,20 @@ def _replace_path_prefix(
 
 
 def _normalize_text(data: bytes, origin: str) -> tuple[bytes, list[str]]:
-    replacements = (
+    macos_homes = set()
+    if origin in PATH_NORMALIZATION_DECLARATIONS["user-home"]:
+        macos_homes = {
+            match.group(0)
+            for match in _USER_HOME_PATTERN.finditer(data)
+            if match.group(0) not in _SYNTHETIC_USER_HOMES
+        }
+    home = str(Path.home()).encode("utf-8")
+    user_homes = sorted({home, *macos_homes}, key=len, reverse=True)
+    replacements = [
         (str(REPOSITORY_ROOT).encode("utf-8"), b"${LLMWIKI_ROOT}", "repository-root"),
-        (
-            str(Path.home() / ".codex").encode("utf-8"),
-            b"${CODEX_HOME}",
-            "codex-home",
-        ),
-        (str(Path.home()).encode("utf-8"), b"${HOME}", "user-home"),
-    )
+        *((source + b"/.codex", b"${CODEX_HOME}", "codex-home") for source in user_homes),
+        *((source, b"${HOME}", "user-home") for source in user_homes),
+    ]
     normalized = data
     applied = []
     for source, target, label in replacements:
@@ -389,7 +398,8 @@ def _normalize_text(data: bytes, origin: str) -> tuple[bytes, list[str]]:
                     f"undeclared path normalization `{label}`: {origin}"
                 )
             normalized = updated
-            applied.append(label)
+            if label not in applied:
+                applied.append(label)
     temporary_pattern = re.compile(
         rb"/private/var/" rb"folders/[^\s`\"']+/T/"
     )

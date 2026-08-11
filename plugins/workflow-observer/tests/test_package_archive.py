@@ -250,6 +250,29 @@ class ArchiveTests(unittest.TestCase):
             row["normalizations"],
         )
 
+    def test_archive_normalizes_declared_macos_home_off_host(self):
+        plan = self.source / "docs/parallel-evaluation-mvp-implementation-plan.md"
+        plan.write_text(
+            plan.read_text(encoding="utf-8")
+            + "\noff-host-home=/"
+            + "Users/foreign/private.txt\n"
+            + "off-host-codex=/"
+            + "Users/foreign/.codex/skills/example\n",
+            encoding="utf-8",
+        )
+
+        build_archive(self.source, self.archive, self.evidence)
+        member = (
+            "workflow-observatory/docs/"
+            "parallel-evaluation-mvp-implementation-plan.md"
+        )
+        with zipfile.ZipFile(self.archive) as bundle:
+            packaged = bundle.read(member)
+
+        self.assertIn(b"off-host-home=${HOME}/private.txt", packaged)
+        self.assertIn(b"off-host-codex=${CODEX_HOME}/skills/example", packaged)
+        self.assertNotIn(b"/" + b"Users/foreign", packaged)
+
     def test_source_archive_inventory_closes_v02_policies_and_approved_docs(self):
         build_archive(self.source, self.archive, self.evidence)
         self._assert_live_v02_inventory(self.archive)
