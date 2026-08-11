@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -608,6 +609,11 @@ class AdapterConformanceTests(unittest.TestCase):
         )
         tombstone = (
             self.llm_root / "wiki/observations/invalidations" / f"{run_id}.md"
+        )
+        self.assertEqual(
+            0o600,
+            stat.S_IMODE(tombstone.stat().st_mode),
+            "LLMWiki invalidation must be mode-0600 at publication",
         )
         tombstone_bytes = tombstone.read_bytes()
         lines = tombstone_bytes.decode("utf-8").splitlines()

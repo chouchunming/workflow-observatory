@@ -303,12 +303,12 @@ class FakeObservationStore:
         if base is None:
             self.temporary = tempfile.TemporaryDirectory()
             self.base = Path(self.temporary.name).resolve(strict=True)
-            self.base.chmod(0o700)
         else:
             self.base = Path(base).resolve(strict=False)
             self.base.mkdir(mode=0o700)
             self.base = self.base.resolve(strict=True)
-            self.base.chmod(0o700)
+        if stat.S_IMODE(self.base.stat().st_mode) != 0o700:
+            raise AssertionError("fake observation store root must be mode-0700")
         if adapter == "portable":
             self.store_root = self.base / "portable-home" / "store"
             self.tasks = self.store_root / "wiki" / "tasks"
@@ -353,12 +353,20 @@ class FakeObservationStore:
         for part in relative.parts:
             cursor = cursor / part
             cursor.mkdir(exist_ok=True, mode=0o700)
-            cursor.chmod(0o700)
+            if stat.S_IMODE(cursor.stat().st_mode) != 0o700:
+                raise AssertionError(f"fixture directory is not mode-0700: {cursor}")
 
     def _write_private(self, path: Path, content: bytes) -> None:
         path.resolve(strict=False).relative_to(self.base)
-        path.write_bytes(content)
-        path.chmod(0o600)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise AssertionError(f"fixture file is not mode-0600: {path}")
 
     def close(self) -> None:
         if self.temporary is not None:
@@ -431,7 +439,8 @@ class AcceptanceFixtureMatrix:
         for case_id in self._case_ids:
             case_root = self.root / case_id
             case_root.mkdir(mode=0o700)
-            case_root.chmod(0o700)
+            if stat.S_IMODE(case_root.stat().st_mode) != 0o700:
+                raise AssertionError("acceptance case root must be mode-0700")
             self._case_roots[case_id] = case_root
             self._stores[case_id] = {
                 adapter: FakeObservationStore(
@@ -446,6 +455,80 @@ class AcceptanceFixtureMatrix:
 
     def stores(self, case_id: str) -> dict[str, FakeObservationStore]:
         return dict(self._stores[case_id])
+
+    def explicit_observation_sources(
+        self,
+        case_id: str,
+        adapter: str,
+        *,
+        schema_version: int,
+    ) -> tuple[Path, ...]:
+        store = self._stores[case_id][adapter]
+        marker = f"schema_version: {schema_version}\n".encode("ascii")
+        matches = []
+        for path in sorted(store.observations.glob("*.md")):
+            source = path.read_bytes()
+            _opening, separator, remainder = source.partition(b"---\n")
+            frontmatter, closing, _body = remainder.partition(b"---\n")
+            if not separator or not closing:
+                raise AssertionError(f"fixture observation lacks frontmatter: {path}")
+            if marker in frontmatter:
+                matches.append(path)
+        return tuple(matches)
+
+    def inject_privacy_sentinel_observations(self, case_id: str) -> None:
+        metadata = {
+            **V1_METADATA,
+            "title": f"Workflow evolution fixture {PRIVACY_SENTINEL}",
+        }
+        body = V1_BODY.replace(
+            "canonical Episode projection",
+            f"canonical Episode projection {PRIVACY_SENTINEL}",
+            1,
+        )
+        source = (_render_frontmatter(metadata) + body).encode("utf-8")
+        if source.count(PRIVACY_SENTINEL.encode("utf-8")) < 2:
+            raise AssertionError("privacy sentinel must occur in human title and body")
+        for store in self._stores[case_id].values():
+            store._write_private(store.v1_path, source)
+
+    def assert_private_staging_boundary(
+        self,
+        staging_parent: Path,
+        staged_source: Path,
+    ) -> None:
+        boundary = Path(staging_parent).resolve(strict=True)
+        boundary.relative_to(self.root)
+        details = boundary.lstat()
+        if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+            raise AssertionError("staging privacy boundary must be a real directory")
+        if stat.S_IMODE(details.st_mode) != 0o700:
+            raise AssertionError("staging privacy boundary must be mode-0700")
+
+        source = Path(staged_source).resolve(strict=True)
+        source.relative_to(boundary)
+        directory_modes = set()
+        file_modes = set()
+        for path in (source, *source.rglob("*")):
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(boundary)
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise AssertionError("repo-copy staging must not contain symlinks")
+            if stat.S_ISDIR(mode):
+                directory_modes.add(stat.S_IMODE(mode))
+            elif stat.S_ISREG(mode):
+                file_modes.add(stat.S_IMODE(mode))
+            else:
+                raise AssertionError("repo-copy staging contains a special file")
+        if directory_modes != {0o755}:
+            raise AssertionError(
+                f"repo-copy staging directory modes changed: {directory_modes}"
+            )
+        if file_modes != {0o644}:
+            raise AssertionError(
+                f"repo-copy staging file modes changed: {file_modes}"
+            )
 
     def assert_isolated(self) -> None:
         live_roots = {

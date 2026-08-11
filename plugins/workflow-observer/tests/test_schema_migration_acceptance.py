@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import multiprocessing.process
 import shutil
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -38,10 +44,13 @@ from artifact_schema import (
 from canonical_json import canonicalize, hash_canonical, strict_json_loads
 from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
+    _MANIFEST_DOMAIN,
     SNAPSHOT_ANALYZER_FILES,
+    SnapshotInput,
     SnapshotQuery,
     acquire_snapshot_input,
 )
+from learning_snapshot import build_snapshot_core
 from snapshot_store import (
     SnapshotPublicationError,
     create_learning_snapshot,
@@ -77,6 +86,10 @@ _SEMANTICS = {
 }
 
 
+class _FormalIsolationViolation(RuntimeError):
+    pass
+
+
 def _declared_case_ids() -> tuple[str, ...]:
     source = Path(__file__).read_text(encoding="utf-8")
     tree = ast.parse(source, filename=__file__)
@@ -105,12 +118,15 @@ if _declared_case_ids() != EXPECTED_CASE_IDS:
 class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._temporary = tempfile.TemporaryDirectory(
-            prefix="workflow-observatory-phase1-acceptance-"
-        )
+        cls._guard_stack = cls._install_external_effect_guards()
+        cls._temporary = None
         try:
+            cls._temporary = tempfile.TemporaryDirectory(
+                prefix="workflow-observatory-phase1-acceptance-"
+            )
             cls.root = Path(cls._temporary.name).resolve(strict=True)
-            cls.root.chmod(0o700)
+            if stat.S_IMODE(cls.root.stat().st_mode) != 0o700:
+                raise AssertionError("acceptance root must be mode-0700 at creation")
             cls.fixtures = AcceptanceFixtureMatrix(cls.root, EXPECTED_CASE_IDS)
             cls.migration_vectors = load_artifact_migration_vectors()
             cls.artifact_policies = load_artifact_policy_set(
@@ -140,7 +156,9 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             )
             cls._assert_isolation_preflight()
         except BaseException:
-            cls._temporary.cleanup()
+            if cls._temporary is not None:
+                cls._temporary.cleanup()
+            cls._guard_stack.close()
             raise
 
     @classmethod
@@ -149,11 +167,14 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         try:
             cls.fixtures.assert_private_modes()
             cls.fixtures.assert_no_publication_residue()
+            if cls._external_effect_violation is not None:
+                raise AssertionError(cls._external_effect_violation)
         except BaseException as error:
             failure = error
         finally:
             root = cls.root
             cls._temporary.cleanup()
+            cls._guard_stack.close()
         if root.exists() and failure is None:
             failure = AssertionError("acceptance TemporaryDirectory cleanup failed")
         if failure is not None:
@@ -166,22 +187,113 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         cls.fixtures.assert_isolated()
         cls.fixtures.assert_private_modes()
         cls.fixtures.assert_fixture_provenance()
+        if cls._guard_probe_results != ("process", "network"):
+            raise AssertionError("formal external-effect guard probes did not pass")
 
-        source = Path(__file__).read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=__file__)
-        forbidden_imports = {"socket", "subprocess", "urllib", "requests", "httpx"}
-        imported = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name.partition(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.partition(".")[0])
-        forbidden = sorted(forbidden_imports.intersection(imported))
-        if forbidden:
-            raise AssertionError(
-                "formal acceptance must not use network or external commands: "
-                + ", ".join(forbidden)
+    @classmethod
+    def _install_external_effect_guards(cls) -> ExitStack:
+        cls._external_effect_violation = None
+        cls._guard_probe_active = True
+        stack = ExitStack()
+
+        def blocker(label: str):
+            def blocked(*_args, **_kwargs):
+                message = f"formal acceptance blocked external effect: {label}"
+                if cls._guard_probe_active:
+                    raise _FormalIsolationViolation(message)
+                cls._external_effect_violation = (
+                    cls._external_effect_violation or message
+                )
+                result = getattr(cls, "_active_result", None)
+                if result is None:
+                    raise _FormalIsolationViolation(message)
+                result.stop()
+                raise unittest.case._ShouldStop
+
+            return blocked
+
+        process_targets = [(subprocess, "Popen")]
+        process_targets.extend(
+            (os, name)
+            for name in (
+                "execl",
+                "execle",
+                "execlp",
+                "execlpe",
+                "execv",
+                "execve",
+                "execvp",
+                "execvpe",
+                "fork",
+                "forkpty",
+                "popen",
+                "posix_spawn",
+                "posix_spawnp",
+                "spawnl",
+                "spawnle",
+                "spawnlp",
+                "spawnlpe",
+                "spawnv",
+                "spawnve",
+                "spawnvp",
+                "spawnvpe",
+                "system",
             )
+            if hasattr(os, name)
+        )
+        process_targets.append((multiprocessing.process.BaseProcess, "start"))
+        network_targets = [
+            (socket, name)
+            for name in (
+                "create_connection",
+                "fromfd",
+                "socket",
+                "socketpair",
+            )
+            if hasattr(socket, name)
+        ]
+        try:
+            for owner, name in (*process_targets, *network_targets):
+                stack.enter_context(
+                    mock.patch.object(
+                        owner,
+                        name,
+                        new=blocker(f"{owner.__name__}.{name}"),
+                    )
+                )
+
+            probes = []
+            for label, attempt in (
+                ("process", lambda: subprocess.Popen(("formal-guard-probe",))),
+                ("network", lambda: socket.socket()),
+            ):
+                try:
+                    attempt()
+                except _FormalIsolationViolation:
+                    probes.append(label)
+                else:
+                    raise AssertionError(
+                        f"formal {label} guard probe was not blocked"
+                    )
+            cls._guard_probe_results = tuple(probes)
+            cls._guard_probe_active = False
+            return stack
+        except BaseException:
+            stack.close()
+            raise
+
+    def setUp(self):
+        if self._external_effect_violation is not None:
+            raise AssertionError(self._external_effect_violation)
+
+    def run(self, result=None):
+        if result is None:
+            result = self.defaultTestResult()
+        self.__class__._active_result = result
+        try:
+            return super().run(result)
+        finally:
+            self.__class__._active_result = None
 
     @classmethod
     def _stores(cls, case_id: str):
@@ -201,13 +313,56 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
     @classmethod
     def _publish(cls, case_id: str, adapter: str = "portable"):
         store = cls._stores(case_id)[adapter]
-        return create_learning_snapshot(
+        published = create_learning_snapshot(
             acquire=lambda: cls._acquire(case_id, adapter),
             query=cls.query,
             policy_set=cls.learning_policies,
             home=store.store_root.parent,
             generated_at=_FIXED_NOW,
         )
+        if stat.S_IMODE(published.path.stat().st_mode) != 0o600:
+            raise AssertionError(
+                f"{adapter} snapshot was not mode-0600 at publication"
+            )
+        return published
+
+    @classmethod
+    def _legacy_v02_core(cls, acquired: SnapshotInput) -> dict:
+        bundle = acquired.semantic_bundle
+        bundle["schema_version"] = 1
+        bundle.pop("artifact_policy_set")
+        bundle.pop("migration_manifest")
+        bundle.pop("input_manifest_sha256")
+        bundle["input_manifest_sha256"] = hash_canonical(
+            _MANIFEST_DOMAIN, bundle
+        )
+        legacy = SnapshotInput(
+            adapter=acquired.adapter,
+            store_identity=acquired.store_identity,
+            semantic_bundle=bundle,
+            reviewed_generation_mapping=(
+                cls.learning_policies.documents["workflow_generation_mapping"]
+            ),
+        )
+        return build_snapshot_core(legacy, cls.learning_policies)
+
+    @staticmethod
+    def _candidate_denominators(core: dict) -> tuple[tuple[bytes, bytes], ...]:
+        rows = tuple(sorted(
+            (
+                canonicalize([
+                    candidate["candidate_type"],
+                    candidate["class"],
+                    candidate["cohort"],
+                    candidate["source"],
+                ]),
+                canonicalize(candidate["denominators"]),
+            )
+            for candidate in core["candidates"]
+        ))
+        if len({key for key, _value in rows}) != len(rows):
+            raise AssertionError("candidate denominator control keys are duplicated")
+        return rows
 
     @classmethod
     def _historical_v1(cls):
@@ -253,8 +408,19 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
 
     @staticmethod
     def _write_private(path: Path, content: bytes) -> None:
-        path.write_bytes(content)
-        path.chmod(0o600)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise AssertionError(f"private fixture output is not mode-0600: {path}")
 
     def test_01(self):
         """Observation v1 exact legacy shape migrates deterministically."""
@@ -311,7 +477,12 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                 self.assertEqual(2, derived.canonical_document["target"]["value"][
                     "episode_schema_version"
                 ])
-                self.assertEqual(1, len([derived.canonical_document["target"]["value"]]))
+                self.assertEqual(
+                    (store.v2_path,),
+                    self.fixtures.explicit_observation_sources(
+                        "test_02", adapter, schema_version=2
+                    ),
+                )
 
     def test_03(self):
         """Ambiguous absent-version observation fails the Data Trust Gate."""
@@ -448,11 +619,15 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                     now=datetime(2026, 8, 11, 1, 2, 3, tzinfo=timezone.utc),
                 )
                 new_path = store.invalidations / f"{new_run_id}.md"
+                self.assertEqual(
+                    0o600,
+                    stat.S_IMODE(new_path.stat().st_mode),
+                    "new invalidation must be mode-0600 at publication",
+                )
                 new_bytes = new_path.read_bytes()
                 self.assertEqual(legacy, legacy_path.read_bytes())
                 self.assertIn(b"artifact_type: observation-invalidation", new_bytes)
                 self.assertIn(b"schema_version: 2", new_bytes)
-                new_path.chmod(0o600)
                 with self.assertRaisesRegex(ObservationError, "already invalidated"):
                     invalidate_observation(
                         ObservationPaths.from_root(store.store_root),
@@ -463,6 +638,7 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
 
     def test_07(self):
         """Snapshot Input v2 binds policies and a sorted private manifest."""
+        self.fixtures.inject_privacy_sentinel_observations("test_07")
         identities = self.artifact_policies.identities()
         expected_policies = {
             key: identities[key]
@@ -473,6 +649,16 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         }
         semantic_bytes = []
         for adapter in _SEMANTICS:
+            source = self._stores("test_07")[adapter].v1_path.read_bytes()
+            decoded_source = source.decode("utf-8")
+            self.assertIn(
+                f'title: "Workflow evolution fixture {PRIVACY_SENTINEL}"',
+                decoded_source,
+            )
+            self.assertIn(
+                f"- Goal: Exercise canonical Episode projection {PRIVACY_SENTINEL}",
+                decoded_source,
+            )
             acquired = self._acquire("test_07", adapter)
             bundle = acquired.semantic_bundle
             semantic_bytes.append(canonicalize(bundle))
@@ -513,29 +699,66 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             "schema_version"
         ])
         self.assertEqual(source, path.read_bytes())
-        self.assertEqual(before_inventory, tuple(sorted(item.name for item in root.iterdir())))
+        self.assertEqual(
+            before_inventory,
+            tuple(sorted(item.name for item in root.iterdir())),
+        )
 
     def test_09(self):
         """New Snapshot v2 records exhaustive zero sampling semantics."""
-        published = self._publish("test_09")
-        artifact = strict_json_loads(published.path.read_bytes())
-        core = artifact["core"]
-        selected = len(core["input_manifest"]["episodes"])
-        invalidated = len(core["input_manifest"]["invalidations"])
-        self.assertEqual(2, artifact["schema_version"])
-        self.assertEqual(2, core["schema_version"])
-        self.assertEqual(0, core["sampled_by_policy_n"])
-        self.assertEqual(
-            {
-                "full_retained_episode_n": selected - invalidated,
-                "sampled_minimal_episode_n": 0,
-                "sampling_policy_identities": [],
-            },
-            core["sampling_summary"],
-        )
-        for cohort in core["cohorts"]:
-            for metric in cohort["metrics"]:
-                missingness = metric["missingness"]
+        cores = []
+        for adapter in ("portable", "llmwiki"):
+            acquired = self._acquire("test_09", adapter)
+            legacy_core = self._legacy_v02_core(acquired)
+            published = self._publish("test_09", adapter)
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE(published.path.stat().st_mode),
+                f"{adapter} snapshot must be mode-0600 at publication",
+            )
+            artifact = strict_json_loads(published.path.read_bytes())
+            core = artifact["core"]
+            cores.append(canonicalize(core))
+            selected = len(core["input_manifest"]["episodes"])
+            invalidated = len(core["input_manifest"]["invalidations"])
+            self.assertEqual(2, artifact["schema_version"])
+            self.assertEqual(2, core["schema_version"])
+            self.assertEqual(0, core["sampled_by_policy_n"])
+            self.assertEqual(
+                {
+                    "full_retained_episode_n": selected - invalidated,
+                    "sampled_minimal_episode_n": 0,
+                    "sampling_policy_identities": [],
+                },
+                core["sampling_summary"],
+            )
+            for cohort in core["cohorts"]:
+                for metric in cohort["metrics"]:
+                    missingness = metric["missingness"]
+                    self.assertEqual(0, missingness["sampled_by_policy_n"])
+                    self.assertEqual(
+                        missingness["eligible_episode_n"],
+                        sum(
+                            missingness[name]
+                            for name in (
+                                "observed_n",
+                                "not_recorded_n",
+                                "unsupported_by_schema_n",
+                                "not_applicable_n",
+                                "sampled_by_policy_n",
+                            )
+                        ),
+                    )
+            fixed_denominators = {
+                "eligible_episode_n": 1,
+                "outcome_episode_n": 1,
+                "supporting_episode_n": None,
+            }
+            for candidate in core["candidates"]:
+                self.assertEqual(fixed_denominators, candidate["denominators"])
+                missingness = candidate["evidence"]["missingness"]
+                if candidate["source"]["kind"] != "metric" or missingness is None:
+                    continue
                 self.assertEqual(0, missingness["sampled_by_policy_n"])
                 self.assertEqual(
                     missingness["eligible_episode_n"],
@@ -550,15 +773,11 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                         )
                     ),
                 )
-        for candidate in core["candidates"]:
             self.assertEqual(
-                {
-                    "eligible_episode_n",
-                    "outcome_episode_n",
-                    "supporting_episode_n",
-                },
-                set(candidate["denominators"]),
+                self._candidate_denominators(legacy_core),
+                self._candidate_denominators(core),
             )
+        self.assertEqual(cores[0], cores[1])
 
     def test_10(self):
         """Secure readback accepts siblings and rejects four mismatch classes."""
@@ -566,10 +785,10 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         historical, historical_bytes, historical_policies = self._historical_v1()
         learning_dir = store.store_root.parent / "learning"
         learning_dir.mkdir(mode=0o700)
-        learning_dir.chmod(0o700)
+        self.assertEqual(0o700, stat.S_IMODE(learning_dir.stat().st_mode))
         snapshot_dir = learning_dir / "snapshots"
         snapshot_dir.mkdir(mode=0o700)
-        snapshot_dir.chmod(0o700)
+        self.assertEqual(0o700, stat.S_IMODE(snapshot_dir.stat().st_mode))
         v1_path = snapshot_dir / f"{historical['snapshot_id']}.json"
         self._write_private(v1_path, historical_bytes)
         v2 = self._publish("test_10")
@@ -636,6 +855,11 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                 )
                 self.assertEqual(1, len({result.snapshot_id for result in results}))
                 final = results[0].path
+                self.assertEqual(
+                    0o600,
+                    stat.S_IMODE(final.stat().st_mode),
+                    f"{adapter} concurrent snapshot must publish mode-0600",
+                )
                 read_learning_artifact(
                     final.parent, results[0].snapshot_id, self.learning_policies
                 )
@@ -654,14 +878,21 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         staging_parent.mkdir(mode=0o700)
         try:
             source = _stage_live_marketplace(MARKETPLACE_ROOT, staging_parent)
+            # Descendants are non-authoritative repo copies with ordinary
+            # 0644/0755 modes; their mode-0700 ancestor is the privacy boundary.
+            self.fixtures.assert_private_staging_boundary(staging_parent, source)
             build_archive(
                 source,
                 archive,
                 default_evidence(REPOSITORY_ROOT),
             )
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE(archive.stat().st_mode),
+                "archive must be mode-0600 at publication",
+            )
         finally:
             shutil.rmtree(staging_parent)
-        archive.chmod(0o600)
         with zipfile.ZipFile(archive) as bundle:
             inventory = json.loads(
                 bundle.read("workflow-observatory/SHA256SUMS.json")

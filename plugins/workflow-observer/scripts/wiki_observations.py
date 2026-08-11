@@ -2306,7 +2306,7 @@ def invalidate_observation(
                 _assert_temporary_in_directory(
                     temporary, temporary_name, invalidations_fd
                 )
-                os.fchmod(temporary.fileno(), 0o644)
+                os.fchmod(temporary.fileno(), 0o600)
                 temporary.write(content)
                 temporary.flush()
                 os.fsync(temporary.fileno())
