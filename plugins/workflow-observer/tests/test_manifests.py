@@ -20,3 +20,27 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual("./plugins/workflow-observer", entry["source"]["path"])
         self.assertEqual("AVAILABLE", entry["policy"]["installation"])
         self.assertEqual("ON_INSTALL", entry["policy"]["authentication"])
+
+    def test_artifact_policy_source_inventory_paths_are_exact(self):
+        expected = {
+            "policies/artifact_migration_registry.json",
+            "policies/artifact_schema_registry.json",
+            "policies/health_event_schema.json",
+            "scripts/artifact_schema.py",
+            "tests/test_artifact_schema.py",
+        }
+        actual = {
+            path.relative_to(PLUGIN_ROOT).as_posix()
+            for path in PLUGIN_ROOT.rglob("*")
+            if path.is_file()
+            and (
+                path.name in {
+                    "artifact_migration_registry.json",
+                    "artifact_schema_registry.json",
+                    "health_event_schema.json",
+                    "artifact_schema.py",
+                    "test_artifact_schema.py",
+                }
+            )
+        }
+        self.assertEqual(expected, actual)

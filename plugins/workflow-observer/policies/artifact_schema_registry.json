@@ -1,0 +1,112 @@
+{
+  "artifact_type": "artifact-schema-registry",
+  "schema_version": 1,
+  "registry_version": "artifact-schema-registry@1",
+  "schemas": [
+    {
+      "artifact_type": "artifact-migration-registry",
+      "schema_version": 1,
+      "schema_identity": "artifact-migration-registry@1",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "immutable-policy"
+    },
+    {
+      "artifact_type": "artifact-schema-registry",
+      "schema_version": 1,
+      "schema_identity": "artifact-schema-registry@1",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "immutable-policy"
+    },
+    {
+      "artifact_type": "derived-artifact",
+      "schema_version": 1,
+      "schema_identity": "derived-artifact@1",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "derived-only"
+    },
+    {
+      "artifact_type": "episode-projection",
+      "schema_version": 2,
+      "schema_identity": "episode-projection@2",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "derived-only"
+    },
+    {
+      "artifact_type": "health-event",
+      "schema_version": 1,
+      "schema_identity": "health-event@1",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "disabled-until-phase-3"
+    },
+    {
+      "artifact_type": "health-event-schema",
+      "schema_version": 1,
+      "schema_identity": "health-event-schema@1",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "immutable-policy"
+    },
+    {
+      "artifact_type": "learning-snapshot",
+      "schema_version": 1,
+      "schema_identity": "learning-snapshot@1",
+      "reader_contract": "legacy-exact-shape",
+      "writer_contract": "legacy-read-only"
+    },
+    {
+      "artifact_type": "learning-snapshot",
+      "schema_version": 2,
+      "schema_identity": "learning-snapshot@2",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "new-default"
+    },
+    {
+      "artifact_type": "learning-snapshot-core",
+      "schema_version": 2,
+      "schema_identity": "learning-snapshot-core@2",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "embedded-only"
+    },
+    {
+      "artifact_type": "observation-invalidation",
+      "schema_version": 1,
+      "schema_identity": "observation-invalidation@1",
+      "reader_contract": "legacy-exact-shape",
+      "writer_contract": "legacy-read-only"
+    },
+    {
+      "artifact_type": "observation-invalidation",
+      "schema_version": 2,
+      "schema_identity": "observation-invalidation@2",
+      "reader_contract": "explicit-markdown-envelope",
+      "writer_contract": "new-default"
+    },
+    {
+      "artifact_type": "snapshot-input",
+      "schema_version": 1,
+      "schema_identity": "snapshot-input@1",
+      "reader_contract": "legacy-exact-shape",
+      "writer_contract": "legacy-read-only"
+    },
+    {
+      "artifact_type": "snapshot-input",
+      "schema_version": 2,
+      "schema_identity": "snapshot-input@2",
+      "reader_contract": "strict-canonical-json",
+      "writer_contract": "new-default"
+    },
+    {
+      "artifact_type": "workflow-observation",
+      "schema_version": 1,
+      "schema_identity": "workflow-observation@1",
+      "reader_contract": "legacy-exact-shape",
+      "writer_contract": "explicit-v1-compatibility"
+    },
+    {
+      "artifact_type": "workflow-observation",
+      "schema_version": 2,
+      "schema_identity": "workflow-observation@2",
+      "reader_contract": "explicit-episode-v2",
+      "writer_contract": "explicit-v2-compatibility"
+    }
+  ]
+}

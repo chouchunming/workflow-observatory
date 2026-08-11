@@ -277,6 +277,19 @@ class ArchiveTests(unittest.TestCase):
                     build_archive(self.source, self.archive, self.evidence)
                 unexpected.unlink()
 
+    def test_archive_contains_exact_artifact_policy_inventory(self):
+        build_archive(self.source, self.archive, self.evidence)
+        marketplace = self._inventory()["marketplace_files"]
+        expected = {
+            "plugins/workflow-observer/policies/"
+            "artifact_migration_registry.json",
+            "plugins/workflow-observer/policies/artifact_schema_registry.json",
+            "plugins/workflow-observer/policies/health_event_schema.json",
+            "plugins/workflow-observer/scripts/artifact_schema.py",
+            "plugins/workflow-observer/tests/test_artifact_schema.py",
+        }
+        self.assertLessEqual(expected, set(marketplace))
+
     def test_parallel_worker_sources_are_captured_reproducibly(self):
         second = self.root / "parallel-worker-second.zip"
         evidence = default_evidence(REPOSITORY_ROOT)

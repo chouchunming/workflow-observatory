@@ -1,0 +1,39 @@
+{
+  "artifact_type": "artifact-migration-registry",
+  "schema_version": 1,
+  "registry_version": "artifact-migration-registry@1",
+  "migrations": [
+    {
+      "source_artifact_type": "learning-snapshot",
+      "source_schema_version": 1,
+      "target_contract": "learning-snapshot-core@2",
+      "target_schema_version": 2,
+      "migration_identity": "learning-snapshot-v1-to-core-v2@1",
+      "handler": "learning-snapshot-v1"
+    },
+    {
+      "source_artifact_type": "observation-invalidation",
+      "source_schema_version": 1,
+      "target_contract": "observation-invalidation@2",
+      "target_schema_version": 2,
+      "migration_identity": "observation-invalidation-v1-to-v2@1",
+      "handler": "observation-invalidation-v1"
+    },
+    {
+      "source_artifact_type": "workflow-observation",
+      "source_schema_version": 1,
+      "target_contract": "episode-projection@2",
+      "target_schema_version": 2,
+      "migration_identity": "workflow-observation-v1-to-episode-projection@1",
+      "handler": "workflow-observation-v1"
+    },
+    {
+      "source_artifact_type": "workflow-observation",
+      "source_schema_version": 2,
+      "target_contract": "episode-projection@2",
+      "target_schema_version": 2,
+      "migration_identity": "workflow-observation-v2-to-episode-projection@1",
+      "handler": "workflow-observation-v2"
+    }
+  ]
+}

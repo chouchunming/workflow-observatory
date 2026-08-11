@@ -1,0 +1,176 @@
+{
+  "artifact_type": "health-event-schema",
+  "schema_version": 1,
+  "schema_identity": "health-event-schema@1",
+  "event_schema_identity": "health-event@1",
+  "event_types": [
+    {
+      "event_type": "validation-rejected",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": ["artifact", "policy", "reference", "request"]
+          }
+        }
+      }
+    },
+    {
+      "event_type": "schema-mismatch",
+      "evidence": {
+        "required": ["expected_schema", "observed_schema"],
+        "properties": {
+          "expected_schema": {"type": "bounded-identifier"},
+          "observed_schema": {"type": "bounded-identifier"}
+        }
+      }
+    },
+    {
+      "event_type": "duplicate-finish",
+      "evidence": {
+        "required": ["attempt"],
+        "properties": {"attempt": {"type": "positive-integer"}}
+      }
+    },
+    {
+      "event_type": "record-dropped",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": ["invalid", "storage", "unsupported"]
+          }
+        }
+      }
+    },
+    {
+      "event_type": "payload-cleanup-failed",
+      "evidence": {
+        "required": ["attempt"],
+        "properties": {"attempt": {"type": "positive-integer"}}
+      }
+    },
+    {
+      "event_type": "lock-contended",
+      "evidence": {
+        "required": ["wait_milliseconds"],
+        "properties": {
+          "wait_milliseconds": {"type": "nonnegative-integer"}
+        }
+      }
+    },
+    {
+      "event_type": "lock-timeout",
+      "evidence": {
+        "required": ["timeout_milliseconds"],
+        "properties": {
+          "timeout_milliseconds": {"type": "positive-integer"}
+        }
+      }
+    },
+    {
+      "event_type": "stale-owner-recovered",
+      "evidence": {
+        "required": ["metadata_present"],
+        "properties": {"metadata_present": {"type": "boolean"}}
+      }
+    },
+    {
+      "event_type": "cas-conflict",
+      "evidence": {
+        "required": ["attempt"],
+        "properties": {"attempt": {"type": "positive-integer"}}
+      }
+    },
+    {
+      "event_type": "maintenance-lease-timeout",
+      "evidence": {
+        "required": ["timeout_milliseconds"],
+        "properties": {
+          "timeout_milliseconds": {"type": "positive-integer"}
+        }
+      }
+    },
+    {
+      "event_type": "maintenance-recovery-blocked",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": [
+              "conflict",
+              "corrupt-staging",
+              "durability",
+              "missing-staging",
+              "multiple-active"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "event_type": "sampling-decision-failed",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": ["cleanup", "policy", "validation"]
+          }
+        }
+      }
+    },
+    {
+      "event_type": "export-aborted",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": ["drift", "integrity", "validation"]
+          }
+        }
+      }
+    },
+    {
+      "event_type": "purge-aborted",
+      "evidence": {
+        "required": ["reason_code"],
+        "properties": {
+          "reason_code": {
+            "type": "enum",
+            "values": ["drift", "expired", "integrity", "validation"]
+          }
+        }
+      }
+    }
+  ],
+  "error_classes": [
+    "conflict",
+    "integrity",
+    "state",
+    "timeout",
+    "unsupported",
+    "validation"
+  ],
+  "resource_kinds": [
+    "artifact",
+    "export",
+    "health",
+    "learning-snapshot",
+    "maintenance",
+    "observation",
+    "observation-invalidation",
+    "purge",
+    "sampling",
+    "store"
+  ],
+  "limits": {
+    "identifier_max_utf8_bytes": 128,
+    "integer_max": 9007199254740991
+  },
+  "hash_domain": "workflow-observatory:health-event:v1"
+}
