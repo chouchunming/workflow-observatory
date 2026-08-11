@@ -191,6 +191,30 @@ class ArchiveTests(unittest.TestCase):
         build_archive(self.source, self.archive, self.evidence)
         self._assert_live_v02_inventory(self.archive)
 
+    def test_archive_contains_approved_v03_phase1_documents(self):
+        build_archive(self.source, self.archive, self.evidence)
+        marketplace = self._inventory()["marketplace_files"]
+        self.assertIn(
+            "docs/superpowers/specs/"
+            "2026-08-11-workflow-observatory-concurrency-operability-v0.3-design.md",
+            marketplace,
+        )
+        self.assertIn(
+            "docs/superpowers/plans/"
+            "2026-08-11-workflow-observatory-v0.3-phase-1-schema-migration.md",
+            marketplace,
+        )
+
+    def test_archive_rejects_unlisted_v03_phase1_document_sibling(self):
+        sibling = self.source / "docs/superpowers/specs/unlisted-v0.3-sibling.md"
+        sibling.write_text("# Unlisted sibling\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            PackageError,
+            "unexpected marketplace file: "
+            "docs/superpowers/specs/unlisted-v0.3-sibling.md",
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
     def test_public_main_builds_from_live_v02_source_inventory(self):
         destination = self.root / "public-main.zip"
         real_build_archive = build_archive

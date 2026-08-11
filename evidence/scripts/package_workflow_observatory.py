@@ -125,7 +125,9 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
         "docs/parallel-evaluation-plan.md",
         "docs/release-acceptance.md",
         "docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md",
+        "docs/superpowers/plans/2026-08-11-workflow-observatory-v0.3-phase-1-schema-migration.md",
         "docs/superpowers/specs/2026-08-02-workflow-evolution-foundation-v0.2-design.md",
+        "docs/superpowers/specs/2026-08-11-workflow-observatory-concurrency-operability-v0.3-design.md",
         "plugins/workflow-observer/.codex-plugin/plugin.json",
         "plugins/workflow-observer/README.md",
     }:
