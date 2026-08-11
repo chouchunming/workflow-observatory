@@ -18,10 +18,12 @@ for module_root in (PLUGIN_ROOT / "scripts", PLUGIN_ROOT / "tests"):
         sys.path.insert(0, str(module_root))
 
 from canonical_json import canonicalize, hash_canonical, strict_json_loads
+from artifact_schema import load_artifact_policy_set
 from learning_snapshot import candidate_id
 from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
+    SnapshotInput,
     SnapshotQuery,
     acquire_snapshot_input,
 )
@@ -40,6 +42,7 @@ from workflow_evolution_fixtures import FakeObservationStore
 
 FIXED_NOW = "2026-08-03T00:01:00Z"
 _SNAPSHOT_CORE_DOMAIN = b"workflow-observatory:learning-snapshot-core:v1\0"
+_INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
 _COMPLETION = """## Execution evidence
 
 - Verification: publication regression passed
@@ -138,6 +141,25 @@ def recompute_candidate_identity(candidate):
     candidate["candidate_id"] = candidate_id(evidence)
 
 
+def legacy_snapshot_input(acquired, policy_set):
+    bundle = acquired.semantic_bundle
+    bundle["schema_version"] = 1
+    bundle.pop("artifact_policy_set")
+    bundle.pop("migration_manifest")
+    bundle.pop("input_manifest_sha256")
+    bundle["input_manifest_sha256"] = hash_canonical(
+        _INPUT_MANIFEST_DOMAIN, bundle
+    )
+    return SnapshotInput(
+        acquired.adapter,
+        acquired.store_identity,
+        bundle,
+        reviewed_generation_mapping=(
+            policy_set.documents["workflow_generation_mapping"]
+        ),
+    )
+
+
 class SnapshotPublicationTests(unittest.TestCase):
     def setUp(self):
         self.store = FakeObservationStore("portable")
@@ -147,6 +169,9 @@ class SnapshotPublicationTests(unittest.TestCase):
             PLUGIN_ROOT / "policies",
             analyzer_files=SNAPSHOT_ANALYZER_FILES,
             canonicalizer_files=("scripts/canonical_json.py",),
+        )
+        self.artifact_policies = load_artifact_policy_set(
+            PLUGIN_ROOT / "policies"
         )
         interval = {
             "basis": "started_at",
@@ -168,10 +193,14 @@ class SnapshotPublicationTests(unittest.TestCase):
         )
 
     def acquire(self):
-        return acquire_snapshot_input(
-            ObservationPaths.from_root(self.store.store_root),
-            PORTABLE_SEMANTICS,
-            self.query,
+        return legacy_snapshot_input(
+            acquire_snapshot_input(
+                ObservationPaths.from_root(self.store.store_root),
+                PORTABLE_SEMANTICS,
+                self.query,
+                self.policies,
+                self.artifact_policies,
+            ),
             self.policies,
         )
 
@@ -297,9 +326,10 @@ plugin_root = Path(os.environ["PLUGIN_ROOT"])
 for module_root in (plugin_root / "scripts", plugin_root / "tests"):
     sys.path.insert(0, str(module_root))
 
-from canonical_json import canonicalize
+from artifact_schema import load_artifact_policy_set
+from canonical_json import canonicalize, hash_canonical
 from policy_artifacts import load_policy_set
-from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotQuery, acquire_snapshot_input
+from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotInput, SnapshotQuery, acquire_snapshot_input
 from snapshot_store import create_learning_snapshot
 from store_config import PORTABLE_SEMANTICS
 from wiki_observations import ObservationPaths
@@ -309,6 +339,7 @@ policy_set = load_policy_set(
     analyzer_files=SNAPSHOT_ANALYZER_FILES,
     canonicalizer_files=("scripts/canonical_json.py",),
 )
+artifact_policy_set = load_artifact_policy_set(plugin_root / "policies")
 interval = {
     "basis": "started_at",
     "since_inclusive": "2026-08-01T16:00:00Z",
@@ -335,11 +366,28 @@ while not release.exists():
     time.sleep(0.01)
 
 def acquire():
-    return acquire_snapshot_input(
+    acquired = acquire_snapshot_input(
         ObservationPaths.from_root(store_root),
         PORTABLE_SEMANTICS,
         query,
         policy_set,
+        artifact_policy_set,
+    )
+    bundle = acquired.semantic_bundle
+    bundle["schema_version"] = 1
+    bundle.pop("artifact_policy_set")
+    bundle.pop("migration_manifest")
+    bundle.pop("input_manifest_sha256")
+    bundle["input_manifest_sha256"] = hash_canonical(
+        b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
+    )
+    return SnapshotInput(
+        acquired.adapter,
+        acquired.store_identity,
+        bundle,
+        reviewed_generation_mapping=(
+            policy_set.documents["workflow_generation_mapping"]
+        ),
     )
 
 published = create_learning_snapshot(

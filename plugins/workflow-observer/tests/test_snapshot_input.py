@@ -20,6 +20,7 @@ for module_root in (PLUGIN_ROOT / "scripts", PLUGIN_ROOT / "tests"):
         sys.path.insert(0, str(module_root))
 
 from canonical_json import canonicalize, hash_canonical
+from artifact_schema import load_artifact_policy_set
 from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
@@ -68,6 +69,9 @@ class SnapshotInputTests(unittest.TestCase):
             analyzer_files=SNAPSHOT_ANALYZER_FILES,
             canonicalizer_files=("scripts/canonical_json.py",),
         )
+        self.artifact_policies = load_artifact_policy_set(
+            PLUGIN_ROOT / "policies"
+        )
         interval = {
             "basis": "started_at",
             "since_inclusive": "2026-08-02T00:00:00Z",
@@ -98,6 +102,7 @@ class SnapshotInputTests(unittest.TestCase):
             semantics,
             self.query,
             self.policy_set,
+            self.artifact_policies,
         )
 
     def add_reviewed_generation_mapping(
@@ -281,6 +286,8 @@ class SnapshotInputTests(unittest.TestCase):
             adapter,
             acquired.store_identity,
             semantic_bundle,
+            artifact_type="snapshot-input",
+            schema_version=2,
         )
         expected_bytes = rebuilt.manifest_bytes
         adapter["name"] = "mutated-adapter"
@@ -318,6 +325,8 @@ class SnapshotInputTests(unittest.TestCase):
                 acquired.adapter,
                 acquired.store_identity,
                 semantic_bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
             )
 
     def test_snapshot_input_rejects_unmapped_v1_observed_generation(self):
@@ -341,6 +350,8 @@ class SnapshotInputTests(unittest.TestCase):
                 acquired.adapter,
                 acquired.store_identity,
                 semantic_bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
             )
 
     def test_nonempty_bound_mapping_requires_exact_reviewed_document(self):
@@ -365,6 +376,8 @@ class SnapshotInputTests(unittest.TestCase):
                 acquired.adapter,
                 acquired.store_identity,
                 semantic_bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
             )
 
     def test_approved_empty_mapping_identity_allows_omitted_document(self):
@@ -378,6 +391,8 @@ class SnapshotInputTests(unittest.TestCase):
             acquired.adapter,
             acquired.store_identity,
             acquired.semantic_bundle,
+            artifact_type="snapshot-input",
+            schema_version=2,
         )
 
         self.assertEqual(acquired.manifest_bytes, rebuilt.manifest_bytes)
@@ -397,6 +412,8 @@ class SnapshotInputTests(unittest.TestCase):
             reviewed_generation_mapping=(
                 self.policy_set.documents["workflow_generation_mapping"]
             ),
+            artifact_type="snapshot-input",
+            schema_version=2,
         )
 
         self.assertEqual(acquired.manifest_bytes, rebuilt.manifest_bytes)
@@ -426,7 +443,13 @@ class SnapshotInputTests(unittest.TestCase):
         for adapter, bundle in malformed_values:
             with self.subTest(keys=(set(adapter), set(bundle))):
                 with self.assertRaisesRegex(SnapshotInputError, "exact fields"):
-                    SnapshotInput(adapter, acquired.store_identity, bundle)
+                    SnapshotInput(
+                        adapter,
+                        acquired.store_identity,
+                        bundle,
+                        artifact_type="snapshot-input",
+                        schema_version=2,
+                    )
 
     def test_snapshot_input_rejects_rehashed_nested_corruption(self):
         acquired = self.acquire()
@@ -532,6 +555,8 @@ class SnapshotInputTests(unittest.TestCase):
                         acquired.adapter,
                         acquired.store_identity,
                         rehashed(mutate),
+                        artifact_type="snapshot-input",
+                        schema_version=2,
                     )
 
         adapter = acquired.adapter
@@ -542,6 +567,8 @@ class SnapshotInputTests(unittest.TestCase):
                     adapter,
                     acquired.store_identity,
                     acquired.semantic_bundle,
+                    artifact_type="snapshot-input",
+                    schema_version=2,
                 )
 
     def test_snapshot_input_rejects_rehashed_invalid_decision_summary(self):
@@ -573,6 +600,8 @@ class SnapshotInputTests(unittest.TestCase):
                         acquired.adapter,
                         acquired.store_identity,
                         bundle,
+                        artifact_type="snapshot-input",
+                        schema_version=2,
                     )
 
     def test_taipei_dates_become_fixed_utc_half_open_interval(self):
@@ -644,6 +673,7 @@ class SnapshotInputTests(unittest.TestCase):
         self.add_reviewed_generation_mapping()
         acquired = self.acquire()
         self.assertEqual(1, len(acquired.semantic_bundle["episodes"]))
+        self.assertEqual(1, len(acquired.semantic_bundle["migration_manifest"]))
         self.assertEqual(
             1,
             acquired.semantic_bundle["record_counts"]["selected_episode_n"],
@@ -873,6 +903,7 @@ class SnapshotInputTests(unittest.TestCase):
                 PORTABLE_SEMANTICS,
                 self.query,
                 self.policy_set,
+                self.artifact_policies,
             )
 
         expected_references = {
@@ -927,6 +958,8 @@ class SnapshotInputTests(unittest.TestCase):
     def test_cli_and_direct_acquisition_close_the_same_analyzer_dependencies(self):
         self.assertEqual(
             (
+                "scripts/artifact_migration.py",
+                "scripts/artifact_schema.py",
                 "scripts/episode_schema.py",
                 "scripts/learning_snapshot.py",
                 "scripts/policy_artifacts.py",
@@ -954,6 +987,34 @@ class SnapshotInputTests(unittest.TestCase):
 
         self.assertEqual(direct, cli)
         self.assertNotEqual(direct, without_store_config)
+        self.assertEqual(
+            self.artifact_policies.identities(),
+            workflow_observer_cli._snapshot_artifact_policy_set().identities(),
+        )
+
+    def test_snapshot_v1_publication_bridge_uses_one_immutable_v2_input(self):
+        acquired = self.acquire()
+        original_bytes = acquired.manifest_bytes
+        with mock.patch(
+            "workflow_observer_cli.acquire_snapshot_input",
+            side_effect=AssertionError("bridge reopened the observation store"),
+        ) as acquisition:
+            legacy = workflow_observer_cli._snapshot_v1_publication_view(
+                acquired, self.policy_set
+            )
+
+        acquisition.assert_not_called()
+        self.assertEqual(original_bytes, acquired.manifest_bytes)
+        self.assertEqual(2, acquired.schema_version)
+        self.assertEqual(1, legacy.schema_version)
+        self.assertEqual(
+            {"adapter", "store_identity", "semantic_bundle"},
+            set(legacy.canonical_representation),
+        )
+        self.assertNotIn(
+            "artifact_policy_set", legacy.semantic_bundle
+        )
+        self.assertNotIn("migration_manifest", legacy.semantic_bundle)
 
     def test_snapshot_input_excludes_human_text_and_reference_bodies(self):
         self._write_valid_record_with_privacy_sentinel()
@@ -1256,6 +1317,7 @@ class SnapshotInputTests(unittest.TestCase):
                         PORTABLE_SEMANTICS,
                         self.query,
                         malformed,
+                        self.artifact_policies,
                     )
 
     def test_selected_invalidation_is_manifested_regardless_of_its_timestamp(self):
@@ -1301,13 +1363,179 @@ class SnapshotInputTests(unittest.TestCase):
             actual,
         )
         self.assertEqual(
-            {"adapter", "store_identity", "semantic_bundle"},
+            {
+                "artifact_type",
+                "schema_version",
+                "adapter",
+                "store_identity",
+                "semantic_bundle",
+            },
             set(acquired.canonical_representation),
         )
+        self.assertEqual("snapshot-input", acquired.canonical_representation[
+            "artifact_type"
+        ])
+        self.assertEqual(2, acquired.canonical_representation["schema_version"])
+        self.assertEqual(2, acquired.semantic_bundle["schema_version"])
         self.assertEqual(
             canonicalize(acquired.canonical_representation),
             acquired.manifest_bytes,
         )
+
+    def test_snapshot_input_v2_binds_exact_artifact_policy_and_migration_rows(self):
+        acquired = self.acquire()
+        identities = self.artifact_policies.identities()
+        self.assertEqual(
+            {
+                "artifact_schema_registry": identities[
+                    "artifact_schema_registry"
+                ],
+                "artifact_migration_registry": identities[
+                    "artifact_migration_registry"
+                ],
+            },
+            acquired.semantic_bundle["artifact_policy_set"],
+        )
+        self.assertNotIn(
+            "health_event_schema",
+            acquired.semantic_bundle["artifact_policy_set"],
+        )
+        episode = acquired.semantic_bundle["episodes"][0]
+        self.assertEqual(
+            [{
+                "artifact_type": "workflow-observation",
+                "migration_identity": (
+                    "workflow-observation-v1-to-episode-projection@1"
+                ),
+                "run_id": episode["run_id"],
+                "source_schema_version": 1,
+                "source_sha256": episode["source_sha256"],
+                "target_contract": "episode-projection@2",
+            }],
+            acquired.semantic_bundle["migration_manifest"],
+        )
+        encoded = canonicalize(acquired.semantic_bundle["migration_manifest"])
+        self.assertNotIn(b"/Users/", encoded)
+        self.assertNotIn(PRIVACY_SENTINEL.encode("utf-8"), encoded)
+
+    def test_snapshot_input_v2_rejects_schema_disagreement_and_stale_rows(self):
+        acquired = self.acquire()
+        with self.assertRaisesRegex(SnapshotInputError, "artifact type"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                acquired.semantic_bundle,
+                schema_version=2,
+            )
+        with self.assertRaisesRegex(SnapshotInputError, "schema version"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                acquired.semantic_bundle,
+                artifact_type="snapshot-input",
+            )
+        with self.assertRaisesRegex(SnapshotInputError, "schema version"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                acquired.semantic_bundle,
+                artifact_type="snapshot-input",
+                schema_version=1,
+            )
+
+        bundle = acquired.semantic_bundle
+        bundle["migration_manifest"][0]["source_sha256"] = "0" * 64
+        bundle.pop("input_manifest_sha256")
+        bundle["input_manifest_sha256"] = hash_canonical(
+            b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
+        )
+        with self.assertRaisesRegex(SnapshotInputError, "migration manifest"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
+            )
+
+    def test_migration_manifest_is_jcs_sorted_unique_per_physical_source(self):
+        for store in self.stores.values():
+            store._write_private(store.v2_path, store.expected_raw_bytes["v2"])
+        acquired = self.acquire()
+        rows = acquired.semantic_bundle["migration_manifest"]
+        self.assertEqual(1, len(rows))
+        self.assertEqual(
+            sorted(rows, key=canonicalize),
+            rows,
+        )
+        self.assertEqual(
+            len(rows),
+            len({
+                (
+                    row["artifact_type"],
+                    row["run_id"],
+                    row["source_sha256"],
+                    row["migration_identity"],
+                )
+                for row in rows
+            }),
+        )
+        self.assertEqual({1}, {row["source_schema_version"] for row in rows})
+        self.assertEqual(2, acquired.semantic_bundle["record_counts"][
+            "selected_episode_n"
+        ])
+
+        bundle = acquired.semantic_bundle
+        v2_episode = next(
+            episode for episode in bundle["episodes"]
+            if episode["episode_schema_version"] == 2
+        )
+        bundle["migration_manifest"].append({
+            "artifact_type": "workflow-observation",
+            "migration_identity": (
+                "workflow-observation-v2-to-episode-projection@1"
+            ),
+            "run_id": v2_episode["run_id"],
+            "source_schema_version": 2,
+            "source_sha256": v2_episode["source_sha256"],
+            "target_contract": "episode-projection@2",
+        })
+        bundle["migration_manifest"].sort(key=canonicalize)
+        bundle.pop("input_manifest_sha256")
+        bundle["input_manifest_sha256"] = hash_canonical(
+            b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
+        )
+        with self.assertRaisesRegex(
+            SnapshotInputError, "legacy|migration manifest"
+        ):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
+            )
+
+    def test_acquisition_requires_explicit_artifact_policy_set(self):
+        with self.assertRaisesRegex(TypeError, "artifact_policy_set"):
+            acquire_snapshot_input(
+                ObservationPaths.from_root(self.store.store_root),
+                PORTABLE_SEMANTICS,
+                self.query,
+                self.policy_set,
+            )
+
+    def test_acquisition_resolves_rows_with_supplied_artifact_policy_set(self):
+        with mock.patch(
+            "snapshot_input.resolve_artifact_migration",
+            wraps=snapshot_input.resolve_artifact_migration,
+        ) as resolver:
+            self.acquire()
+        self.assertGreater(resolver.call_count, 0)
+        self.assertTrue(all(
+            call.kwargs["policies"] is self.artifact_policies
+            for call in resolver.call_args_list
+        ))
 
     def test_lifecycle_as_of_must_be_utc_second_precision_and_not_before_window(self):
         invalid_values = (

@@ -21,11 +21,13 @@ from store_config import (
     load_store_config,
 )
 import wiki_observations
+from artifact_schema import ArtifactSchemaError, load_artifact_policy_set
 from episode_schema import EpisodeSchemaError, parse_v2_supplement
 from policy_artifacts import PolicyError, load_policy_set
-from canonical_json import CanonicalizationError, canonicalize
+from canonical_json import CanonicalizationError, canonicalize, hash_canonical
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
+    SnapshotInput,
     SnapshotInputError,
     SnapshotQuery,
     acquire_snapshot_input,
@@ -298,7 +300,7 @@ def _read_draft_schema(paths: ObservationPaths, run_id: str) -> int:
             raise ObservationError(
                 "validation", "observation record must be UTF-8 text"
             ) from error
-        from artifact_schema import load_artifact_policy_set, parse_markdown_envelope
+        from artifact_schema import parse_markdown_envelope
 
         envelope = parse_markdown_envelope(
             text,
@@ -524,6 +526,49 @@ def _snapshot_policy_set():
         raise SnapshotInputError(kind, f"could not load snapshot policy: {error}") from error
 
 
+def _snapshot_artifact_policy_set():
+    plugin_root = Path(__file__).resolve().parents[1]
+    try:
+        return load_artifact_policy_set(plugin_root / "policies")
+    except (ArtifactSchemaError, OSError) as error:
+        kind = "io" if isinstance(error, OSError) else "validation"
+        raise SnapshotInputError(
+            kind, f"could not load snapshot artifact policy: {error}"
+        ) from error
+
+
+def _snapshot_v1_publication_view(
+    acquired: SnapshotInput,
+    policy_set,
+) -> SnapshotInput:
+    """Temporary Task 6 bridge for the unchanged v1-only publisher.
+
+    Delete this bridge when Task 7 makes publication schema-dispatched.
+    """
+
+    if not isinstance(acquired, SnapshotInput) or acquired.schema_version != 2:
+        raise SnapshotInputError(
+            "validation", "v1 publication bridge requires Snapshot Input v2"
+        )
+    acquired.manifest_bytes
+    bundle = acquired.semantic_bundle
+    bundle["schema_version"] = 1
+    bundle.pop("artifact_policy_set")
+    bundle.pop("migration_manifest")
+    bundle.pop("input_manifest_sha256")
+    bundle["input_manifest_sha256"] = hash_canonical(
+        b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
+    )
+    return SnapshotInput(
+        acquired.adapter,
+        acquired.store_identity,
+        bundle,
+        reviewed_generation_mapping=(
+            policy_set.documents["workflow_generation_mapping"]
+        ),
+    )
+
+
 def _run_bundled(
     args: argparse.Namespace,
     config: StoreConfig,
@@ -543,6 +588,7 @@ def _run_bundled(
     if args.command in {"snapshot-input", "snapshot"}:
         query = _snapshot_query(args)
         policy_set = _snapshot_policy_set()
+        artifact_policy_set = _snapshot_artifact_policy_set()
         paths = (
             _portable_paths(config, missing_ok=False)
             if semantics.name == "portable"
@@ -550,9 +596,16 @@ def _run_bundled(
         )
         assert paths is not None
         def acquire():
-            return acquire_snapshot_input(
-                paths, semantics, query, policy_set
+            acquired = acquire_snapshot_input(
+                paths,
+                semantics,
+                query,
+                policy_set,
+                artifact_policy_set,
             )
+            if args.command == "snapshot":
+                return _snapshot_v1_publication_view(acquired, policy_set)
+            return acquired
 
         if args.command == "snapshot-input":
             acquired = acquire()

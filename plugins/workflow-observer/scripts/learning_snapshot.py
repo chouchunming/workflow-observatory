@@ -9,12 +9,16 @@ import re
 
 from canonical_json import CanonicalizationError, canonicalize, hash_canonical
 from policy_artifacts import PolicyError, PolicySet, validate_policy_documents
-from snapshot_input import SnapshotInput
+from snapshot_input import SnapshotInput, SnapshotQuery, validate_snapshot_query
 
 
 _ANALYZER_VERSION = "workflow-learning-analyzer@0.2.0"
 _INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
 _CANDIDATE_DOMAIN = b"workflow-observatory:learning-candidate:v1\0"
+_SNAPSHOT_CORE_DOMAINS = {
+    1: b"workflow-observatory:learning-snapshot-core:v1\0",
+    2: b"workflow-observatory:learning-snapshot-core:v2\0",
+}
 _MAX_SAFE_INTEGER = (2**53) - 1
 _LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _POLICY_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -51,7 +55,7 @@ _EPISODE_KEYS = {
     "decisions",
     "source_sha256",
 }
-_BUNDLE_KEYS = {
+_BUNDLE_V1_KEYS = {
     "schema_version",
     "projection_version",
     "query",
@@ -64,6 +68,58 @@ _BUNDLE_KEYS = {
     "reference_manifest",
     "input_manifest_sha256",
 }
+_BUNDLE_V2_KEYS = _BUNDLE_V1_KEYS | {
+    "artifact_policy_set",
+    "migration_manifest",
+}
+_CORE_V1_KEYS = {
+    "schema_version",
+    "analyzer_version",
+    "query",
+    "lifecycle_health_policy",
+    "analysis_policy_set",
+    "input_manifest",
+    "exclusion_ledger",
+    "cohorts",
+    "decision_patterns",
+    "candidates",
+}
+_CORE_V2_KEYS = _CORE_V1_KEYS | {
+    "artifact_type",
+    "sampled_by_policy_n",
+    "sampling_summary",
+}
+_ARTIFACT_V1_KEYS = {
+    "artifact_type",
+    "authoritative",
+    "generated_at",
+    "store_identity",
+    "adapter",
+    "snapshot_id",
+    "core",
+    "artifact_sha256",
+}
+_ARTIFACT_V2_KEYS = _ARTIFACT_V1_KEYS | {"schema_version"}
+_ANALYSIS_POLICY_IDENTITY_NAMES = {
+    "analyzer_artifact",
+    "candidate_emission_policy",
+    "canonical_projection_contract",
+    "canonicalizer_artifact",
+    "decision_support_policy",
+    "lifecycle_health_policy",
+    "metric_semantics_registry",
+    "producer_capability_registry",
+    "quantile_policy",
+    "workflow_generation_mapping",
+}
+_MISSINGNESS_V1_KEYS = {
+    "eligible_episode_n",
+    "observed_n",
+    "not_recorded_n",
+    "unsupported_by_schema_n",
+    "not_applicable_n",
+}
+_MISSINGNESS_V2_KEYS = _MISSINGNESS_V1_KEYS | {"sampled_by_policy_n"}
 _VERIFICATION_CATEGORIES = ("fail", "not-run", "pass", "unknown")
 _COHORT_IDENTITY_FIELDS = (
     "collection",
@@ -311,10 +367,19 @@ def _validate_input_bundle(
 ) -> dict:
     if not isinstance(snapshot_input, SnapshotInput):
         raise LearningSnapshotError("snapshot_input must be a SnapshotInput")
+    schema_version = snapshot_input.schema_version
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise LearningSnapshotError("snapshot input schema version is unsupported")
     bundle = snapshot_input.semantic_bundle
-    if not isinstance(bundle, dict) or set(bundle) != _BUNDLE_KEYS:
+    expected_keys = (
+        _BUNDLE_V1_KEYS if schema_version == 1 else _BUNDLE_V2_KEYS
+    )
+    if not isinstance(bundle, dict) or set(bundle) != expected_keys:
         raise LearningSnapshotError("snapshot input semantic bundle has wrong fields")
-    if type(bundle["schema_version"]) is not int or bundle["schema_version"] != 1:
+    if (
+        type(bundle["schema_version"]) is not int
+        or bundle["schema_version"] != schema_version
+    ):
         raise LearningSnapshotError("snapshot input schema version is unsupported")
     if bundle["projection_version"] != "episode-projection@2":
         raise LearningSnapshotError("snapshot input projection version is unsupported")
@@ -548,7 +613,13 @@ def _metric_value(name: str, metric: Mapping, semantics: Mapping) -> object:
     raise LearningSnapshotError(f"metric {name} has unsupported value semantics")
 
 
-def _metric_result(name: str, outcomes: list[Mapping], documents: Mapping) -> dict:
+def _metric_result(
+    name: str,
+    outcomes: list[Mapping],
+    documents: Mapping,
+    *,
+    schema_version: int,
+) -> dict:
     semantics = documents["metric_semantics"]["metrics"][name]
     counts = {
         "eligible_episode_n": len(outcomes),
@@ -557,6 +628,8 @@ def _metric_result(name: str, outcomes: list[Mapping], documents: Mapping) -> di
         "unsupported_by_schema_n": 0,
         "not_applicable_n": 0,
     }
+    if schema_version == 2:
+        counts["sampled_by_policy_n"] = 0
     observed = []
     for episode in outcomes:
         metric = episode["metrics"][name]
@@ -572,12 +645,15 @@ def _metric_result(name: str, outcomes: list[Mapping], documents: Mapping) -> di
             raise LearningSnapshotError(
                 f"metric {name} did not enter one eligibility bucket"
             )
-    if sum(counts[name] for name in (
+    partitions = (
         "observed_n",
         "not_recorded_n",
         "unsupported_by_schema_n",
         "not_applicable_n",
-    )) != counts["eligible_episode_n"]:
+    )
+    if schema_version == 2:
+        partitions += ("sampled_by_policy_n",)
+    if sum(counts[name] for name in partitions) != counts["eligible_episode_n"]:
         raise LearningSnapshotError(f"metric {name} eligibility partition is invalid")
 
     aggregation = semantics["aggregation"]
@@ -980,6 +1056,533 @@ def _ledger_row(run_id: str, reason: str, excluded_from: str) -> tuple[str, str,
     return run_id, reason, excluded_from
 
 
+def _exact_learning_mapping(
+    value: object, keys: set[str], label: str
+) -> Mapping:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise LearningSnapshotError(f"{label} does not have its exact fields")
+    return value
+
+
+def _validated_core_input_manifest(value: object) -> tuple[set[str], set[str]]:
+    manifest = _exact_learning_mapping(
+        value,
+        {
+            "input_manifest_sha256",
+            "episodes",
+            "invalidations",
+            "reference_manifest",
+        },
+        "learning snapshot input manifest",
+    )
+    _sha256(manifest["input_manifest_sha256"], "learning snapshot input manifest")
+    episodes = manifest["episodes"]
+    invalidations = manifest["invalidations"]
+    references = manifest["reference_manifest"]
+    if not isinstance(episodes, list):
+        raise LearningSnapshotError("learning snapshot Episode evidence must be an array")
+    if not isinstance(invalidations, list):
+        raise LearningSnapshotError("learning snapshot invalidation evidence must be an array")
+    if not isinstance(references, list):
+        raise LearningSnapshotError("learning snapshot reference evidence must be an array")
+    episode_ids = []
+    for raw in episodes:
+        row = _exact_learning_mapping(
+            raw, {"run_id", "source_sha256"}, "learning snapshot Episode evidence"
+        )
+        run_id = _bounded_text(row["run_id"], "learning snapshot Episode run_id")
+        _sha256(row["source_sha256"], "learning snapshot Episode source")
+        episode_ids.append(run_id)
+    if episode_ids != sorted(set(episode_ids), key=_utf8):
+        raise LearningSnapshotError("learning snapshot Episode evidence is not sorted unique")
+    invalidation_ids = []
+    for raw in invalidations:
+        row = _exact_learning_mapping(
+            raw,
+            {"run_id", "source_sha256", "timestamp"},
+            "learning snapshot invalidation evidence",
+        )
+        run_id = _bounded_text(
+            row["run_id"], "learning snapshot invalidation run_id"
+        )
+        if run_id not in episode_ids:
+            raise LearningSnapshotError(
+                "learning snapshot invalidation has no selected Episode"
+            )
+        _sha256(row["source_sha256"], "learning snapshot invalidation source")
+        _utc_instant(row["timestamp"], "learning snapshot invalidation timestamp")
+        invalidation_ids.append(run_id)
+    if invalidation_ids != sorted(set(invalidation_ids), key=_utf8):
+        raise LearningSnapshotError(
+            "learning snapshot invalidation evidence is not sorted unique"
+        )
+    for raw in references:
+        row = _exact_learning_mapping(
+            raw,
+            {"kind", "identity", "sha256"},
+            "learning snapshot reference evidence",
+        )
+        _bounded_text(row["kind"], "learning snapshot reference kind")
+        _bounded_text(
+            row["identity"],
+            "learning snapshot reference identity",
+            maximum_codepoints=1024,
+        )
+        _sha256(row["sha256"], "learning snapshot reference source")
+    return set(episode_ids), set(invalidation_ids)
+
+
+def _validate_core_metric_partitions(core: Mapping, schema_version: int) -> None:
+    cohorts = core["cohorts"]
+    if not isinstance(cohorts, list):
+        raise LearningSnapshotError("learning snapshot cohorts must be an array")
+    missingness_keys = (
+        _MISSINGNESS_V1_KEYS if schema_version == 1 else _MISSINGNESS_V2_KEYS
+    )
+    for cohort in cohorts:
+        if not isinstance(cohort, Mapping) or not isinstance(
+            cohort.get("metrics"), list
+        ):
+            raise LearningSnapshotError("learning snapshot cohort is invalid")
+        for metric in cohort["metrics"]:
+            row = _exact_learning_mapping(
+                metric,
+                {
+                    "metric",
+                    "semantics_id",
+                    "value_type",
+                    "aggregation",
+                    "missingness",
+                    "observed_values",
+                    "category_counts",
+                    "quantiles",
+                },
+                "learning snapshot metric",
+            )
+            _bounded_text(row["metric"], "learning snapshot metric identity")
+            missingness = _exact_learning_mapping(
+                row["missingness"],
+                missingness_keys,
+                "learning snapshot metric availability partition",
+            )
+            for name, count in missingness.items():
+                _safe_nonnegative_integer(
+                    count, f"learning snapshot metric availability {name}"
+                )
+            if schema_version == 2 and missingness["sampled_by_policy_n"] != 0:
+                raise LearningSnapshotError(
+                    "Phase 1 learning snapshot sampling count must be zero"
+                )
+            partition_names = (
+                "observed_n",
+                "not_recorded_n",
+                "unsupported_by_schema_n",
+                "not_applicable_n",
+            )
+            if schema_version == 2:
+                partition_names += ("sampled_by_policy_n",)
+            if sum(missingness[name] for name in partition_names) != missingness[
+                "eligible_episode_n"
+            ]:
+                raise LearningSnapshotError(
+                    "learning snapshot metric availability partition is not exhaustive"
+                )
+
+
+def _validate_candidate_metric_partitions(
+    core: Mapping, schema_version: int
+) -> None:
+    missingness_keys = (
+        _MISSINGNESS_V1_KEYS if schema_version == 1 else _MISSINGNESS_V2_KEYS
+    )
+    candidate_ids = []
+    for raw_candidate in core["candidates"]:
+        candidate = _exact_learning_mapping(
+            raw_candidate,
+            {
+                "candidate_type",
+                "class",
+                "cohort",
+                "source",
+                "policy_identities",
+                "denominators",
+                "evidence",
+                "evidence_strength",
+                "candidate_id",
+            },
+            "learning snapshot candidate",
+        )
+        source = _exact_learning_mapping(
+            candidate["source"],
+            {"kind", "identity", "semantics_id"},
+            "learning snapshot candidate source",
+        )
+        evidence = _exact_learning_mapping(
+            candidate["evidence"],
+            set(_CANDIDATE_EVIDENCE_FIELDS),
+            "learning snapshot candidate evidence",
+        )
+        missingness = evidence["missingness"]
+        if missingness is not None:
+            if source["kind"] != "metric":
+                raise LearningSnapshotError(
+                    "learning snapshot candidate missingness is not metric evidence"
+                )
+            partition = _exact_learning_mapping(
+                missingness,
+                missingness_keys,
+                "learning snapshot candidate metric availability partition",
+            )
+            for name, count in partition.items():
+                _safe_nonnegative_integer(
+                    count,
+                    f"learning snapshot candidate metric availability {name}",
+                )
+            partition_names = (
+                "observed_n",
+                "not_recorded_n",
+                "unsupported_by_schema_n",
+                "not_applicable_n",
+            )
+            if schema_version == 2:
+                partition_names += ("sampled_by_policy_n",)
+                if partition["sampled_by_policy_n"] != 0:
+                    raise LearningSnapshotError(
+                        "Phase 1 candidate sampling count must be zero"
+                    )
+            if sum(partition[name] for name in partition_names) != partition[
+                "eligible_episode_n"
+            ]:
+                raise LearningSnapshotError(
+                    "learning snapshot candidate metric partition is not exhaustive"
+                )
+        expected_candidate = deepcopy(dict(candidate))
+        actual_candidate_id = expected_candidate.pop("candidate_id")
+        if actual_candidate_id != candidate_id(expected_candidate):
+            raise LearningSnapshotError(
+                "learning snapshot candidate identity is inconsistent"
+            )
+        candidate_ids.append(actual_candidate_id)
+    if candidate_ids != sorted(set(candidate_ids), key=_utf8):
+        raise LearningSnapshotError(
+            "learning snapshot candidates are not sorted unique"
+        )
+
+
+def _legacy_core_validation_view(core: Mapping, schema_version: int) -> dict:
+    legacy = deepcopy(dict(core))
+    if schema_version == 1:
+        return legacy
+    legacy.pop("artifact_type")
+    legacy.pop("sampled_by_policy_n")
+    legacy.pop("sampling_summary")
+    legacy["schema_version"] = 1
+    for cohort in legacy["cohorts"]:
+        for metric in cohort["metrics"]:
+            metric["missingness"].pop("sampled_by_policy_n")
+    for candidate in legacy["candidates"]:
+        missingness = candidate["evidence"]["missingness"]
+        if candidate["source"]["kind"] == "metric" and missingness is not None:
+            missingness.pop("sampled_by_policy_n")
+            candidate.pop("candidate_id")
+            candidate["candidate_id"] = candidate_id(candidate)
+    legacy["candidates"].sort(key=lambda row: _utf8(row["candidate_id"]))
+    return legacy
+
+
+def _validate_with_established_v02_core_validator(
+    core: Mapping,
+    *,
+    schema_version: int,
+    adapter: Mapping,
+    policy_set: PolicySet,
+) -> None:
+    if not isinstance(policy_set, PolicySet):
+        raise LearningSnapshotError(
+            "learning snapshot validation requires an immutable PolicySet"
+        )
+    legacy_core = _legacy_core_validation_view(core, schema_version)
+    snapshot_id = hash_canonical(_SNAPSHOT_CORE_DOMAINS[1], legacy_core)
+    without_digest = {
+        "artifact_type": "learning-snapshot",
+        "authoritative": False,
+        "generated_at": "2000-01-01T00:00:00Z",
+        "store_identity": None,
+        "adapter": deepcopy(dict(adapter)),
+        "snapshot_id": snapshot_id,
+        "core": legacy_core,
+    }
+    artifact = {
+        **without_digest,
+        "artifact_sha256": hashlib.sha256(
+            canonicalize(without_digest)
+        ).hexdigest(),
+    }
+    try:
+        from snapshot_store import (
+            SnapshotPublicationError,
+            validate_learning_artifact,
+        )
+
+        validate_learning_artifact(artifact, policy_set)
+    except SnapshotPublicationError as error:
+        raise _error(
+            f"learning snapshot core failed established v0.2 validation: {error}",
+            error,
+        ) from error
+
+
+def validate_learning_snapshot_core(
+    value: object,
+    *,
+    expected_schema_version: int,
+    adapter: Mapping,
+    policy_set: PolicySet,
+) -> dict:
+    """Validate one complete legacy-v1 or Phase-1-v2 learning core."""
+
+    if expected_schema_version not in {1, 2}:
+        raise LearningSnapshotError("learning snapshot core schema is unsupported")
+    keys = _CORE_V1_KEYS if expected_schema_version == 1 else _CORE_V2_KEYS
+    core = _exact_learning_mapping(value, keys, "learning snapshot core")
+    if (
+        type(core["schema_version"]) is not int
+        or core["schema_version"] != expected_schema_version
+    ):
+        raise LearningSnapshotError("learning snapshot core schema does not agree")
+    if expected_schema_version == 2 and core["artifact_type"] != (
+        "learning-snapshot-core"
+    ):
+        raise LearningSnapshotError("learning snapshot core artifact type is invalid")
+    if core["analyzer_version"] != _ANALYZER_VERSION:
+        raise LearningSnapshotError("learning snapshot core analyzer version is invalid")
+    identities = _exact_learning_mapping(
+        core["analysis_policy_set"],
+        _ANALYSIS_POLICY_IDENTITY_NAMES,
+        "learning snapshot analysis policy set",
+    )
+    for name, raw in identities.items():
+        row = _exact_learning_mapping(
+            raw, {"version", "sha256"}, f"learning snapshot policy {name}"
+        )
+        _bounded_text(row["version"], f"learning snapshot policy {name} version")
+        _sha256(
+            row["sha256"], f"learning snapshot policy {name}", prefixed=True
+        )
+    query = _exact_learning_mapping(
+        core["query"],
+        {
+            "interval",
+            "lifecycle_as_of",
+            "project",
+            "workspace",
+            "workspace_id",
+            "task_type",
+        },
+        "learning snapshot query",
+    )
+    try:
+        validate_snapshot_query(SnapshotQuery(**deepcopy(dict(query))))
+    except Exception as error:
+        raise _error(f"learning snapshot query is invalid: {error}", error) from error
+    lifecycle = _exact_learning_mapping(
+        core["lifecycle_health_policy"],
+        {"policy_id", "policy_sha256", "as_of", "stale_after_seconds"},
+        "learning snapshot lifecycle policy",
+    )
+    _bounded_text(lifecycle["policy_id"], "learning snapshot lifecycle policy id")
+    _sha256(
+        lifecycle["policy_sha256"],
+        "learning snapshot lifecycle policy",
+        prefixed=True,
+    )
+    _utc_instant(lifecycle["as_of"], "learning snapshot lifecycle as_of")
+    _safe_nonnegative_integer(
+        lifecycle["stale_after_seconds"], "learning snapshot stale threshold"
+    )
+    if lifecycle["as_of"] != query["lifecycle_as_of"] or {
+        "version": lifecycle["policy_id"],
+        "sha256": lifecycle["policy_sha256"],
+    } != identities["lifecycle_health_policy"]:
+        raise LearningSnapshotError("learning snapshot lifecycle policy is not bound")
+    episode_ids, invalidation_ids = _validated_core_input_manifest(
+        core["input_manifest"]
+    )
+    for name in ("exclusion_ledger", "decision_patterns", "candidates"):
+        if not isinstance(core[name], list):
+            raise LearningSnapshotError(f"learning snapshot {name} must be an array")
+    _validate_core_metric_partitions(core, expected_schema_version)
+    _validate_candidate_metric_partitions(core, expected_schema_version)
+    if expected_schema_version == 2:
+        _safe_nonnegative_integer(
+            core["sampled_by_policy_n"], "learning snapshot sampled_by_policy_n"
+        )
+        summary = _exact_learning_mapping(
+            core["sampling_summary"],
+            {
+                "full_retained_episode_n",
+                "sampled_minimal_episode_n",
+                "sampling_policy_identities",
+            },
+            "learning snapshot sampling summary",
+        )
+        for name in (
+            "full_retained_episode_n",
+            "sampled_minimal_episode_n",
+        ):
+            _safe_nonnegative_integer(summary[name], f"sampling summary {name}")
+        if not isinstance(summary["sampling_policy_identities"], list):
+            raise LearningSnapshotError(
+                "sampling policy identities must be an array"
+            )
+        if (
+            core["sampled_by_policy_n"] != 0
+            or summary["sampled_minimal_episode_n"] != 0
+            or summary["sampling_policy_identities"] != []
+        ):
+            raise LearningSnapshotError(
+                "Phase 1 learning snapshot sampling state must be explicit zero"
+            )
+        if summary["full_retained_episode_n"] != len(
+            episode_ids - invalidation_ids
+        ):
+            raise LearningSnapshotError(
+                "learning snapshot full retained population is inconsistent"
+            )
+    try:
+        canonicalize(core)
+    except CanonicalizationError as error:
+        raise _error(f"learning snapshot core is not canonicalizable: {error}", error) \
+            from error
+    _validate_with_established_v02_core_validator(
+        core,
+        schema_version=expected_schema_version,
+        adapter=adapter,
+        policy_set=policy_set,
+    )
+    return deepcopy(dict(core))
+
+
+def migrate_learning_snapshot_v1_core(
+    value: object,
+    *,
+    adapter: Mapping,
+    policy_set: PolicySet,
+) -> dict:
+    """Purely derive Phase-1 v2 missingness from an exact historical core."""
+
+    legacy = validate_learning_snapshot_core(
+        value,
+        expected_schema_version=1,
+        adapter=adapter,
+        policy_set=policy_set,
+    )
+    migrated = deepcopy(legacy)
+    migrated["artifact_type"] = "learning-snapshot-core"
+    migrated["schema_version"] = 2
+    migrated["sampled_by_policy_n"] = 0
+    episode_ids, invalidation_ids = _validated_core_input_manifest(
+        migrated["input_manifest"]
+    )
+    migrated["sampling_summary"] = {
+        "full_retained_episode_n": len(episode_ids - invalidation_ids),
+        "sampled_minimal_episode_n": 0,
+        "sampling_policy_identities": [],
+    }
+    for cohort in migrated["cohorts"]:
+        for metric in cohort["metrics"]:
+            metric["missingness"]["sampled_by_policy_n"] = 0
+    for candidate in migrated["candidates"]:
+        missingness = candidate["evidence"]["missingness"]
+        if candidate["source"]["kind"] == "metric" and missingness is not None:
+            missingness["sampled_by_policy_n"] = 0
+            candidate.pop("candidate_id")
+            candidate["candidate_id"] = candidate_id(candidate)
+    migrated["candidates"].sort(key=lambda item: _utf8(item["candidate_id"]))
+    return validate_learning_snapshot_core(
+        migrated,
+        expected_schema_version=2,
+        adapter=adapter,
+        policy_set=policy_set,
+    )
+
+
+def validate_learning_snapshot_artifact(
+    value: object,
+    *,
+    expected_schema_version: int,
+    policy_set: PolicySet,
+) -> dict:
+    """Recognize an exact v1/v2 envelope without absence-based fallback."""
+
+    if expected_schema_version not in {1, 2}:
+        raise LearningSnapshotError("learning snapshot schema is unsupported")
+    keys = _ARTIFACT_V1_KEYS if expected_schema_version == 1 else _ARTIFACT_V2_KEYS
+    artifact = _exact_learning_mapping(value, keys, "learning snapshot artifact")
+    if artifact["artifact_type"] != "learning-snapshot":
+        raise LearningSnapshotError("learning snapshot artifact type is invalid")
+    if expected_schema_version == 2 and (
+        type(artifact["schema_version"]) is not int
+        or artifact["schema_version"] != 2
+    ):
+        raise LearningSnapshotError("learning snapshot envelope schema is invalid")
+    if artifact["authoritative"] is not False:
+        raise LearningSnapshotError("learning snapshot cannot be authoritative")
+    _utc_instant(artifact["generated_at"], "learning snapshot generated_at")
+    if artifact["store_identity"] is not None:
+        _sha256(artifact["store_identity"], "learning snapshot store identity")
+    adapter = _exact_learning_mapping(
+        artifact["adapter"],
+        {"name", "implementation_version", "implementation_sha256"},
+        "learning snapshot adapter",
+    )
+    if (
+        adapter["name"] not in {"portable", "llmwiki"}
+        or adapter["implementation_version"]
+            != "workflow-observer-snapshot-adapter@1"
+    ):
+        raise LearningSnapshotError("learning snapshot adapter is invalid")
+    _sha256(
+        adapter["implementation_sha256"],
+        "learning snapshot adapter implementation",
+    )
+    core = validate_learning_snapshot_core(
+        artifact["core"],
+        expected_schema_version=expected_schema_version,
+        adapter=adapter,
+        policy_set=policy_set,
+    )
+    analyzer = core["analysis_policy_set"]["analyzer_artifact"]
+    if (
+        analyzer["version"] != core["analyzer_version"]
+        or analyzer["sha256"]
+            != "sha256:" + adapter["implementation_sha256"]
+    ):
+        raise LearningSnapshotError(
+            "learning snapshot adapter does not bind analyzer identity"
+        )
+    _sha256(artifact["snapshot_id"], "learning snapshot identity")
+    _sha256(artifact["artifact_sha256"], "learning snapshot artifact digest")
+    try:
+        expected_snapshot_id = hash_canonical(
+            _SNAPSHOT_CORE_DOMAINS[expected_schema_version], core
+        )
+        without_digest = deepcopy(dict(artifact))
+        del without_digest["artifact_sha256"]
+        expected_artifact_sha256 = hashlib.sha256(
+            canonicalize(without_digest)
+        ).hexdigest()
+    except CanonicalizationError as error:
+        raise _error(
+            f"learning snapshot artifact is not canonicalizable: {error}", error
+        ) from error
+    if artifact["snapshot_id"] != expected_snapshot_id:
+        raise LearningSnapshotError("learning snapshot identity is inconsistent")
+    if artifact["artifact_sha256"] != expected_artifact_sha256:
+        raise LearningSnapshotError("learning snapshot artifact digest is inconsistent")
+    return deepcopy(dict(artifact))
+
+
 def _build_cohort(
     key: tuple,
     episodes: list[Mapping],
@@ -987,6 +1590,8 @@ def _build_cohort(
     documents: Mapping,
     as_of: datetime,
     ledger: set[tuple[str, str, str]],
+    *,
+    schema_version: int,
 ) -> dict:
     collection = key[0]
     if collection == "workflow-generation":
@@ -1068,7 +1673,13 @@ def _build_cohort(
             len(episodes) if generation is None else 0
         ),
         "metrics": [
-            _metric_result(name, outcomes, documents) for name in metric_names
+            _metric_result(
+                name,
+                outcomes,
+                documents,
+                schema_version=schema_version,
+            )
+            for name in metric_names
         ],
     }
 
@@ -1080,6 +1691,7 @@ def build_snapshot_core(
 
     documents, identities = _validate_policy_set(policy_set)
     bundle = _validate_input_bundle(snapshot_input, documents, identities)
+    schema_version = snapshot_input.schema_version
     episodes = _validate_episodes(bundle, documents)
     invalidation_rows, invalidated_ids = _validate_invalidations(
         bundle, {episode["run_id"] for episode in episodes}
@@ -1101,6 +1713,7 @@ def build_snapshot_core(
             documents,
             as_of,
             ledger,
+            schema_version=schema_version,
         )
         outcomes = _outcome_episodes(grouped_episodes, invalidated_ids)
         patterns = _decision_patterns(outcomes, cohort, documents)
@@ -1139,8 +1752,8 @@ def build_snapshot_core(
         )
     ]
     lifecycle_identity = identities["lifecycle_health_policy"]
-    return {
-        "schema_version": 1,
+    core = {
+        "schema_version": schema_version,
         "analyzer_version": _ANALYZER_VERSION,
         "query": deepcopy(bundle["query"]),
         "lifecycle_health_policy": {
@@ -1168,3 +1781,19 @@ def build_snapshot_core(
         "decision_patterns": decision_patterns,
         "candidates": candidates,
     }
+    if schema_version == 2:
+        core.update({
+            "artifact_type": "learning-snapshot-core",
+            "sampled_by_policy_n": 0,
+            "sampling_summary": {
+                "full_retained_episode_n": len(episodes) - len(invalidated_ids),
+                "sampled_minimal_episode_n": 0,
+                "sampling_policy_identities": [],
+            },
+        })
+    return validate_learning_snapshot_core(
+        core,
+        expected_schema_version=schema_version,
+        adapter=snapshot_input.adapter,
+        policy_set=policy_set,
+    )

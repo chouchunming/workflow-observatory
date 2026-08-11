@@ -23,6 +23,7 @@ from canonical_json import (
     hash_canonical,
     strict_json_loads,
 )
+from artifact_schema import load_artifact_policy_set
 from episode_schema import (
     build_episode_v2,
     parse_v2_supplement,
@@ -105,6 +106,9 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             analyzer_files=SNAPSHOT_ANALYZER_FILES,
             canonicalizer_files=("scripts/canonical_json.py",),
         )
+        self.artifact_policies = load_artifact_policy_set(
+            PLUGIN_ROOT / "policies"
+        )
         interval = {
             "basis": "started_at",
             "since_inclusive": "2026-08-01T16:00:00Z",
@@ -126,11 +130,31 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         self._sequence = 10
 
     def acquire(self):
-        return acquire_snapshot_input(
+        acquired = acquire_snapshot_input(
             ObservationPaths.from_root(self.store.store_root),
             PORTABLE_SEMANTICS,
             self.query,
             self.policies,
+            self.artifact_policies,
+        )
+        return self._legacy_snapshot_input(acquired)
+
+    def _legacy_snapshot_input(self, acquired):
+        bundle = acquired.semantic_bundle
+        bundle["schema_version"] = 1
+        bundle.pop("artifact_policy_set")
+        bundle.pop("migration_manifest")
+        bundle.pop("input_manifest_sha256")
+        bundle["input_manifest_sha256"] = hash_canonical(
+            INPUT_MANIFEST_DOMAIN, bundle
+        )
+        return SnapshotInput(
+            acquired.adapter,
+            acquired.store_identity,
+            bundle,
+            reviewed_generation_mapping=(
+                self.policies.documents["workflow_generation_mapping"]
+            ),
         )
 
     def publish(self):
@@ -534,12 +558,14 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
                 PORTABLE_SEMANTICS,
                 self.query,
                 self.policies,
+                self.artifact_policies,
             )
             llmwiki_input = acquire_snapshot_input(
                 ObservationPaths.from_root(llmwiki.store_root),
                 LLMWIKI_SEMANTICS,
                 self.query,
                 self.policies,
+                self.artifact_policies,
             )
 
         self.assertEqual(
@@ -746,6 +772,7 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             PORTABLE_SEMANTICS,
             self.query,
             policies,
+            self.artifact_policies,
         )
 
         physical_records = list(self.store.observations.glob("*.md"))
@@ -894,11 +921,14 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
 
         def publish_at(query, generated_at):
             def acquire():
-                return acquire_snapshot_input(
-                    ObservationPaths.from_root(self.store.store_root),
-                    PORTABLE_SEMANTICS,
-                    query,
-                    self.policies,
+                return self._legacy_snapshot_input(
+                    acquire_snapshot_input(
+                        ObservationPaths.from_root(self.store.store_root),
+                        PORTABLE_SEMANTICS,
+                        query,
+                        self.policies,
+                        self.artifact_policies,
+                    )
                 )
 
             return create_learning_snapshot(

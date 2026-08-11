@@ -14,6 +14,7 @@ import stat
 from types import MappingProxyType
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from artifact_schema import ArtifactPolicySet, resolve_artifact_migration
 from canonical_json import CanonicalizationError, canonicalize, hash_canonical
 from episode_schema import (
     EpisodeSchemaError,
@@ -51,6 +52,8 @@ _MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
 _STORE_IDENTITY_DOMAIN = b"workflow-observatory:store-identity:v1\0"
 _ADAPTER_IMPLEMENTATION_VERSION = "workflow-observer-snapshot-adapter@1"
 SNAPSHOT_ANALYZER_FILES = (
+    "scripts/artifact_migration.py",
+    "scripts/artifact_schema.py",
     "scripts/episode_schema.py",
     "scripts/learning_snapshot.py",
     "scripts/policy_artifacts.py",
@@ -58,6 +61,32 @@ SNAPSHOT_ANALYZER_FILES = (
     "scripts/store_config.py",
     "scripts/wiki_observations.py",
 )
+_ARTIFACT_POLICY_IDENTITIES = {
+    "artifact_schema_registry": {
+        "version": "artifact-schema-registry@1",
+        "sha256": (
+            "sha256:1bba0c5635ed2cedf4885861243947c89d3f9ba98e358b049ff3a61c0a40e7d6"
+        ),
+    },
+    "artifact_migration_registry": {
+        "version": "artifact-migration-registry@1",
+        "sha256": (
+            "sha256:0c6bbdb88de176725c065f885a4393b73db19ee769f04f486ade013121e0fe90"
+        ),
+    },
+}
+_OBSERVATION_MIGRATIONS = {
+    1: "workflow-observation-v1-to-episode-projection@1",
+    2: "workflow-observation-v2-to-episode-projection@1",
+}
+_MIGRATION_MANIFEST_KEYS = {
+    "artifact_type",
+    "migration_identity",
+    "run_id",
+    "source_schema_version",
+    "source_sha256",
+    "target_contract",
+}
 _DOCUMENT_IDENTITIES = {
     "episode_projection": "canonical_projection_contract",
     "producer_capabilities": "producer_capability_registry",
@@ -251,20 +280,30 @@ class SnapshotInput:
     store_identity: str | None
     semantic_bundle: dict
     reviewed_generation_mapping: InitVar[Mapping[str, object] | None] = None
+    artifact_type: str | None = None
+    schema_version: int | None = None
 
     def __post_init__(
         self,
         reviewed_generation_mapping: Mapping[str, object] | None,
     ) -> None:
-        adapter, semantic_bundle, manifest_bytes = (
-            _validated_snapshot_input_constructor(
+        (
+            adapter,
+            semantic_bundle,
+            manifest_bytes,
+            artifact_type,
+            schema_version,
+        ) = _validated_snapshot_input_constructor(
                 object.__getattribute__(self, "adapter"),
                 object.__getattribute__(self, "store_identity"),
                 object.__getattribute__(self, "semantic_bundle"),
                 reviewed_generation_mapping,
+                object.__getattribute__(self, "artifact_type"),
+                object.__getattribute__(self, "schema_version"),
             )
-        )
         object.__setattr__(self, "adapter", _deep_freeze(adapter))
+        object.__setattr__(self, "artifact_type", artifact_type)
+        object.__setattr__(self, "schema_version", schema_version)
         object.__setattr__(
             self,
             "semantic_bundle",
@@ -280,11 +319,18 @@ class SnapshotInput:
 
     @property
     def canonical_representation(self) -> dict:
-        return {
+        representation = {
             "adapter": deepcopy(self.adapter),
             "store_identity": self.store_identity,
             "semantic_bundle": deepcopy(self.semantic_bundle),
         }
+        if self.schema_version == 2:
+            representation = {
+                "artifact_type": self.artifact_type,
+                "schema_version": self.schema_version,
+                **representation,
+            }
+        return representation
 
     @property
     def manifest_bytes(self) -> bytes:
@@ -832,12 +878,101 @@ def _validated_reference_manifest(value: object) -> list[dict[str, str]]:
     return normalized
 
 
+def _validate_snapshot_v2_artifact_fields(
+    bundle: dict,
+    episodes_by_id: Mapping[str, Mapping],
+) -> None:
+    artifact_policy_set = _exact_mapping(
+        bundle["artifact_policy_set"],
+        set(_ARTIFACT_POLICY_IDENTITIES),
+        "snapshot artifact policy identity set",
+    )
+    if artifact_policy_set != _ARTIFACT_POLICY_IDENTITIES:
+        raise _snapshot_error("snapshot artifact policy identity set is invalid")
+    bundle["artifact_policy_set"] = artifact_policy_set
+
+    raw_manifest = bundle["migration_manifest"]
+    if not isinstance(raw_manifest, list):
+        raise _snapshot_error("snapshot migration manifest must be a list")
+    legacy_episode_ids = {
+        run_id for run_id, episode in episodes_by_id.items()
+        if episode["episode_schema_version"] == 1
+    }
+    manifest = []
+    migration_keys = set()
+    for raw_row in raw_manifest:
+        row = _exact_mapping(
+            raw_row,
+            _MIGRATION_MANIFEST_KEYS,
+            "snapshot migration manifest row",
+        )
+        run_id = row["run_id"]
+        source_schema_version = row["source_schema_version"]
+        expected_episode = episodes_by_id.get(run_id)
+        if (
+            row["artifact_type"] != "workflow-observation"
+            or not isinstance(run_id, str)
+            or _RUN_ID_RE.fullmatch(run_id) is None
+            or type(source_schema_version) is not int
+            or source_schema_version != 1
+            or row["migration_identity"]
+                != _OBSERVATION_MIGRATIONS[source_schema_version]
+            or row["target_contract"] != "episode-projection@2"
+            or expected_episode is None
+            or expected_episode["episode_schema_version"]
+                != source_schema_version
+            or expected_episode["source_sha256"] != row["source_sha256"]
+        ):
+            raise _snapshot_error("snapshot migration manifest row is invalid")
+        _valid_sha256(
+            row["source_sha256"], "snapshot migration manifest source"
+        )
+        key = (
+            row["artifact_type"],
+            run_id,
+            row["source_sha256"],
+            row["migration_identity"],
+        )
+        if key in migration_keys:
+            raise _snapshot_error("snapshot migration manifest is not unique")
+        migration_keys.add(key)
+        manifest.append(row)
+    if manifest != sorted(manifest, key=canonicalize):
+        raise _snapshot_error("snapshot migration manifest is not JCS-byte sorted")
+    if {row["run_id"] for row in manifest} != legacy_episode_ids:
+        raise _snapshot_error(
+            "snapshot migration manifest does not cover selected legacy sources"
+        )
+    bundle["migration_manifest"] = manifest
+
+
 def _validated_snapshot_input_constructor(
     adapter: object,
     store_identity: object,
     semantic_bundle: object,
     reviewed_generation_mapping: object,
-) -> tuple[dict, dict, bytes]:
+    artifact_type: object,
+    schema_version: object,
+) -> tuple[dict, dict, bytes, str | None, int]:
+    if not isinstance(semantic_bundle, Mapping):
+        raise _snapshot_error("snapshot semantic bundle must be an object")
+    embedded_schema_version = semantic_bundle.get("schema_version")
+    if (
+        type(embedded_schema_version) is not int
+        or embedded_schema_version not in {1, 2}
+    ):
+        raise _snapshot_error("snapshot semantic bundle schema version is invalid")
+    if embedded_schema_version == 1:
+        if artifact_type is not None or schema_version is not None:
+            raise _snapshot_error("legacy snapshot input has no envelope schema")
+        resolved_artifact_type = None
+    else:
+        if artifact_type != "snapshot-input":
+            raise _snapshot_error("snapshot artifact type is invalid")
+        if type(schema_version) is not int or schema_version != 2:
+            raise _snapshot_error("snapshot schema version is invalid")
+        resolved_artifact_type = "snapshot-input"
+    resolved_schema_version = embedded_schema_version
     adapter_copy = _exact_mapping(
         adapter,
         {"name", "implementation_version", "implementation_sha256"},
@@ -860,26 +995,29 @@ def _validated_snapshot_input_constructor(
     ):
         raise _snapshot_error("snapshot store identity is invalid")
 
+    bundle_keys = {
+        "schema_version",
+        "projection_version",
+        "query",
+        "lifecycle_as_of",
+        "policy_set",
+        "schema_capabilities",
+        "record_counts",
+        "episodes",
+        "invalidations",
+        "reference_manifest",
+        "input_manifest_sha256",
+    }
+    if resolved_schema_version == 2:
+        bundle_keys |= {"artifact_policy_set", "migration_manifest"}
     bundle_copy = _exact_mapping(
         semantic_bundle,
-        {
-            "schema_version",
-            "projection_version",
-            "query",
-            "lifecycle_as_of",
-            "policy_set",
-            "schema_capabilities",
-            "record_counts",
-            "episodes",
-            "invalidations",
-            "reference_manifest",
-            "input_manifest_sha256",
-        },
+        bundle_keys,
         "snapshot semantic bundle",
     )
     if (
         type(bundle_copy["schema_version"]) is not int
-        or bundle_copy["schema_version"] != 1
+        or bundle_copy["schema_version"] != resolved_schema_version
         or bundle_copy["projection_version"] != "episode-projection@2"
     ):
         raise _snapshot_error("snapshot semantic bundle version is invalid")
@@ -1069,6 +1207,11 @@ def _validated_snapshot_input_constructor(
         raise _snapshot_error("snapshot record_counts are inconsistent")
     bundle_copy["record_counts"] = counts
 
+    if resolved_schema_version == 2:
+        _validate_snapshot_v2_artifact_fields(
+            bundle_copy, episodes_by_id
+        )
+
     actual_digest = bundle_copy["input_manifest_sha256"]
     if (
         not isinstance(actual_digest, str)
@@ -1092,6 +1235,12 @@ def _validated_snapshot_input_constructor(
         "store_identity": store_identity,
         "semantic_bundle": bundle_copy,
     }
+    if resolved_schema_version == 2:
+        representation = {
+            "artifact_type": resolved_artifact_type,
+            "schema_version": resolved_schema_version,
+            **representation,
+        }
     try:
         manifest_bytes = canonicalize(representation)
     except CanonicalizationError as error:
@@ -1099,7 +1248,13 @@ def _validated_snapshot_input_constructor(
             "snapshot manifest is not canonical I-JSON",
             cause=error,
         ) from error
-    return adapter_copy, bundle_copy, manifest_bytes
+    return (
+        adapter_copy,
+        bundle_copy,
+        manifest_bytes,
+        resolved_artifact_type,
+        resolved_schema_version,
+    )
 
 
 def _reference_identity(value: object) -> str:
@@ -1372,10 +1527,13 @@ def _acquire_snapshot_input(
     semantics: AdapterSemantics,
     query: SnapshotQuery,
     policy_set: PolicySet,
+    artifact_policy_set: ArtifactPolicySet,
 ) -> SnapshotInput:
     if not isinstance(semantics, AdapterSemantics):
         raise _snapshot_error("adapter semantics have the wrong type")
     validate_snapshot_query(query)
+    if not isinstance(artifact_policy_set, ArtifactPolicySet):
+        raise _snapshot_error("artifact_policy_set must be an ArtifactPolicySet")
     documents, identities = _validate_policy_set(policy_set, semantics)
     generation_mapping = _generation_mapping(documents)
     collection = collect_record_documents(paths, semantics, strict_layout=True)
@@ -1422,6 +1580,30 @@ def _acquire_snapshot_input(
         {**deepcopy(projection), "source_sha256": document.source_sha256}
         for document, projection in selected
     ]
+    migration_manifest = []
+    for document, projection in selected:
+        if document.artifact.schema_version != 1:
+            continue
+        migration = resolve_artifact_migration(
+            document.artifact,
+            policies=artifact_policy_set,
+        )
+        if (
+            migration.target_contract != "episode-projection@2"
+            or migration.target_schema_version != 2
+        ):
+            raise _snapshot_error(
+                "selected observation migration does not target Episode projection"
+            )
+        migration_manifest.append({
+            "artifact_type": document.artifact.artifact_type,
+            "migration_identity": migration.migration_identity,
+            "run_id": projection["run_id"],
+            "source_schema_version": document.artifact.schema_version,
+            "source_sha256": document.source_sha256,
+            "target_contract": migration.target_contract,
+        })
+    migration_manifest.sort(key=canonicalize)
     references = canonical_reference_manifest(
         evidence
         for document, _projection in selected
@@ -1465,7 +1647,7 @@ def _acquire_snapshot_input(
     if not isinstance(capabilities, Mapping):
         raise _snapshot_error("projection schema capabilities are invalid")
     bundle = {
-        "schema_version": 1,
+        "schema_version": 2,
         "projection_version": semantics.projection_version,
         "query": _query_document(query),
         "lifecycle_as_of": query.lifecycle_as_of,
@@ -1475,6 +1657,11 @@ def _acquire_snapshot_input(
         "episodes": episodes,
         "invalidations": invalidations,
         "reference_manifest": references,
+        "artifact_policy_set": {
+            name: deepcopy(artifact_policy_set.identities()[name])
+            for name in _ARTIFACT_POLICY_IDENTITIES
+        },
+        "migration_manifest": migration_manifest,
     }
     bundle["input_manifest_sha256"] = hash_canonical(_MANIFEST_DOMAIN, bundle)
 
@@ -1489,6 +1676,8 @@ def _acquire_snapshot_input(
         store_identity,
         bundle,
         reviewed_generation_mapping=documents["workflow_generation_mapping"],
+        artifact_type="snapshot-input",
+        schema_version=2,
     )
     result.manifest_bytes
     return result
@@ -1499,11 +1688,18 @@ def acquire_snapshot_input(
     semantics: AdapterSemantics,
     query: SnapshotQuery,
     policy_set: PolicySet,
+    artifact_policy_set: ArtifactPolicySet,
 ) -> SnapshotInput:
     """Validate, project, and hash one canonical selection under one adapter."""
 
     try:
-        return _acquire_snapshot_input(paths, semantics, query, policy_set)
+        return _acquire_snapshot_input(
+            paths,
+            semantics,
+            query,
+            policy_set,
+            artifact_policy_set,
+        )
     except SnapshotInputError:
         raise
     except ObservationError as error:

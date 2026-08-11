@@ -16,6 +16,7 @@ for module_root in (PLUGIN_ROOT / "scripts", PLUGIN_ROOT / "tests"):
         sys.path.insert(0, str(module_root))
 
 from canonical_json import canonicalize, hash_canonical
+from artifact_schema import load_artifact_policy_set
 from episode_schema import (
     build_episode_v2,
     parse_v2_supplement,
@@ -29,7 +30,11 @@ from learning_snapshot import (
     linear_rational_quantile,
 )
 from policy_artifacts import PolicySet, load_policy_set
-from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotInput
+from snapshot_input import (
+    SNAPSHOT_ANALYZER_FILES,
+    SnapshotInput,
+    SnapshotInputError,
+)
 from workflow_evolution_fixtures import (
     DECISION,
     V1_BODY,
@@ -37,6 +42,7 @@ from workflow_evolution_fixtures import (
     V2_METADATA,
     V2_SUPPLEMENT,
 )
+import learning_snapshot
 
 
 _INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
@@ -50,12 +56,27 @@ class LearningSnapshotTests(unittest.TestCase):
             analyzer_files=SNAPSHOT_ANALYZER_FILES,
             canonicalizer_files=("scripts/canonical_json.py",),
         )
+        self.artifact_policies = load_artifact_policy_set(
+            PLUGIN_ROOT / "policies"
+        )
         self.projection = self.policies.documents
         self._sequence = 0
 
     def _run_id(self) -> str:
         self._sequence += 1
         return f"obs-20260802-{self._sequence:06d}-{self._sequence:06x}"
+
+    def _adapter(self, policies=None):
+        selected = self.policies if policies is None else policies
+        return {
+            "name": "portable",
+            "implementation_version": (
+                "workflow-observer-snapshot-adapter@1"
+            ),
+            "implementation_sha256": selected.core_identity()[
+                "analyzer_artifact"
+            ]["sha256"][7:],
+        }
 
     def _completion_body(self, completion_metrics: dict[str, object]) -> str:
         body = V1_BODY
@@ -177,6 +198,7 @@ class LearningSnapshotTests(unittest.TestCase):
         invalidated: frozenset[str] = frozenset(),
         as_of: str = "2026-08-02T16:00:00Z",
         policies: PolicySet | None = None,
+        input_schema_version: int = 2,
     ) -> SnapshotInput:
         selected_policies = self.policies if policies is None else policies
         invalidations = [
@@ -190,7 +212,7 @@ class LearningSnapshotTests(unittest.TestCase):
             for run_id in sorted(invalidated, key=lambda item: item.encode("utf-8"))
         ]
         bundle = {
-            "schema_version": 1,
+            "schema_version": input_schema_version,
             "projection_version": "episode-projection@2",
             "query": {
                 "interval": {
@@ -236,8 +258,43 @@ class LearningSnapshotTests(unittest.TestCase):
                 }
             ],
         }
+        if input_schema_version == 2:
+            bundle["artifact_policy_set"] = {
+                name: identity
+                for name, identity in self.artifact_policies.identities().items()
+                if name in {
+                    "artifact_schema_registry",
+                    "artifact_migration_registry",
+                }
+            }
+            bundle["migration_manifest"] = sorted(
+                [
+                    {
+                        "artifact_type": "workflow-observation",
+                        "migration_identity": (
+                            "workflow-observation-v1-to-episode-projection@1"
+                            if episode["episode_schema_version"] == 1
+                            else "workflow-observation-v2-to-episode-projection@1"
+                        ),
+                        "run_id": episode["run_id"],
+                        "source_schema_version": episode[
+                            "episode_schema_version"
+                        ],
+                        "source_sha256": episode["source_sha256"],
+                        "target_contract": "episode-projection@2",
+                    }
+                    for episode in episodes
+                    if episode["episode_schema_version"] == 1
+                ],
+                key=canonicalize,
+            )
         bundle["input_manifest_sha256"] = hash_canonical(
             _INPUT_MANIFEST_DOMAIN, bundle
+        )
+        envelope = (
+            {"artifact_type": "snapshot-input", "schema_version": 2}
+            if input_schema_version == 2
+            else {}
         )
         return SnapshotInput(
             adapter={
@@ -253,6 +310,7 @@ class LearningSnapshotTests(unittest.TestCase):
             reviewed_generation_mapping=(
                 selected_policies.documents["workflow_generation_mapping"]
             ),
+            **envelope,
         )
 
     def bundle(
@@ -451,6 +509,35 @@ class LearningSnapshotTests(unittest.TestCase):
             self._snapshot_input([episode]), self.policies
         )
 
+    def _v2_artifact(self, core):
+        snapshot_id = hash_canonical(
+            b"workflow-observatory:learning-snapshot-core:v2\0", core
+        )
+        without_digest = {
+            "artifact_type": "learning-snapshot",
+            "schema_version": 2,
+            "authoritative": False,
+            "generated_at": "2026-08-03T00:01:00Z",
+            "store_identity": "f" * 64,
+            "adapter": {
+                "name": "portable",
+                "implementation_version": (
+                    "workflow-observer-snapshot-adapter@1"
+                ),
+                "implementation_sha256": self.policies.core_identity()[
+                    "analyzer_artifact"
+                ]["sha256"][7:],
+            },
+            "snapshot_id": snapshot_id,
+            "core": deepcopy(core),
+        }
+        return {
+            **without_digest,
+            "artifact_sha256": hashlib.sha256(
+                canonicalize(without_digest)
+            ).hexdigest(),
+        }
+
     def core_with_equal_missingness(self, metrics):
         execution = {"cache_read_tokens": 1}
         execution.update({
@@ -514,6 +601,7 @@ class LearningSnapshotTests(unittest.TestCase):
             "not_recorded_n": 2,
             "unsupported_by_schema_n": 4,
             "not_applicable_n": 0,
+            "sampled_by_policy_n": 0,
         }, metric["missingness"])
         self.assertEqual([0, 1], metric["observed_values"])
 
@@ -573,6 +661,7 @@ class LearningSnapshotTests(unittest.TestCase):
         acquired = self.bundle(outcomes=["success"])
         core = build_snapshot_core(acquired, self.policies)
         self.assertEqual({
+            "artifact_type",
             "schema_version",
             "analyzer_version",
             "query",
@@ -583,8 +672,20 @@ class LearningSnapshotTests(unittest.TestCase):
             "cohorts",
             "decision_patterns",
             "candidates",
+            "sampled_by_policy_n",
+            "sampling_summary",
         }, set(core))
-        self.assertEqual(1, core["schema_version"])
+        self.assertEqual("learning-snapshot-core", core["artifact_type"])
+        self.assertEqual(2, core["schema_version"])
+        self.assertEqual(0, core["sampled_by_policy_n"])
+        self.assertEqual(
+            {
+                "full_retained_episode_n": 1,
+                "sampled_minimal_episode_n": 0,
+                "sampling_policy_identities": [],
+            },
+            core["sampling_summary"],
+        )
         self.assertEqual(
             "workflow-learning-analyzer@0.2.0", core["analyzer_version"]
         )
@@ -598,6 +699,107 @@ class LearningSnapshotTests(unittest.TestCase):
         }, set(core["input_manifest"]))
         self.assertNotIn("adapter", canonicalize(core).decode("utf-8"))
         self.assertNotIn("store_identity", canonicalize(core).decode("utf-8"))
+
+    def test_exact_snapshot_input_schema_dispatches_core_schema(self):
+        episode = self._projection(status="success")
+        legacy_input = self._snapshot_input(
+            [episode], input_schema_version=1
+        )
+        phase_one_input = self._snapshot_input(
+            [episode], input_schema_version=2
+        )
+
+        legacy = build_snapshot_core(legacy_input, self.policies)
+        phase_one = build_snapshot_core(phase_one_input, self.policies)
+
+        self.assertEqual(1, legacy["schema_version"])
+        self.assertNotIn("artifact_type", legacy)
+        self.assertNotIn("sampled_by_policy_n", legacy)
+        self.assertNotIn("sampling_summary", legacy)
+        self.assertTrue(all(
+            "sampled_by_policy_n" not in metric["missingness"]
+            for cohort in legacy["cohorts"]
+            for metric in cohort["metrics"]
+        ))
+        self.assertEqual(2, phase_one["schema_version"])
+        self.assertEqual("learning-snapshot-core", phase_one["artifact_type"])
+        self.assertTrue(all(
+            metric["missingness"]["sampled_by_policy_n"] == 0
+            for cohort in phase_one["cohorts"]
+            for metric in cohort["metrics"]
+        ))
+
+    def test_snapshot_input_schema_dispatch_never_infers_missing_version(self):
+        acquired = self._snapshot_input(
+            [self._projection(status="success")], input_schema_version=2
+        )
+        bundle = acquired.semantic_bundle
+        del bundle["schema_version"]
+        bundle.pop("input_manifest_sha256")
+        bundle["input_manifest_sha256"] = hash_canonical(
+            _INPUT_MANIFEST_DOMAIN, bundle
+        )
+
+        with self.assertRaisesRegex(SnapshotInputError, "schema|fields"):
+            SnapshotInput(
+                acquired.adapter,
+                acquired.store_identity,
+                bundle,
+                artifact_type="snapshot-input",
+                schema_version=2,
+            )
+
+    def test_v1_migration_closes_candidate_metric_partitions_and_ids(self):
+        episode = self._projection(
+            status="success",
+            supplement_quality={"test_failures": 1},
+        )
+        legacy = build_snapshot_core(
+            self._snapshot_input([episode], input_schema_version=1),
+            self.policies,
+        )
+        self.assertTrue(any(
+            candidate["source"]["kind"] == "metric"
+            and candidate["evidence"]["missingness"] is not None
+            for candidate in legacy["candidates"]
+        ))
+
+        migrated = learning_snapshot.migrate_learning_snapshot_v1_core(
+            legacy,
+            adapter=self._adapter(),
+            policy_set=self.policies,
+        )
+
+        for candidate in migrated["candidates"]:
+            missingness = candidate["evidence"]["missingness"]
+            if candidate["source"]["kind"] != "metric" or missingness is None:
+                continue
+            self.assertEqual(0, missingness["sampled_by_policy_n"])
+            evidence = {
+                name: deepcopy(value)
+                for name, value in candidate.items()
+                if name != "candidate_id"
+            }
+            self.assertEqual(candidate_id(evidence), candidate["candidate_id"])
+
+        tampered = deepcopy(migrated)
+        metric_candidate = next(
+            candidate for candidate in tampered["candidates"]
+            if candidate["source"]["kind"] == "metric"
+            and candidate["evidence"]["missingness"] is not None
+        )
+        metric_candidate["evidence"]["missingness"].pop(
+            "sampled_by_policy_n"
+        )
+        with self.assertRaisesRegex(
+            LearningSnapshotError, "candidate|partition|fields"
+        ):
+            learning_snapshot.validate_learning_snapshot_core(
+                tampered,
+                expected_schema_version=2,
+                adapter=self._adapter(),
+                policy_set=self.policies,
+            )
 
     def test_input_manifest_preserves_validated_reference_identity_bound(self):
         acquired = self.bundle(outcomes=["success"])
@@ -614,6 +816,8 @@ class LearningSnapshotTests(unittest.TestCase):
             acquired.adapter,
             acquired.store_identity,
             bundle,
+            artifact_type="snapshot-input",
+            schema_version=2,
         )
 
         core = build_snapshot_core(rebuilt, self.policies)
@@ -622,6 +826,166 @@ class LearningSnapshotTests(unittest.TestCase):
             "raw/" + "r" * 197,
             core["input_manifest"]["reference_manifest"][0]["identity"],
         )
+
+    def test_phase_one_full_retained_count_uses_outcome_lifecycle_union(self):
+        invalidated_outcome = self._projection(status="failed")
+        retained_outcome = self._projection(status="success")
+        draft = self._projection(status="draft")
+        core = build_snapshot_core(
+            self._snapshot_input(
+                [invalidated_outcome, retained_outcome, draft],
+                invalidated=frozenset({invalidated_outcome["run_id"]}),
+            ),
+            self.policies,
+        )
+
+        self.assertEqual(
+            2,
+            core["sampling_summary"]["full_retained_episode_n"],
+        )
+        self.assertEqual(0, core["sampling_summary"][
+            "sampled_minimal_episode_n"
+        ])
+        self.assertEqual(0, core["sampled_by_policy_n"])
+        self.assertEqual(
+            1,
+            sum(cohort["outcome_episode_n"] for cohort in core["cohorts"]),
+        )
+        self.assertEqual(
+            1,
+            sum(cohort["draft_episode_n"] for cohort in core["cohorts"]),
+        )
+
+    def test_metric_availability_partitions_include_explicit_zero_sampling(self):
+        core = build_snapshot_core(
+            self.bundle(outcomes=["success", "failed"]),
+            self.policies,
+        )
+        for cohort in core["cohorts"]:
+            for metric in cohort["metrics"]:
+                with self.subTest(metric=metric["metric"]):
+                    missingness = metric["missingness"]
+                    self.assertEqual(0, missingness["sampled_by_policy_n"])
+                    self.assertEqual(
+                        missingness["eligible_episode_n"],
+                        sum(
+                            missingness[name]
+                            for name in (
+                                "observed_n",
+                                "not_recorded_n",
+                                "unsupported_by_schema_n",
+                                "not_applicable_n",
+                                "sampled_by_policy_n",
+                            )
+                        ),
+                    )
+        learning_snapshot.validate_learning_snapshot_core(
+            core,
+            expected_schema_version=2,
+            adapter=self._adapter(),
+            policy_set=self.policies,
+        )
+
+        tampered = deepcopy(core)
+        tampered["cohorts"][0]["metrics"][0]["missingness"][
+            "sampled_by_policy_n"
+        ] = 1
+        with self.assertRaisesRegex(
+            LearningSnapshotError, "sampling|partition"
+        ):
+            learning_snapshot.validate_learning_snapshot_core(
+                tampered,
+                expected_schema_version=2,
+                adapter=self._adapter(),
+                policy_set=self.policies,
+            )
+
+    def test_learning_snapshot_v2_envelope_is_exact_and_agrees_with_core(self):
+        core = build_snapshot_core(
+            self.bundle(outcomes=["success"]), self.policies
+        )
+        artifact = self._v2_artifact(core)
+
+        validated = learning_snapshot.validate_learning_snapshot_artifact(
+            artifact,
+            expected_schema_version=2,
+            policy_set=self.policies,
+        )
+        self.assertEqual(artifact, validated)
+        self.assertEqual(
+            {
+                "artifact_type",
+                "schema_version",
+                "authoritative",
+                "generated_at",
+                "store_identity",
+                "adapter",
+                "snapshot_id",
+                "core",
+                "artifact_sha256",
+            },
+            set(validated),
+        )
+
+        mismatched = deepcopy(artifact)
+        mismatched["core"]["schema_version"] = 1
+        with self.assertRaisesRegex(LearningSnapshotError, "schema"):
+            learning_snapshot.validate_learning_snapshot_artifact(
+                mismatched,
+                expected_schema_version=2,
+                policy_set=self.policies,
+            )
+
+    def test_v2_artifact_rejects_rehashed_nested_adversarial_graphs(self):
+        recurring = self.core_with_recurring_decision_pattern(
+            outcome_episode_n=5,
+            supporting_episode_n=3,
+        )
+        multiple_candidates = self.core_with_multiple_candidates()
+
+        bad_ledger = deepcopy(recurring)
+        bad_ledger["exclusion_ledger"].append({
+            "run_id": "not-a-run-id",
+            "reason": "draft",
+            "excluded_from": "outcome-analysis",
+        })
+        bad_metric = deepcopy(recurring)
+        bad_metric["cohorts"][0]["metrics"][0]["metric"] = "unknown-metric"
+        orphan_pattern = deepcopy(recurring)
+        orphan_pattern["decision_patterns"][0]["cohort"]["project"] = "orphan"
+        wrong_pattern_count = deepcopy(recurring)
+        wrong_pattern_count["decision_patterns"][0]["event_count"] += 1
+        orphan_candidate = deepcopy(recurring)
+        orphan_candidate["candidates"][0]["cohort"]["project"] = "orphan"
+        recompute = deepcopy(orphan_candidate["candidates"][0])
+        recompute.pop("candidate_id")
+        orphan_candidate["candidates"][0]["candidate_id"] = candidate_id(
+            recompute
+        )
+        bad_candidate_identity = deepcopy(recurring)
+        bad_candidate_identity["candidates"][0]["candidate_id"] = "0" * 64
+        bad_candidate_order = deepcopy(multiple_candidates)
+        bad_candidate_order["candidates"].reverse()
+
+        cases = {
+            "bad-exclusion-row": bad_ledger,
+            "malformed-cohort-metric": bad_metric,
+            "orphan-decision-pattern": orphan_pattern,
+            "wrong-decision-count": wrong_pattern_count,
+            "orphan-candidate": orphan_candidate,
+            "bad-candidate-identity": bad_candidate_identity,
+            "bad-candidate-order": bad_candidate_order,
+        }
+        for name, tampered_core in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                LearningSnapshotError,
+                "core|ledger|metric|cohort|pattern|candidate|identity|order|binding",
+            ):
+                learning_snapshot.validate_learning_snapshot_artifact(
+                    self._v2_artifact(tampered_core),
+                    expected_schema_version=2,
+                    policy_set=self.policies,
+                )
 
     def test_generation_unavailable_episodes_are_separate_legacy_collections(self):
         episodes = [
