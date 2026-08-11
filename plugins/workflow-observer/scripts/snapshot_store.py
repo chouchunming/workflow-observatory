@@ -26,6 +26,7 @@ from learning_snapshot import (
     LearningSnapshotError,
     build_snapshot_core,
     candidate_id,
+    validate_learning_snapshot_artifact,
 )
 from policy_artifacts import (
     PolicyError,
@@ -41,7 +42,11 @@ from snapshot_input import (
 from wiki_observations import ObservationError, _validate_scalar
 
 
-_SNAPSHOT_CORE_DOMAIN = b"workflow-observatory:learning-snapshot-core:v1\0"
+_SNAPSHOT_CORE_DOMAINS = {
+    1: b"workflow-observatory:learning-snapshot-core:v1\0",
+    2: b"workflow-observatory:learning-snapshot-core:v2\0",
+}
+_SNAPSHOT_CORE_DOMAIN = _SNAPSHOT_CORE_DOMAINS[1]
 _ADAPTER_IMPLEMENTATION_VERSION = "workflow-observer-snapshot-adapter@1"
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PREFIXED_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -62,6 +67,7 @@ _ARTIFACT_KEYS = {
     "core",
     "artifact_sha256",
 }
+_ARTIFACT_V2_KEYS = _ARTIFACT_KEYS | {"schema_version"}
 _ADAPTER_KEYS = {
     "name",
     "implementation_version",
@@ -429,9 +435,21 @@ def validate_learning_artifact_bytes(
         raise SnapshotPublicationError(
             "validation", "learning snapshot artifact must be an object"
         )
-    validate_learning_artifact(parsed, policy_set)
+    schema_version = _classify_learning_artifact(parsed)
+    if schema_version == 1:
+        validate_learning_artifact(parsed, policy_set)
+        validated = deepcopy(dict(parsed))
+    else:
+        try:
+            validated = validate_learning_snapshot_artifact(
+                parsed,
+                expected_schema_version=2,
+                policy_set=policy_set,
+            )
+        except LearningSnapshotError as error:
+            raise SnapshotPublicationError("validation", str(error)) from error
     recomputed_snapshot_id = hash_canonical(
-        _SNAPSHOT_CORE_DOMAIN, parsed["core"]
+        _SNAPSHOT_CORE_DOMAINS[schema_version], validated["core"]
     )
     if (
         expected_snapshot_id is not None
@@ -440,7 +458,30 @@ def validate_learning_artifact_bytes(
         raise SnapshotPublicationError(
             "validation", "snapshot filename mismatch"
         )
-    return deepcopy(dict(parsed))
+    return deepcopy(dict(validated))
+
+
+def _classify_learning_artifact(artifact: Mapping) -> int:
+    """Return the exact persisted Learning Snapshot schema version."""
+
+    if artifact.get("artifact_type") != "learning-snapshot":
+        raise SnapshotPublicationError(
+            "validation", "learning snapshot artifact type is invalid"
+        )
+    keys = set(artifact)
+    if keys == _ARTIFACT_KEYS:
+        return 1
+    if keys != _ARTIFACT_V2_KEYS:
+        raise SnapshotPublicationError(
+            "validation", "learning snapshot artifact has wrong fields"
+        )
+    if type(artifact["schema_version"]) is not int or (
+        artifact["schema_version"] != 2
+    ):
+        raise SnapshotPublicationError(
+            "validation", "learning snapshot schema version is unsupported"
+        )
+    return 2
 
 
 def _core_error(label: str) -> None:
@@ -1364,9 +1405,10 @@ def create_learning_snapshot(
         core = build_snapshot_core(manifest_a, policy_set)
     except LearningSnapshotError as error:
         raise SnapshotPublicationError("validation", str(error)) from error
-    snapshot_id = hash_canonical(_SNAPSHOT_CORE_DOMAIN, core)
+    snapshot_id = hash_canonical(_SNAPSHOT_CORE_DOMAINS[2], core)
     artifact_without_digest = {
         "artifact_type": "learning-snapshot",
+        "schema_version": 2,
         "authoritative": False,
         "generated_at": generated_at,
         "store_identity": manifest_a.store_identity,
@@ -1380,12 +1422,12 @@ def create_learning_snapshot(
             canonicalize(artifact_without_digest)
         ).hexdigest(),
     }
-    validate_learning_artifact(artifact, policy_set)
     artifact_bytes = canonicalize(artifact)
-    if len(artifact_bytes) > _MAX_ARTIFACT_BYTES:
-        raise SnapshotPublicationError(
-            "validation", "learning snapshot artifact is too large"
-        )
+    artifact = validate_learning_artifact_bytes(
+        artifact_bytes,
+        policy_set,
+        expected_snapshot_id=snapshot_id,
+    )
 
     manifest_b = acquire()
     if not isinstance(manifest_b, SnapshotInput):

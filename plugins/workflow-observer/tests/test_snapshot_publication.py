@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 import hashlib
 import os
@@ -23,7 +24,6 @@ from learning_snapshot import candidate_id
 from policy_artifacts import PolicySet, load_policy_set
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
-    SnapshotInput,
     SnapshotQuery,
     acquire_snapshot_input,
 )
@@ -31,7 +31,6 @@ from snapshot_store import (
     SnapshotPublicationError,
     create_learning_snapshot,
     read_learning_artifact,
-    validate_learning_artifact,
     validate_learning_artifact_bytes,
 )
 from store_config import PORTABLE_SEMANTICS
@@ -41,8 +40,10 @@ from workflow_evolution_fixtures import FakeObservationStore
 
 
 FIXED_NOW = "2026-08-03T00:01:00Z"
-_SNAPSHOT_CORE_DOMAIN = b"workflow-observatory:learning-snapshot-core:v1\0"
-_INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
+_SNAPSHOT_CORE_DOMAINS = {
+    1: b"workflow-observatory:learning-snapshot-core:v1\0",
+    2: b"workflow-observatory:learning-snapshot-core:v2\0",
+}
 _COMPLETION = """## Execution evidence
 
 - Verification: publication regression passed
@@ -79,8 +80,9 @@ def artifact_bytes_with_recomputed_file_digest(artifact):
 
 def artifact_bytes_with_recomputed_identities(artifact):
     rebuilt = deepcopy(artifact)
+    schema_version = rebuilt.get("schema_version", 1)
     rebuilt["snapshot_id"] = hash_canonical(
-        _SNAPSHOT_CORE_DOMAIN, rebuilt["core"]
+        _SNAPSHOT_CORE_DOMAINS[schema_version], rebuilt["core"]
     )
     return artifact_bytes_with_recomputed_file_digest(rebuilt)
 
@@ -141,25 +143,6 @@ def recompute_candidate_identity(candidate):
     candidate["candidate_id"] = candidate_id(evidence)
 
 
-def legacy_snapshot_input(acquired, policy_set):
-    bundle = acquired.semantic_bundle
-    bundle["schema_version"] = 1
-    bundle.pop("artifact_policy_set")
-    bundle.pop("migration_manifest")
-    bundle.pop("input_manifest_sha256")
-    bundle["input_manifest_sha256"] = hash_canonical(
-        _INPUT_MANIFEST_DOMAIN, bundle
-    )
-    return SnapshotInput(
-        acquired.adapter,
-        acquired.store_identity,
-        bundle,
-        reviewed_generation_mapping=(
-            policy_set.documents["workflow_generation_mapping"]
-        ),
-    )
-
-
 class SnapshotPublicationTests(unittest.TestCase):
     def setUp(self):
         self.store = FakeObservationStore("portable")
@@ -193,16 +176,37 @@ class SnapshotPublicationTests(unittest.TestCase):
         )
 
     def acquire(self):
-        return legacy_snapshot_input(
-            acquire_snapshot_input(
-                ObservationPaths.from_root(self.store.store_root),
-                PORTABLE_SEMANTICS,
-                self.query,
-                self.policies,
-                self.artifact_policies,
-            ),
+        return acquire_snapshot_input(
+            ObservationPaths.from_root(self.store.store_root),
+            PORTABLE_SEMANTICS,
+            self.query,
             self.policies,
+            self.artifact_policies,
         )
+
+    def historical_v1_artifact_bytes(self):
+        fixture = strict_json_loads(
+            (PLUGIN_ROOT / "tests/fixtures/artifact_migration_vectors.json")
+            .read_bytes()
+        )
+        vector = next(
+            row for row in fixture["vectors"]
+            if row["name"] == "learning-snapshot-v1"
+        )
+        encoded = vector["source_bytes_base64"]
+        insertion = vector.get("source_bytes_base64_tail_insertion", "")
+        if insertion:
+            encoded = encoded[:-4] + insertion + encoded[-4:]
+        artifact_bytes = base64.b64decode(encoded, validate=True)
+        self.assertEqual(
+            vector["source_sha256"], hashlib.sha256(artifact_bytes).hexdigest()
+        )
+        artifact = strict_json_loads(artifact_bytes)
+        historical_policies = PolicySet(
+            self.policies.documents,
+            artifact["core"]["analysis_policy_set"],
+        )
+        return artifact["snapshot_id"], artifact_bytes, historical_policies
 
     def publish(self, generated_at=FIXED_NOW):
         return create_learning_snapshot(
@@ -327,9 +331,9 @@ for module_root in (plugin_root / "scripts", plugin_root / "tests"):
     sys.path.insert(0, str(module_root))
 
 from artifact_schema import load_artifact_policy_set
-from canonical_json import canonicalize, hash_canonical
+from canonical_json import canonicalize
 from policy_artifacts import load_policy_set
-from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotInput, SnapshotQuery, acquire_snapshot_input
+from snapshot_input import SNAPSHOT_ANALYZER_FILES, SnapshotQuery, acquire_snapshot_input
 from snapshot_store import create_learning_snapshot
 from store_config import PORTABLE_SEMANTICS
 from wiki_observations import ObservationPaths
@@ -366,28 +370,12 @@ while not release.exists():
     time.sleep(0.01)
 
 def acquire():
-    acquired = acquire_snapshot_input(
+    return acquire_snapshot_input(
         ObservationPaths.from_root(store_root),
         PORTABLE_SEMANTICS,
         query,
         policy_set,
         artifact_policy_set,
-    )
-    bundle = acquired.semantic_bundle
-    bundle["schema_version"] = 1
-    bundle.pop("artifact_policy_set")
-    bundle.pop("migration_manifest")
-    bundle.pop("input_manifest_sha256")
-    bundle["input_manifest_sha256"] = hash_canonical(
-        b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
-    )
-    return SnapshotInput(
-        acquired.adapter,
-        acquired.store_identity,
-        bundle,
-        reviewed_generation_mapping=(
-            policy_set.documents["workflow_generation_mapping"]
-        ),
     )
 
 published = create_learning_snapshot(
@@ -520,6 +508,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         artifact = published.artifact
         self.assertEqual({
             "artifact_type",
+            "schema_version",
             "authoritative",
             "generated_at",
             "store_identity",
@@ -529,6 +518,16 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             "artifact_sha256",
         }, set(artifact))
         self.assertEqual("learning-snapshot", artifact["artifact_type"])
+        self.assertEqual(2, artifact["schema_version"])
+        self.assertEqual(2, artifact["core"]["schema_version"])
+        self.assertEqual(
+            hash_canonical(_SNAPSHOT_CORE_DOMAINS[2], artifact["core"]),
+            artifact["snapshot_id"],
+        )
+        self.assertNotEqual(
+            hash_canonical(_SNAPSHOT_CORE_DOMAINS[1], artifact["core"]),
+            artifact["snapshot_id"],
+        )
         self.assertIs(False, artifact["authoritative"])
         self.assertEqual(FIXED_NOW, artifact["generated_at"])
         self.assertNotIn(str(self.home), canonicalize(artifact).decode("utf-8"))
@@ -549,14 +548,17 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         artifact = strict_json_loads(self.publish().path.read_bytes())
         artifact["authoritative"] = True
         with self.assertRaises(SnapshotPublicationError):
-            validate_learning_artifact(artifact, self.policies)
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_file_digest(artifact),
+                self.policies,
+            )
 
     def test_adapter_tamper_cannot_inject_path_metadata(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
         artifact["adapter"]["name"] = str(self.home)
         raw = artifact_bytes_with_recomputed_file_digest(artifact)
         with self.assertRaisesRegex(
-            SnapshotPublicationError, "adapter identity is invalid"
+            SnapshotPublicationError, "adapter.*invalid"
         ):
             validate_learning_artifact_bytes(raw, self.policies)
 
@@ -590,7 +592,8 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         for item in malformed:
             with self.subTest(core=item["core"]):
                 with self.assertRaisesRegex(
-                    SnapshotPublicationError, "core structure is invalid"
+                    SnapshotPublicationError,
+                    "core|query|cohort|candidate|exact fields",
                 ):
                     validate_learning_artifact_bytes(
                         artifact_bytes_with_recomputed_identities(item),
@@ -604,6 +607,9 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         evidence = dict(candidate)
         del evidence["candidate_id"]
         candidate["candidate_id"] = candidate_id(evidence)
+        artifact["core"]["candidates"].sort(
+            key=lambda row: row["candidate_id"]
+        )
         with self.assertRaisesRegex(
             SnapshotPublicationError, "sensitive path or credential"
         ):
@@ -846,12 +852,112 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         ):
             validate_learning_artifact_bytes(ambiguous, self.policies)
 
+    def test_historical_v1_readback_is_byte_identical_and_uses_v1_domain(self):
+        (
+            snapshot_id,
+            historical_bytes,
+            historical_policies,
+        ) = self.historical_v1_artifact_bytes()
+        self.assertEqual(
+            "9376242a607a79bdd7495427562c28ff6c4b63b6ee73dcdc29ee7dcc63109712",
+            snapshot_id,
+        )
+        self.assertEqual(
+            "d7063bc9ed597388e958b3451edbbd72104124082cf143cb67deec2311b3e5ec",
+            hashlib.sha256(historical_bytes).hexdigest(),
+        )
+        snapshot_dir = self.home / "learning/snapshots"
+        snapshot_dir.mkdir(parents=True, mode=0o700)
+        snapshot_dir.chmod(0o700)
+        path = snapshot_dir / f"{snapshot_id}.json"
+        path.write_bytes(historical_bytes)
+        path.chmod(0o600)
+
+        readback = read_learning_artifact(
+            snapshot_dir, snapshot_id, historical_policies
+        )
+
+        self.assertEqual(historical_bytes, canonicalize(readback))
+        self.assertEqual(historical_bytes, path.read_bytes())
+        self.assertNotIn("schema_version", {
+            key: value for key, value in readback.items() if key != "core"
+        })
+        self.assertEqual(1, readback["core"]["schema_version"])
+
+    def test_version_classification_rejects_unknown_mismatch_and_relabeling(self):
+        v2 = strict_json_loads(self.publish().path.read_bytes())
+        _v1_id, v1_bytes, _historical_policies = (
+            self.historical_v1_artifact_bytes()
+        )
+        v1 = strict_json_loads(v1_bytes)
+        cases = {}
+
+        unknown = deepcopy(v2)
+        unknown["schema_version"] = 3
+        cases["unknown"] = artifact_bytes_with_recomputed_file_digest(unknown)
+
+        wrong_type = deepcopy(v2)
+        wrong_type["artifact_type"] = "health-event"
+        cases["type mismatch"] = artifact_bytes_with_recomputed_file_digest(
+            wrong_type
+        )
+
+        v1_labeled_v2 = deepcopy(v1)
+        v1_labeled_v2["schema_version"] = 2
+        cases["v1 labeled v2"] = artifact_bytes_with_recomputed_file_digest(
+            v1_labeled_v2
+        )
+
+        v2_labeled_v1 = deepcopy(v2)
+        del v2_labeled_v1["schema_version"]
+        cases["v2 labeled v1"] = artifact_bytes_with_recomputed_file_digest(
+            v2_labeled_v1
+        )
+
+        for label, raw in cases.items():
+            with self.subTest(label=label), self.assertRaises(
+                SnapshotPublicationError
+            ):
+                validate_learning_artifact_bytes(raw, self.policies)
+
+    def test_v2_envelope_core_schema_disagreement_is_rejected(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        artifact["core"]["schema_version"] = 1
+        with self.assertRaisesRegex(SnapshotPublicationError, "schema"):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_file_digest(artifact),
+                self.policies,
+            )
+
+    def test_v2_readback_recomputes_sampling_equations(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        artifact["core"]["sampling_summary"]["full_retained_episode_n"] += 1
+        with self.assertRaisesRegex(
+            SnapshotPublicationError, "retained population"
+        ):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
+    def test_v2_readback_recomputes_metric_sampling_partition(self):
+        artifact = strict_json_loads(self.publish().path.read_bytes())
+        missingness = artifact["core"]["cohorts"][0]["metrics"][0][
+            "missingness"
+        ]
+        missingness["sampled_by_policy_n"] = 1
+        with self.assertRaisesRegex(SnapshotPublicationError, "sampling|partition"):
+            validate_learning_artifact_bytes(
+                artifact_bytes_with_recomputed_identities(artifact),
+                self.policies,
+            )
+
     def test_artifact_readback_recomputes_snapshot_identity(self):
         artifact = strict_json_loads(self.publish().path.read_bytes())
-        artifact["core"]["analyzer_version"] = "tampered"
+        artifact["snapshot_id"] = "0" * 64
         raw = artifact_bytes_with_recomputed_file_digest(artifact)
         with self.assertRaisesRegex(
-            SnapshotPublicationError, "snapshot identity mismatch"
+            SnapshotPublicationError, "snapshot identity.*inconsistent|mismatch"
         ):
             validate_learning_artifact_bytes(raw, self.policies)
 
@@ -859,7 +965,7 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
         artifact = strict_json_loads(self.publish().path.read_bytes())
         artifact["artifact_sha256"] = "0" * 64
         with self.assertRaisesRegex(
-            SnapshotPublicationError, "artifact digest mismatch"
+            SnapshotPublicationError, "artifact digest.*inconsistent|mismatch"
         ):
             validate_learning_artifact_bytes(
                 canonicalize(artifact), self.policies
@@ -957,12 +1063,15 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             with self.subTest(field=field):
                 tampered = {**artifact, field: "different text"}
                 with self.assertRaises(SnapshotPublicationError):
-                    validate_learning_artifact(tampered, self.policies)
+                    validate_learning_artifact_bytes(
+                        artifact_bytes_with_recomputed_file_digest(tampered),
+                        self.policies,
+                    )
         self.assertEqual(
             [], list((self.home / "learning/annotations").glob("*"))
         )
 
-    def test_concurrent_publishers_never_overwrite(self):
+    def test_concurrent_same_v2_id_publishers_never_overwrite(self):
         results = self.publish_from_two_processes_released_by_one_barrier()
         self.assertEqual(
             [False, True], sorted(result.created for result in results)
@@ -973,6 +1082,35 @@ Path(os.environ["RESULT"]).write_bytes(canonicalize({
             final_path.parent, results[0].snapshot_id, self.policies
         )
         self.assertEqual([], list(final_path.parent.glob(".snapshot-*.tmp")))
+
+    def test_v1_v2_sibling_artifacts_remain_independent(self):
+        v1_id, v1_bytes, historical_policies = (
+            self.historical_v1_artifact_bytes()
+        )
+        learning_dir = self.home / "learning"
+        learning_dir.mkdir(mode=0o700)
+        learning_dir.chmod(0o700)
+        snapshot_dir = learning_dir / "snapshots"
+        snapshot_dir.mkdir(mode=0o700)
+        snapshot_dir.chmod(0o700)
+        v1_path = snapshot_dir / f"{v1_id}.json"
+        v1_path.write_bytes(v1_bytes)
+        v1_path.chmod(0o600)
+
+        v2 = self.publish()
+
+        self.assertNotEqual(v1_id, v2.snapshot_id)
+        self.assertEqual(v1_bytes, v1_path.read_bytes())
+        self.assertEqual(1, read_learning_artifact(
+            snapshot_dir, v1_id, historical_policies
+        )["core"]["schema_version"])
+        self.assertEqual(2, read_learning_artifact(
+            snapshot_dir, v2.snapshot_id, self.policies
+        )["schema_version"])
+        self.assertEqual(
+            sorted([v1_id, v2.snapshot_id]),
+            sorted(path.stem for path in snapshot_dir.glob("*.json")),
+        )
 
 
 if __name__ == "__main__":

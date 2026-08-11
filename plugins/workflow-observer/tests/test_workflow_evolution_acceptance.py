@@ -67,7 +67,7 @@ from workflow_evolution_fixtures import (
 
 
 FIXED_GENERATED_AT = "2026-08-03T00:01:00Z"
-SNAPSHOT_CORE_DOMAIN = b"workflow-observatory:learning-snapshot-core:v1\0"
+SNAPSHOT_CORE_DOMAIN = b"workflow-observatory:learning-snapshot-core:v2\0"
 INPUT_MANIFEST_DOMAIN = b"workflow-observatory:snapshot-input-manifest:v1\0"
 GENERATION = "implementation-with-review@2"
 COMPLETION = """## Execution evidence
@@ -130,31 +130,12 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
         self._sequence = 10
 
     def acquire(self):
-        acquired = acquire_snapshot_input(
+        return acquire_snapshot_input(
             ObservationPaths.from_root(self.store.store_root),
             PORTABLE_SEMANTICS,
             self.query,
             self.policies,
             self.artifact_policies,
-        )
-        return self._legacy_snapshot_input(acquired)
-
-    def _legacy_snapshot_input(self, acquired):
-        bundle = acquired.semantic_bundle
-        bundle["schema_version"] = 1
-        bundle.pop("artifact_policy_set")
-        bundle.pop("migration_manifest")
-        bundle.pop("input_manifest_sha256")
-        bundle["input_manifest_sha256"] = hash_canonical(
-            INPUT_MANIFEST_DOMAIN, bundle
-        )
-        return SnapshotInput(
-            acquired.adapter,
-            acquired.store_identity,
-            bundle,
-            reviewed_generation_mapping=(
-                self.policies.documents["workflow_generation_mapping"]
-            ),
         )
 
     def publish(self):
@@ -381,6 +362,24 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
             for artifact in artifacts
         ]
 
+        for artifact in artifacts:
+            self.assertEqual({
+                "artifact_type",
+                "schema_version",
+                "authoritative",
+                "generated_at",
+                "store_identity",
+                "adapter",
+                "snapshot_id",
+                "core",
+                "artifact_sha256",
+            }, set(artifact))
+            self.assertEqual(2, artifact["schema_version"])
+            self.assertEqual("learning-snapshot-core", artifact["core"][
+                "artifact_type"
+            ])
+            self.assertEqual(2, artifact["core"]["schema_version"])
+            self.assertEqual(0, artifact["core"]["sampled_by_policy_n"])
         self.assertEqual(
             canonicalize(artifacts[0]["core"]),
             canonicalize(artifacts[1]["core"]),
@@ -921,14 +920,12 @@ class WorkflowEvolutionAcceptanceTests(unittest.TestCase):
 
         def publish_at(query, generated_at):
             def acquire():
-                return self._legacy_snapshot_input(
-                    acquire_snapshot_input(
-                        ObservationPaths.from_root(self.store.store_root),
-                        PORTABLE_SEMANTICS,
-                        query,
-                        self.policies,
-                        self.artifact_policies,
-                    )
+                return acquire_snapshot_input(
+                    ObservationPaths.from_root(self.store.store_root),
+                    PORTABLE_SEMANTICS,
+                    query,
+                    self.policies,
+                    self.artifact_policies,
                 )
 
             return create_learning_snapshot(

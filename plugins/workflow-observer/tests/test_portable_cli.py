@@ -807,6 +807,13 @@ class PortableCliTests(unittest.TestCase):
             )
             self.assertNotIn(str(home), first.stdout)
             snapshot = first_response["snapshot"]
+            self.assertEqual(2, snapshot["schema_version"])
+            self.assertEqual(2, snapshot["core"]["schema_version"])
+            self.assertEqual(
+                "learning-snapshot-core",
+                snapshot["core"]["artifact_type"],
+            )
+            self.assertEqual(0, snapshot["core"]["sampled_by_policy_n"])
             path = (
                 home / "learning/snapshots"
                 / f"{snapshot['snapshot_id']}.json"

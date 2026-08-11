@@ -24,10 +24,9 @@ import wiki_observations
 from artifact_schema import ArtifactSchemaError, load_artifact_policy_set
 from episode_schema import EpisodeSchemaError, parse_v2_supplement
 from policy_artifacts import PolicyError, load_policy_set
-from canonical_json import CanonicalizationError, canonicalize, hash_canonical
+from canonical_json import CanonicalizationError, canonicalize
 from snapshot_input import (
     SNAPSHOT_ANALYZER_FILES,
-    SnapshotInput,
     SnapshotInputError,
     SnapshotQuery,
     acquire_snapshot_input,
@@ -537,38 +536,6 @@ def _snapshot_artifact_policy_set():
         ) from error
 
 
-def _snapshot_v1_publication_view(
-    acquired: SnapshotInput,
-    policy_set,
-) -> SnapshotInput:
-    """Temporary Task 6 bridge for the unchanged v1-only publisher.
-
-    Delete this bridge when Task 7 makes publication schema-dispatched.
-    """
-
-    if not isinstance(acquired, SnapshotInput) or acquired.schema_version != 2:
-        raise SnapshotInputError(
-            "validation", "v1 publication bridge requires Snapshot Input v2"
-        )
-    acquired.manifest_bytes
-    bundle = acquired.semantic_bundle
-    bundle["schema_version"] = 1
-    bundle.pop("artifact_policy_set")
-    bundle.pop("migration_manifest")
-    bundle.pop("input_manifest_sha256")
-    bundle["input_manifest_sha256"] = hash_canonical(
-        b"workflow-observatory:snapshot-input-manifest:v1\0", bundle
-    )
-    return SnapshotInput(
-        acquired.adapter,
-        acquired.store_identity,
-        bundle,
-        reviewed_generation_mapping=(
-            policy_set.documents["workflow_generation_mapping"]
-        ),
-    )
-
-
 def _run_bundled(
     args: argparse.Namespace,
     config: StoreConfig,
@@ -596,16 +563,13 @@ def _run_bundled(
         )
         assert paths is not None
         def acquire():
-            acquired = acquire_snapshot_input(
+            return acquire_snapshot_input(
                 paths,
                 semantics,
                 query,
                 policy_set,
                 artifact_policy_set,
             )
-            if args.command == "snapshot":
-                return _snapshot_v1_publication_view(acquired, policy_set)
-            return acquired
 
         if args.command == "snapshot-input":
             acquired = acquire()

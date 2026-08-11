@@ -992,30 +992,6 @@ class SnapshotInputTests(unittest.TestCase):
             workflow_observer_cli._snapshot_artifact_policy_set().identities(),
         )
 
-    def test_snapshot_v1_publication_bridge_uses_one_immutable_v2_input(self):
-        acquired = self.acquire()
-        original_bytes = acquired.manifest_bytes
-        with mock.patch(
-            "workflow_observer_cli.acquire_snapshot_input",
-            side_effect=AssertionError("bridge reopened the observation store"),
-        ) as acquisition:
-            legacy = workflow_observer_cli._snapshot_v1_publication_view(
-                acquired, self.policy_set
-            )
-
-        acquisition.assert_not_called()
-        self.assertEqual(original_bytes, acquired.manifest_bytes)
-        self.assertEqual(2, acquired.schema_version)
-        self.assertEqual(1, legacy.schema_version)
-        self.assertEqual(
-            {"adapter", "store_identity", "semantic_bundle"},
-            set(legacy.canonical_representation),
-        )
-        self.assertNotIn(
-            "artifact_policy_set", legacy.semantic_bundle
-        )
-        self.assertNotIn("migration_manifest", legacy.semantic_bundle)
-
     def test_snapshot_input_excludes_human_text_and_reference_bodies(self):
         self._write_valid_record_with_privacy_sentinel()
         self.store.task_path.write_text(

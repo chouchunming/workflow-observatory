@@ -790,9 +790,17 @@ class AdapterConformanceTests(unittest.TestCase):
         portable_bundle = json.loads(portable.stdout)
         llmwiki_bundle = json.loads(llmwiki.stdout)
         self.assertEqual(
-            {"adapter", "store_identity", "semantic_bundle"},
+            {
+                "artifact_type",
+                "schema_version",
+                "adapter",
+                "store_identity",
+                "semantic_bundle",
+            },
             set(portable_bundle),
         )
+        self.assertEqual(2, portable_bundle["schema_version"])
+        self.assertEqual(2, llmwiki_bundle["schema_version"])
         self.assertEqual(
             canonicalize(portable_bundle).decode("utf-8") + "\n",
             portable.stdout,
@@ -809,6 +817,53 @@ class AdapterConformanceTests(unittest.TestCase):
         self.assertEqual("llmwiki", llmwiki_bundle["adapter"]["name"])
         self.assertNotIn(str(self.base), portable.stdout)
         self.assertNotIn(str(self.base), llmwiki.stdout)
+
+    def test_snapshot_cli_publishes_v2_with_adapter_neutral_core(self):
+        started = self.start("portable")
+        self.assertEqual(0, started.returncode, started.stderr)
+        run_id = started.stdout.strip()
+        portable_record = (
+            self.homes["portable"] / "store/wiki/observations" / f"{run_id}.md"
+        )
+        llmwiki_record = self.llm_root / "wiki/observations" / f"{run_id}.md"
+        llmwiki_record.write_bytes(portable_record.read_bytes())
+        arguments = (
+            "snapshot",
+            "--since", "2020-01-01",
+            "--until", "2030-12-31",
+            "--timezone", "UTC",
+            "--as-of", "2031-01-01T00:00:00Z",
+        )
+
+        portable_first = self.run_cli("portable", *arguments)
+        portable_second = self.run_cli("portable", *arguments)
+        llmwiki_first = self.run_cli("llmwiki", *arguments)
+        llmwiki_second = self.run_cli("llmwiki", *arguments)
+
+        for result in (
+            portable_first,
+            portable_second,
+            llmwiki_first,
+            llmwiki_second,
+        ):
+            self.assertEqual((0, ""), (result.returncode, result.stderr))
+        portable = json.loads(portable_first.stdout)
+        llmwiki = json.loads(llmwiki_first.stdout)
+        self.assertIs(True, portable["created"])
+        self.assertIs(False, json.loads(portable_second.stdout)["created"])
+        self.assertIs(True, llmwiki["created"])
+        self.assertIs(False, json.loads(llmwiki_second.stdout)["created"])
+        self.assertEqual(2, portable["snapshot"]["schema_version"])
+        self.assertEqual(2, llmwiki["snapshot"]["schema_version"])
+        self.assertEqual(
+            portable["snapshot"]["core"], llmwiki["snapshot"]["core"]
+        )
+        self.assertEqual(
+            portable["snapshot"]["snapshot_id"],
+            llmwiki["snapshot"]["snapshot_id"],
+        )
+        self.assertEqual("portable", portable["snapshot"]["adapter"]["name"])
+        self.assertEqual("llmwiki", llmwiki["snapshot"]["adapter"]["name"])
 
     def test_snapshot_input_cli_rejects_noncanonical_as_of_without_stdout(self):
         result = self.run_cli(
