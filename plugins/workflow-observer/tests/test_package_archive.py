@@ -385,6 +385,37 @@ class ArchiveTests(unittest.TestCase):
         ):
             build_archive(self.source, self.archive, self.evidence)
 
+    def test_archive_rejects_unlisted_plugin_document(self):
+        sibling = self.source / "plugins/workflow-observer/docs/unlisted.md"
+        sibling.parent.mkdir(parents=True, exist_ok=True)
+        sibling.write_text("# Unlisted plugin document\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            PackageError,
+            "unexpected marketplace file: "
+            "plugins/workflow-observer/docs/unlisted.md",
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
+    def test_archive_rejects_unlisted_plugin_script(self):
+        sibling = self.source / "plugins/workflow-observer/scripts/unlisted.py"
+        sibling.write_text("raise SystemExit('unlisted')\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            PackageError,
+            "unexpected marketplace file: "
+            "plugins/workflow-observer/scripts/unlisted.py",
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
+    def test_archive_rejects_unlisted_plugin_test(self):
+        sibling = self.source / "plugins/workflow-observer/tests/test_unlisted.py"
+        sibling.write_text("raise AssertionError('unlisted')\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            PackageError,
+            "unexpected marketplace file: "
+            "plugins/workflow-observer/tests/test_unlisted.py",
+        ):
+            build_archive(self.source, self.archive, self.evidence)
+
     def test_archive_rejects_unlisted_migration_fixture_sibling(self):
         sibling = (
             self.source

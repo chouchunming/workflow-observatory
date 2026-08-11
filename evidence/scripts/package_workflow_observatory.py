@@ -94,6 +94,55 @@ class PackageError(RuntimeError):
     """The requested archive is unsafe, incomplete, or inconsistent."""
 
 
+_ALLOWED_PLUGIN_SCRIPT_FILES = frozenset(
+    {
+        "scripts/artifact_migration.py",
+        "scripts/artifact_schema.py",
+        "scripts/canonical_json.py",
+        "scripts/core_source.json",
+        "scripts/episode_schema.py",
+        "scripts/learning_snapshot.py",
+        "scripts/policy_artifacts.py",
+        "scripts/snapshot_input.py",
+        "scripts/snapshot_store.py",
+        "scripts/store_config.py",
+        "scripts/wiki_observations.py",
+        "scripts/workflow_observer_cli.py",
+    }
+)
+
+_ALLOWED_PLUGIN_TEST_FILES = frozenset(
+    {
+        "tests/fixtures/artifact_migration_vectors.json",
+        "tests/fixtures/jcs_conformance_vectors.json",
+        "tests/run_marketplace_eval.py",
+        "tests/skill_evals/observing_workflows_cases.json",
+        "tests/skill_evals/observing_workflows_lifecycle_cases.json",
+        "tests/test_adapter_conformance.py",
+        "tests/test_artifact_migration.py",
+        "tests/test_artifact_schema.py",
+        "tests/test_canonical_json.py",
+        "tests/test_core_parity.py",
+        "tests/test_episode_v2.py",
+        "tests/test_eval_runner_hygiene.py",
+        "tests/test_learning_improving.py",
+        "tests/test_learning_snapshot.py",
+        "tests/test_manifests.py",
+        "tests/test_package_archive.py",
+        "tests/test_parallel_eval_runner.py",
+        "tests/test_policy_artifacts.py",
+        "tests/test_portable_cli.py",
+        "tests/test_schema_migration_acceptance.py",
+        "tests/test_skill_contracts.py",
+        "tests/test_snapshot_input.py",
+        "tests/test_snapshot_publication.py",
+        "tests/test_store_config.py",
+        "tests/test_workflow_evolution_acceptance.py",
+        "tests/workflow_evolution_fixtures.py",
+    }
+)
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -136,25 +185,16 @@ def _is_allowed_marketplace_file(relative: PurePosixPath) -> bool:
     if not value.startswith(prefix):
         return False
     nested = value[len(prefix):]
-    if nested.startswith("scripts/"):
-        return nested.endswith(".py") or nested == "scripts/core_source.json"
+    if nested in _ALLOWED_PLUGIN_SCRIPT_FILES:
+        return True
     if nested.startswith("skills/"):
         parts = PurePosixPath(nested).parts
         return len(parts) == 3 and parts[-1] == "SKILL.md"
     if nested.startswith("policies/"):
         policy = PurePosixPath(nested)
         return len(policy.parts) == 2 and policy.suffix == ".json"
-    if nested.startswith("tests/skill_evals/"):
-        return nested.endswith(".json")
-    if nested in {
-        "tests/fixtures/artifact_migration_vectors.json",
-        "tests/fixtures/jcs_conformance_vectors.json",
-    }:
+    if nested in _ALLOWED_PLUGIN_TEST_FILES:
         return True
-    if nested.startswith("tests/"):
-        return nested.endswith(".py")
-    if nested.startswith("docs/"):
-        return nested.endswith(".md")
     return False
 
 
