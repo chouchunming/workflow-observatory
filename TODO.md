@@ -35,6 +35,31 @@ tasks, production observations, credentials, and local configuration.
   only against isolated fake portable and fake LLM Wiki roots across the
   supported CPython 3.11–3.14 matrix.
 
+## Workflow Observatory v0.3 Phase 1 checkpoint
+
+Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+
+- [x] Implement the explicit artifact schema registry and policies, pure
+  derived migrations, the exact invalidation v2 writer with legacy reads,
+  Snapshot Input and Learning Snapshot v2 zero-sampling semantics, v1/v2
+  Learning Snapshot readback and publication dispatch, and the fixed 12-case
+  acceptance matrix.
+- [ ] Implement the cooperative lock/CAS/maintenance transaction, a durable
+  health-event sink/store/reporting path,
+  retention/export/delete/restore/purge operations, observation v3 or sampling
+  decisions, and the Windows lock backend. These are not Phase 1 features.
+- [ ] In a native Linux environment, run the exact commit-pinned 12-case
+  CPython matrix, complete plugin suite, and two exact-inventory package gates;
+  record the distribution, kernel, Python versions, commit, and artifact
+  SHA-256 hashes.
+
+- macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
+- Linux native runtime verification: pending; Linux support is not yet certified.
+- Windows backend/runtime verification: not implemented or run; Windows support is not certified.
+
+The next design unit is the Phase 2 cross-platform same-machine writer-safety
+plan. Phase 1 does not authorize Phase 2 code.
+
 ## Next
 
 - [ ] Obtain explicit approval before one protected real-model formal epoch
@@ -42,7 +67,7 @@ tasks, production observations, credentials, and local configuration.
   real-model 28/28 result.
 - [ ] Add per-resource advisory locks, content-hash compare-and-swap, bounded
   lock timeouts, stale-owner handling, and a maintenance lease.
-- [ ] Add schema-version migrations plus retention, export, and delete policy.
+- [ ] Add retention, export, delete, restore, and purge policy and operations.
 - [ ] Define and add immutable health-event history for rejected validation,
   dropped records, duplicate finish attempts, cleanup failure, schema mismatch,
   and lock contention.

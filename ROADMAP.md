@@ -96,20 +96,39 @@ See the approved
 and
 [amended implementation plan](https://github.com/chouchunming/workflow-observatory/blob/53780705ec878af9ad6cde14358121f8ebcb1205/docs/superpowers/plans/2026-08-02-workflow-evolution-foundation-v0.2.md).
 
-## Next — concurrency and operability
+## Workflow Observatory v0.3 Phase 1 checkpoint
 
-- Add explicit schema versions to all observation, invalidation, and analysis
-  records with tested migration rules.
-- Define retention, export, and delete policies for the portable store; local
-  retention remains the default until the user chooses otherwise.
-- Record health counters/events for validation rejection, dropped records,
-  duplicate finishes, cleanup failures, schema mismatches, lock contention,
-  and compare-and-swap conflicts.
-- Add value-based sampling: retain failures, rework, rollback, and rare paths;
-  sample only high-volume repeated successes.
-- Harden same-machine multi-writer behavior with per-resource advisory locks,
-  content-hash compare-and-swap, bounded lock timeouts, stale-owner handling,
-  and a maintenance lease for cross-file operations.
+Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+It implements the explicit artifact schema registry and policies, pure derived
+migrations, the exact invalidation v2 writer with legacy reads, Snapshot Input
+and Learning Snapshot v2 zero-sampling semantics, v1/v2 Learning Snapshot
+readback and publication dispatch, and the fixed 12-case acceptance matrix.
+
+The checkpoint does not implement the cooperative lock/CAS/maintenance
+transaction, a durable health-event sink/store/reporting path,
+retention/export/delete/restore/purge operations, observation v3 or sampling
+decisions, or a Windows lock backend.
+
+- macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
+- Linux native runtime verification: pending; Linux support is not yet certified.
+- Windows backend/runtime verification: not implemented or run; Windows support is not certified.
+
+Linux certification remains a concrete pending gate: on one commit-pinned
+candidate, run the unchanged 12-case CPython matrix, the complete plugin suite,
+and two exact-inventory package builds in a native Linux environment. Record
+the distribution, kernel, Python versions, commit, and artifact SHA-256 hashes.
+
+## Next design unit — same-machine writer safety
+
+The next design unit is the Phase 2 cross-platform same-machine writer-safety
+plan. Phase 1 does not authorize Phase 2 code. That design must cover
+per-resource advisory locks, content-hash compare-and-swap, bounded lock
+timeouts, stale-owner handling, a maintenance lease for cross-file operations,
+and the Windows lock backend and verification boundary.
+
+Later operability phases must separately design the durable health-event
+sink/store/reporting path; retention/export/delete/restore/purge operations;
+and observation v3 sampling decisions.
 
 ## Later — learning and ecosystem expansion
 

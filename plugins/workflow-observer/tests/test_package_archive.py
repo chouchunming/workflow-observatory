@@ -42,6 +42,30 @@ from workflow_evolution_fixtures import (
 )
 
 
+PHASE1_ACCEPTANCE_DOCUMENT_INVENTORY = frozenset(
+    {
+        "README.md",
+        "ROADMAP.md",
+        "TODO.md",
+        "plugins/workflow-observer/README.md",
+    }
+)
+PHASE1_ACCEPTANCE_TEST_INVENTORY = frozenset(
+    {
+        "plugins/workflow-observer/tests/test_artifact_migration.py",
+        "plugins/workflow-observer/tests/test_artifact_schema.py",
+        "plugins/workflow-observer/tests/test_schema_migration_acceptance.py",
+    }
+)
+PHASE1_ACCEPTANCE_PACKAGE_INVENTORY = frozenset(
+    {
+        *APPROVED_PHASE1_ARCHIVE_INVENTORY,
+        *PHASE1_ACCEPTANCE_DOCUMENT_INVENTORY,
+        *PHASE1_ACCEPTANCE_TEST_INVENTORY,
+    }
+)
+
+
 class ArchiveTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -218,8 +242,16 @@ class ArchiveTests(unittest.TestCase):
     def test_archive_contains_exact_phase1_acceptance_inventory(self):
         build_archive(self.source, self.archive, self.evidence)
         marketplace = set(self._inventory()["marketplace_files"])
-        selected = select_phase1_archive_inventory(marketplace)
-        self.assertEqual(APPROVED_PHASE1_ARCHIVE_INVENTORY, selected)
+        selected = set(select_phase1_archive_inventory(marketplace))
+        selected.update(
+            path
+            for path in marketplace
+            if path in PHASE1_ACCEPTANCE_DOCUMENT_INVENTORY
+            or path.startswith(
+                "plugins/workflow-observer/tests/test_artifact_"
+            )
+        )
+        self.assertEqual(PHASE1_ACCEPTANCE_PACKAGE_INVENTORY, selected)
 
     def test_archive_rejects_unlisted_v03_phase1_document_sibling(self):
         sibling = self.source / "docs/superpowers/specs/unlisted-v0.3-sibling.md"

@@ -49,6 +49,26 @@ select both an exact `snapshot_id` and `candidate_id`, verifies membership, and
 stops before Evolution Proposal design, workflow edits, branches, pull
 requests, or experiments.
 
+## Workflow Observatory v0.3 Phase 1 checkpoint
+
+Phase 1 is an implementation checkpoint, not a v0.3 release or publication.
+It implements the explicit artifact schema registry and policies, pure derived
+migrations, the exact invalidation v2 writer with legacy reads, Snapshot Input
+and Learning Snapshot v2 zero-sampling semantics, v1/v2 Learning Snapshot
+readback and publication dispatch, and the fixed 12-case acceptance matrix.
+
+The checkpoint does not implement the cooperative lock/CAS/maintenance
+transaction, a durable health-event sink/store/reporting path,
+retention/export/delete/restore/purge operations, observation v3 or sampling
+decisions, or a Windows lock backend.
+
+- macOS runtime verification: completed for the Phase 1 matrix on CPython 3.11–3.14.
+- Linux native runtime verification: pending; Linux support is not yet certified.
+- Windows backend/runtime verification: not implemented or run; Windows support is not certified.
+
+The next design unit is the Phase 2 cross-platform same-machine writer-safety
+plan. Phase 1 does not authorize Phase 2 code.
+
 ## Developer verification
 
 From a source checkout containing this plugin:
